@@ -1,0 +1,179 @@
+package raft
+
+import (
+	"sync"
+	"time"
+)
+
+type NodeState int
+
+const (
+	Follower NodeState = iota
+	Candidate
+	Leader
+)
+
+func (s NodeState) String() string {
+	switch s {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate" 
+	case Leader:
+		return "Leader"
+	default:
+		return "Unknown"
+	}
+}
+
+type PersistentState struct {
+	CurrentTerm int
+	VotedFor    *string
+	Log         []LogEntry
+}
+
+type VolatileState struct {
+	CommitIndex int
+	LastApplied int
+}
+
+type LeaderState struct {
+	NextIndex  map[string]int
+	MatchIndex map[string]int
+}
+
+type RaftState struct {
+	mu sync.RWMutex
+
+	nodeID    string
+	state     NodeState
+	peers     []string
+
+	persistent PersistentState
+	volatile   VolatileState
+	leader     *LeaderState
+	
+	currentLeader   string  // Track the current leader ID
+
+	electionTimeout time.Duration
+	heartbeatTimeout time.Duration
+	lastHeartbeat   time.Time
+	electionTimer   *time.Timer
+
+	applyCh chan ApplyMsg
+}
+
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
+}
+
+func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftState {
+	rs := &RaftState{
+		nodeID:           nodeID,
+		state:            Follower,
+		peers:            peers,
+		persistent:       PersistentState{CurrentTerm: 0, VotedFor: nil, Log: make([]LogEntry, 0)},
+		volatile:         VolatileState{CommitIndex: 0, LastApplied: 0},
+		electionTimeout:  time.Duration(150+nodeID[0]*5) * time.Millisecond,
+		heartbeatTimeout: 50 * time.Millisecond,
+		lastHeartbeat:    time.Now(),
+		applyCh:          applyCh,
+	}
+	
+	rs.electionTimer = time.NewTimer(rs.electionTimeout)
+	
+	return rs
+}
+
+func (rs *RaftState) GetState() (int, bool) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.persistent.CurrentTerm, rs.state == Leader
+}
+
+func (rs *RaftState) GetCurrentTerm() int {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.persistent.CurrentTerm
+}
+
+func (rs *RaftState) GetNodeState() NodeState {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.state
+}
+
+func (rs *RaftState) SetState(state NodeState) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.state = state
+	
+	if state == Leader {
+		rs.initializeLeaderState()
+	} else {
+		rs.leader = nil
+	}
+}
+
+func (rs *RaftState) IncrementTerm() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.persistent.CurrentTerm++
+	rs.persistent.VotedFor = nil
+}
+
+func (rs *RaftState) SetVotedFor(nodeID *string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.persistent.VotedFor = nodeID
+}
+
+func (rs *RaftState) GetVotedFor() *string {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.persistent.VotedFor
+}
+
+func (rs *RaftState) ResetElectionTimer() {
+	rs.electionTimer.Reset(rs.electionTimeout)
+	rs.lastHeartbeat = time.Now()
+}
+
+func (rs *RaftState) ElectionTimer() <-chan time.Time {
+	return rs.electionTimer.C
+}
+
+func (rs *RaftState) initializeLeaderState() {
+	rs.leader = &LeaderState{
+		NextIndex:  make(map[string]int),
+		MatchIndex: make(map[string]int),
+	}
+	
+	nextIndex := len(rs.persistent.Log) + 1
+	for _, peer := range rs.peers {
+		if peer != rs.nodeID {
+			rs.leader.NextIndex[peer] = nextIndex
+			rs.leader.MatchIndex[peer] = 0
+		}
+	}
+}
+
+func (rs *RaftState) GetLeaderState() *LeaderState {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.leader
+}
+
+func (rs *RaftState) UpdateLastHeartbeat() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.lastHeartbeat = time.Now()
+}
+
+func (rs *RaftState) GetLastHeartbeat() time.Time {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.lastHeartbeat
+}

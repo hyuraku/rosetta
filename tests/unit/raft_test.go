@@ -1,0 +1,290 @@
+package unit
+
+import (
+	"testing"
+	"time"
+
+	"rosetta/raft"
+)
+
+func TestRaftStateInitialization(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	if state == nil {
+		t.Fatal("NewRaftState returned nil")
+	}
+	
+	if state.GetNodeState() != raft.Follower {
+		t.Errorf("Expected initial state to be Follower, got %v", state.GetNodeState())
+	}
+	
+	if state.GetCurrentTerm() != 0 {
+		t.Errorf("Expected initial term to be 0, got %d", state.GetCurrentTerm())
+	}
+	
+	if state.GetVotedFor() != nil {
+		t.Errorf("Expected initial votedFor to be nil, got %v", state.GetVotedFor())
+	}
+}
+
+func TestRaftStateTransitions(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	state.SetState(raft.Candidate)
+	if state.GetNodeState() != raft.Candidate {
+		t.Errorf("Expected state to be Candidate, got %v", state.GetNodeState())
+	}
+	
+	state.SetState(raft.Leader)
+	if state.GetNodeState() != raft.Leader {
+		t.Errorf("Expected state to be Leader, got %v", state.GetNodeState())
+	}
+	
+	leaderState := state.GetLeaderState()
+	if leaderState == nil {
+		t.Error("Expected leader state to be initialized when becoming leader")
+	}
+	
+	state.SetState(raft.Follower)
+	if state.GetNodeState() != raft.Follower {
+		t.Errorf("Expected state to be Follower, got %v", state.GetNodeState())
+	}
+	
+	leaderState = state.GetLeaderState()
+	if leaderState != nil {
+		t.Error("Expected leader state to be nil when not leader")
+	}
+}
+
+func TestTermIncrement(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	initialTerm := state.GetCurrentTerm()
+	state.IncrementTerm()
+	
+	if state.GetCurrentTerm() != initialTerm+1 {
+		t.Errorf("Expected term to be %d, got %d", initialTerm+1, state.GetCurrentTerm())
+	}
+	
+	if state.GetVotedFor() != nil {
+		t.Error("Expected votedFor to be reset to nil after term increment")
+	}
+}
+
+func TestVoting(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	nodeID := "node2"
+	state.SetVotedFor(&nodeID)
+	
+	votedFor := state.GetVotedFor()
+	if votedFor == nil || *votedFor != "node2" {
+		t.Errorf("Expected votedFor to be 'node2', got %v", votedFor)
+	}
+}
+
+func TestLogOperations(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	if state.GetLastLogIndex() != 0 {
+		t.Errorf("Expected initial log index to be 0, got %d", state.GetLastLogIndex())
+	}
+	
+	if state.GetLastLogTerm() != 0 {
+		t.Errorf("Expected initial log term to be 0, got %d", state.GetLastLogTerm())
+	}
+	
+	index := state.AppendLogEntry("test command", "command")
+	if index != 1 {
+		t.Errorf("Expected first log entry index to be 1, got %d", index)
+	}
+	
+	if state.GetLastLogIndex() != 1 {
+		t.Errorf("Expected log index to be 1 after append, got %d", state.GetLastLogIndex())
+	}
+	
+	entry := state.GetLogEntry(1)
+	if entry == nil {
+		t.Fatal("Expected log entry to exist")
+	}
+	
+	if entry.Command != "test command" {
+		t.Errorf("Expected command to be 'test command', got %v", entry.Command)
+	}
+	
+	if entry.Type != "command" {
+		t.Errorf("Expected type to be 'command', got %s", entry.Type)
+	}
+}
+
+func TestRequestVote(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	args := &raft.RequestVoteArgs{
+		Term:         1,
+		CandidateID:  "node2",
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+	
+	reply := &raft.RequestVoteReply{}
+	state.RequestVote(args, reply)
+	
+	if !reply.VoteGranted {
+		t.Error("Expected vote to be granted for valid request")
+	}
+	
+	if reply.Term != 1 {
+		t.Errorf("Expected reply term to be 1, got %d", reply.Term)
+	}
+	
+	votedFor := state.GetVotedFor()
+	if votedFor == nil || *votedFor != "node2" {
+		t.Errorf("Expected to have voted for node2, got %v", votedFor)
+	}
+}
+
+func TestRequestVoteStaleterm(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	state.IncrementTerm()
+	state.IncrementTerm()
+	
+	args := &raft.RequestVoteArgs{
+		Term:         1,
+		CandidateID:  "node2",
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+	
+	reply := &raft.RequestVoteReply{}
+	state.RequestVote(args, reply)
+	
+	if reply.VoteGranted {
+		t.Error("Expected vote to be denied for stale term")
+	}
+	
+	if reply.Term != 2 {
+		t.Errorf("Expected reply term to be 2, got %d", reply.Term)
+	}
+}
+
+func TestAppendEntries(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	entries := []raft.LogEntry{
+		{Term: 1, Index: 1, Command: "cmd1", Type: "command"},
+		{Term: 1, Index: 2, Command: "cmd2", Type: "command"},
+	}
+	
+	args := &raft.AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "node2",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      entries,
+		LeaderCommit: 0,
+	}
+	
+	reply := &raft.AppendEntriesReply{}
+	state.AppendEntries(args, reply)
+	
+	if !reply.Success {
+		t.Error("Expected AppendEntries to succeed")
+	}
+	
+	if state.GetLastLogIndex() != 2 {
+		t.Errorf("Expected log index to be 2, got %d", state.GetLastLogIndex())
+	}
+	
+	entry := state.GetLogEntry(1)
+	if entry == nil || entry.Command != "cmd1" {
+		t.Error("Expected first entry to be 'cmd1'")
+	}
+	
+	entry = state.GetLogEntry(2)
+	if entry == nil || entry.Command != "cmd2" {
+		t.Error("Expected second entry to be 'cmd2'")
+	}
+}
+
+func TestElectionTimer(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+	
+	state := raft.NewRaftState("node1", peers, applyCh)
+	
+	timerCh := state.ElectionTimer()
+	if timerCh == nil {
+		t.Fatal("Expected election timer channel to be non-nil")
+	}
+	
+	state.UpdateLastHeartbeat()
+	lastHeartbeat := state.GetLastHeartbeat()
+	
+	if time.Since(lastHeartbeat) > time.Millisecond {
+		t.Error("Expected last heartbeat to be recent")
+	}
+	
+	state.ResetElectionTimer()
+}
+
+func TestMockTransport(t *testing.T) {
+	transport := raft.NewMockTransport()
+	
+	applyCh1 := make(chan raft.ApplyMsg, 10)
+	applyCh2 := make(chan raft.ApplyMsg, 10)
+	
+	peers := []string{"node1", "node2"}
+	
+	node1 := raft.NewRaftNode("node1", peers, transport, applyCh1)
+	node2 := raft.NewRaftNode("node2", peers, transport, applyCh2)
+	
+	transport.RegisterNode("node1", node1)
+	transport.RegisterNode("node2", node2)
+	
+	nodes := transport.GetNodes()
+	if len(nodes) != 2 {
+		t.Errorf("Expected 2 nodes, got %d", len(nodes))
+	}
+	
+	if _, exists := nodes["node1"]; !exists {
+		t.Error("Expected node1 to be registered")
+	}
+	
+	if _, exists := nodes["node2"]; !exists {
+		t.Error("Expected node2 to be registered")
+	}
+	
+	transport.RemoveNode("node2")
+	nodes = transport.GetNodes()
+	if len(nodes) != 1 {
+		t.Errorf("Expected 1 node after removal, got %d", len(nodes))
+	}
+	
+	node1.Kill()
+	node2.Kill()
+}
