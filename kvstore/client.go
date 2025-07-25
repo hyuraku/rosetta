@@ -158,9 +158,9 @@ type BatchArgs struct {
 }
 
 type BatchReply struct {
-	Success  bool     `json:"success"`
-	Results  []string `json:"results,omitempty"`
-	Error    string   `json:"error,omitempty"`
+	Success bool     `json:"success"`
+	Results []string `json:"results,omitempty"`
+	Error   string   `json:"error,omitempty"`
 }
 
 func (c *Client) Batch(operations []BatchOperation) ([]string, error) {
@@ -185,7 +185,7 @@ func (c *Client) PutBatch(kvPairs map[string]string) error {
 			Value: value,
 		})
 	}
-	
+
 	_, err := c.Batch(operations)
 	return err
 }
@@ -198,18 +198,18 @@ func (c *Client) GetBatch(keys []string) (map[string]string, error) {
 			Key: key,
 		}
 	}
-	
+
 	results, err := c.Batch(operations)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	resultMap := make(map[string]string)
 	for i, key := range keys {
 		if i < len(results) && results[i] != "" {
 			resultMap[key] = results[i]
 		}
 	}
-	
+
 	return resultMap, nil
 }

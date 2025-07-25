@@ -89,7 +89,7 @@ func (lm *LogManager) AppendEntries(prevLogIndex int, prevLogTerm int, entries [
 	if len(entries) > 0 {
 		lm.TruncateAfter(prevLogIndex)
 		lm.entries = append(lm.entries, entries...)
-		
+
 		for i := range lm.entries[prevLogIndex:] {
 			lm.entries[prevLogIndex+i].Index = prevLogIndex + i + 1
 		}
@@ -124,7 +124,7 @@ func (lm *LogManager) DeserializeEntry(data []byte) (*LogEntry, error) {
 func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) int {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	
+
 	index := len(rs.persistent.Log) + 1
 	entry := LogEntry{
 		Term:    rs.persistent.CurrentTerm,
@@ -139,7 +139,7 @@ func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) int {
 func (rs *RaftState) GetLogEntry(index int) *LogEntry {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	
+
 	if index <= 0 || index > len(rs.persistent.Log) {
 		return nil
 	}
@@ -149,7 +149,7 @@ func (rs *RaftState) GetLogEntry(index int) *LogEntry {
 func (rs *RaftState) GetLogEntries(startIndex int) []LogEntry {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	
+
 	if startIndex <= 0 || startIndex > len(rs.persistent.Log)+1 {
 		return nil
 	}
@@ -168,7 +168,7 @@ func (rs *RaftState) GetLastLogIndex() int {
 func (rs *RaftState) GetLastLogTerm() int {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	
+
 	if len(rs.persistent.Log) == 0 {
 		return 0
 	}
@@ -178,7 +178,7 @@ func (rs *RaftState) GetLastLogTerm() int {
 func (rs *RaftState) TruncateLogAfter(index int) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	
+
 	if index < 0 {
 		rs.persistent.Log = make([]LogEntry, 0)
 	} else if index < len(rs.persistent.Log) {
@@ -201,7 +201,7 @@ func (rs *RaftState) appendLogEntries(prevLogIndex int, prevLogTerm int, entries
 			rs.persistent.Log = rs.persistent.Log[:prevLogIndex]
 		}
 		rs.persistent.Log = append(rs.persistent.Log, entries...)
-		
+
 		for i := range rs.persistent.Log[prevLogIndex:] {
 			rs.persistent.Log[prevLogIndex+i].Index = prevLogIndex + i + 1
 		}
@@ -213,7 +213,7 @@ func (rs *RaftState) appendLogEntries(prevLogIndex int, prevLogTerm int, entries
 func (rs *RaftState) UpdateCommitIndex(leaderCommit int) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	
+
 	newCommitIndex := min(leaderCommit, len(rs.persistent.Log))
 	if newCommitIndex > rs.volatile.CommitIndex {
 		rs.volatile.CommitIndex = newCommitIndex
@@ -225,13 +225,13 @@ func (rs *RaftState) applyEntries() {
 	for rs.volatile.LastApplied < rs.volatile.CommitIndex {
 		rs.volatile.LastApplied++
 		entry := rs.persistent.Log[rs.volatile.LastApplied-1]
-		
+
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
 		}
-		
+
 		select {
 		case rs.applyCh <- applyMsg:
 		default:

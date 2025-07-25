@@ -17,7 +17,7 @@ func TestThreeNodeCluster(t *testing.T) {
 	for _, nodeID := range peers {
 		applyCh := make(chan raft.ApplyMsg, 100)
 		applyChannels[nodeID] = applyCh
-		
+
 		node := raft.NewRaftNode(nodeID, peers, transport, applyCh)
 		nodes[nodeID] = node
 		transport.RegisterNode(nodeID, node)
@@ -27,7 +27,7 @@ func TestThreeNodeCluster(t *testing.T) {
 
 	leaderCount := 0
 	var leader *raft.RaftNode
-	
+
 	for _, node := range nodes {
 		if node.IsLeader() {
 			leaderCount++
@@ -66,7 +66,7 @@ func TestFiveNodeCluster(t *testing.T) {
 	for _, nodeID := range peers {
 		applyCh := make(chan raft.ApplyMsg, 100)
 		applyChannels[nodeID] = applyCh
-		
+
 		node := raft.NewRaftNode(nodeID, peers, transport, applyCh)
 		nodes[nodeID] = node
 		transport.RegisterNode(nodeID, node)
@@ -76,7 +76,7 @@ func TestFiveNodeCluster(t *testing.T) {
 
 	leaderCount := 0
 	var leader *raft.RaftNode
-	
+
 	for _, node := range nodes {
 		if node.IsLeader() {
 			leaderCount++
@@ -119,7 +119,7 @@ func TestLeaderElectionAfterFailure(t *testing.T) {
 	for _, nodeID := range peers {
 		applyCh := make(chan raft.ApplyMsg, 100)
 		applyChannels[nodeID] = applyCh
-		
+
 		node := raft.NewRaftNode(nodeID, peers, transport, applyCh)
 		nodes[nodeID] = node
 		transport.RegisterNode(nodeID, node)
@@ -129,7 +129,7 @@ func TestLeaderElectionAfterFailure(t *testing.T) {
 
 	var originalLeader *raft.RaftNode
 	var originalLeaderID string
-	
+
 	for nodeID, node := range nodes {
 		if node.IsLeader() {
 			originalLeader = node
@@ -150,7 +150,7 @@ func TestLeaderElectionAfterFailure(t *testing.T) {
 
 	leaderCount := 0
 	var newLeader *raft.RaftNode
-	
+
 	for _, node := range nodes {
 		if node.IsLeader() {
 			leaderCount++
@@ -189,7 +189,7 @@ func TestLogReplication(t *testing.T) {
 	for _, nodeID := range peers {
 		applyCh := make(chan raft.ApplyMsg, 100)
 		applyChannels[nodeID] = applyCh
-		
+
 		node := raft.NewRaftNode(nodeID, peers, transport, applyCh)
 		nodes[nodeID] = node
 		transport.RegisterNode(nodeID, node)
@@ -210,7 +210,7 @@ func TestLogReplication(t *testing.T) {
 	}
 
 	commands := []string{"command1", "command2", "command3"}
-	
+
 	for _, cmd := range commands {
 		index, term, isLeader := leader.Start(cmd)
 		if !isLeader {
@@ -227,7 +227,7 @@ func TestLogReplication(t *testing.T) {
 	for nodeID, node := range nodes {
 		logLength := node.GetLogLength()
 		if logLength != len(commands) {
-			t.Errorf("Node %s should have %d log entries, got %d", 
+			t.Errorf("Node %s should have %d log entries, got %d",
 				nodeID, len(commands), logLength)
 		}
 	}
@@ -246,7 +246,7 @@ func TestNetworkPartition(t *testing.T) {
 	for _, nodeID := range peers {
 		applyCh := make(chan raft.ApplyMsg, 100)
 		applyChannels[nodeID] = applyCh
-		
+
 		node := raft.NewRaftNode(nodeID, peers, transport, applyCh)
 		nodes[nodeID] = node
 		transport.RegisterNode(nodeID, node)
@@ -255,7 +255,7 @@ func TestNetworkPartition(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	var originalLeader *raft.RaftNode
-	
+
 	for _, node := range nodes {
 		if node.IsLeader() {
 			originalLeader = node
@@ -319,7 +319,7 @@ func TestConcurrentCommands(t *testing.T) {
 	for _, nodeID := range peers {
 		applyCh := make(chan raft.ApplyMsg, 100)
 		applyChannels[nodeID] = applyCh
-		
+
 		node := raft.NewRaftNode(nodeID, peers, transport, applyCh)
 		nodes[nodeID] = node
 		transport.RegisterNode(nodeID, node)
@@ -346,7 +346,7 @@ func TestConcurrentCommands(t *testing.T) {
 		go func(cmdNum int) {
 			cmd := fmt.Sprintf("concurrent-cmd-%d", cmdNum)
 			index, term, isLeader := leader.Start(cmd)
-			
+
 			if isLeader && index > 0 && term > 0 {
 				done <- true
 			} else {

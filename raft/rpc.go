@@ -61,8 +61,8 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 			lastLogTerm = rs.persistent.Log[lastLogIndex-1].Term
 		}
 
-		if args.LastLogTerm > lastLogTerm || 
-		   (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+		if args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			rs.persistent.VotedFor = &args.CandidateID
 			reply.VoteGranted = true
 			rs.ResetElectionTimer()
@@ -89,7 +89,7 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 
 	rs.state = Follower
-	rs.currentLeader = args.LeaderID  // Track who the current leader is
+	rs.currentLeader = args.LeaderID // Track who the current leader is
 	rs.ResetElectionTimer()
 
 	if args.PrevLogIndex > len(rs.persistent.Log) {
@@ -105,7 +105,7 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 			rs.persistent.Log = rs.persistent.Log[:args.PrevLogIndex]
 		}
 		rs.persistent.Log = append(rs.persistent.Log, args.Entries...)
-		
+
 		for i := range rs.persistent.Log[args.PrevLogIndex:] {
 			rs.persistent.Log[args.PrevLogIndex+i].Index = args.PrevLogIndex + i + 1
 		}
@@ -125,7 +125,7 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	rs.persistent.CurrentTerm++
 	rs.state = Candidate
 	rs.persistent.VotedFor = &rs.nodeID
-	rs.currentLeader = ""  // Clear current leader when starting election
+	rs.currentLeader = "" // Clear current leader when starting election
 	currentTerm := rs.persistent.CurrentTerm
 	lastLogIndex := len(rs.persistent.Log)
 	lastLogTerm := 0
@@ -143,7 +143,7 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	if len(rs.peers) == 1 {
 		rs.mu.Lock()
 		rs.state = Leader
-		rs.currentLeader = rs.nodeID  // Set self as leader
+		rs.currentLeader = rs.nodeID // Set self as leader
 		rs.initializeLeaderState()
 		rs.mu.Unlock()
 		// Stop election timer for leader
@@ -190,7 +190,7 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 				votes++
 				if votes >= votesNeeded && rs.state == Candidate {
 					rs.state = Leader
-					rs.currentLeader = rs.nodeID  // Set self as leader
+					rs.currentLeader = rs.nodeID // Set self as leader
 					rs.initializeLeaderState()
 					// Stop election timer for leader
 					rs.electionTimer.Stop()
@@ -232,7 +232,7 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 			if prevLogIndex > 0 {
 				prevLogTerm = rs.persistent.Log[prevLogIndex-1].Term
 			}
-			
+
 			entries := make([]LogEntry, 0)
 			if nextIndex <= len(rs.persistent.Log) {
 				entries = rs.persistent.Log[nextIndex-1:]

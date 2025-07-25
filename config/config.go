@@ -9,37 +9,37 @@ import (
 )
 
 type Config struct {
-	NodeID           string            `json:"node_id"`
-	ListenAddr       string            `json:"listen_addr"`
-	Peers            map[string]string `json:"peers"`
-	DataDir          string            `json:"data_dir"`
-	LogLevel         string            `json:"log_level"`
-	
-	ElectionTimeout  time.Duration     `json:"election_timeout"`
-	HeartbeatTimeout time.Duration     `json:"heartbeat_timeout"`
-	
-	MaxRaftState     int               `json:"max_raft_state"`
-	SnapshotInterval int               `json:"snapshot_interval"`
-	
-	HTTPServerAddr   string            `json:"http_server_addr"`
-	HTTPReadTimeout  time.Duration     `json:"http_read_timeout"`
-	HTTPWriteTimeout time.Duration     `json:"http_write_timeout"`
+	NodeID     string            `json:"node_id"`
+	ListenAddr string            `json:"listen_addr"`
+	Peers      map[string]string `json:"peers"`
+	DataDir    string            `json:"data_dir"`
+	LogLevel   string            `json:"log_level"`
+
+	ElectionTimeout  time.Duration `json:"election_timeout"`
+	HeartbeatTimeout time.Duration `json:"heartbeat_timeout"`
+
+	MaxRaftState     int `json:"max_raft_state"`
+	SnapshotInterval int `json:"snapshot_interval"`
+
+	HTTPServerAddr   string        `json:"http_server_addr"`
+	HTTPReadTimeout  time.Duration `json:"http_read_timeout"`
+	HTTPWriteTimeout time.Duration `json:"http_write_timeout"`
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		NodeID:           "node1",
-		ListenAddr:       "localhost:8080",
-		Peers:            make(map[string]string),
-		DataDir:          "./data",
-		LogLevel:         "INFO",
-		
+		NodeID:     "node1",
+		ListenAddr: "localhost:8080",
+		Peers:      make(map[string]string),
+		DataDir:    "./data",
+		LogLevel:   "INFO",
+
 		ElectionTimeout:  150 * time.Millisecond,
 		HeartbeatTimeout: 50 * time.Millisecond,
-		
+
 		MaxRaftState:     1000,
 		SnapshotInterval: 100,
-		
+
 		HTTPServerAddr:   "localhost:9080",
 		HTTPReadTimeout:  10 * time.Second,
 		HTTPWriteTimeout: 10 * time.Second,

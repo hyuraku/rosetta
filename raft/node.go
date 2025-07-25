@@ -25,7 +25,7 @@ func NewRaftNode(nodeID string, peers []string, transport RPCTransport, applyCh 
 		applyCh:   applyCh,
 		logger:    log.New(log.Writer(), "[RAFT-"+nodeID+"] ", log.LstdFlags),
 	}
-	
+
 	go node.run()
 	return node
 }
@@ -87,7 +87,7 @@ func (rn *RaftNode) Start(command interface{}) (int, int, bool) {
 
 	index := rn.state.AppendLogEntry(command, "command")
 	rn.logger.Printf("Started command at index %d, term %d", index, term)
-	
+
 	return index, term, true
 }
 
@@ -102,11 +102,11 @@ func (rn *RaftNode) GetNodeID() string {
 func (rn *RaftNode) GetLeader() string {
 	rn.mu.RLock()
 	defer rn.mu.RUnlock()
-	
+
 	if rn.state.GetNodeState() == Leader {
 		return rn.state.nodeID
 	}
-	
+
 	// Return the tracked current leader
 	return rn.state.currentLeader
 }
@@ -155,7 +155,7 @@ func (mt *MockTransport) SendRequestVote(ctx context.Context, target string, arg
 	mt.mu.RLock()
 	node, exists := mt.nodes[target]
 	mt.mu.RUnlock()
-	
+
 	if !exists {
 		return nil, context.DeadlineExceeded
 	}
@@ -169,7 +169,7 @@ func (mt *MockTransport) SendAppendEntries(ctx context.Context, target string, a
 	mt.mu.RLock()
 	node, exists := mt.nodes[target]
 	mt.mu.RUnlock()
-	
+
 	if !exists {
 		return nil, context.DeadlineExceeded
 	}
@@ -188,7 +188,7 @@ func (mt *MockTransport) RemoveNode(nodeID string) {
 func (mt *MockTransport) GetNodes() map[string]*RaftNode {
 	mt.mu.RLock()
 	defer mt.mu.RUnlock()
-	
+
 	result := make(map[string]*RaftNode)
 	for k, v := range mt.nodes {
 		result[k] = v

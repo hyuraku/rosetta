@@ -14,12 +14,12 @@ import (
 )
 
 type HTTPTransport struct {
-	addr        string
-	client      *http.Client
-	peers       map[string]string
-	mu          sync.RWMutex
-	raftNode    *raft.RaftNode
-	server      *http.Server
+	addr     string
+	client   *http.Client
+	peers    map[string]string
+	mu       sync.RWMutex
+	raftNode *raft.RaftNode
+	server   *http.Server
 }
 
 func NewHTTPTransport(addr string) *HTTPTransport {
@@ -213,7 +213,7 @@ func (ht *HTTPTransport) GetAddr() string {
 func (ht *HTTPTransport) GetPeers() map[string]string {
 	ht.mu.RLock()
 	defer ht.mu.RUnlock()
-	
+
 	result := make(map[string]string)
 	for k, v := range ht.peers {
 		result[k] = v

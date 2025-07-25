@@ -18,7 +18,7 @@ func (s NodeState) String() string {
 	case Follower:
 		return "Follower"
 	case Candidate:
-		return "Candidate" 
+		return "Candidate"
 	case Leader:
 		return "Leader"
 	default:
@@ -45,20 +45,20 @@ type LeaderState struct {
 type RaftState struct {
 	mu sync.RWMutex
 
-	nodeID    string
-	state     NodeState
-	peers     []string
+	nodeID string
+	state  NodeState
+	peers  []string
 
 	persistent PersistentState
 	volatile   VolatileState
 	leader     *LeaderState
-	
-	currentLeader   string  // Track the current leader ID
 
-	electionTimeout time.Duration
+	currentLeader string // Track the current leader ID
+
+	electionTimeout  time.Duration
 	heartbeatTimeout time.Duration
-	lastHeartbeat   time.Time
-	electionTimer   *time.Timer
+	lastHeartbeat    time.Time
+	electionTimer    *time.Timer
 
 	applyCh chan ApplyMsg
 }
@@ -81,9 +81,9 @@ func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftSta
 		lastHeartbeat:    time.Now(),
 		applyCh:          applyCh,
 	}
-	
+
 	rs.electionTimer = time.NewTimer(rs.electionTimeout)
-	
+
 	return rs
 }
 
@@ -109,7 +109,7 @@ func (rs *RaftState) SetState(state NodeState) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.state = state
-	
+
 	if state == Leader {
 		rs.initializeLeaderState()
 	} else {
@@ -150,7 +150,7 @@ func (rs *RaftState) initializeLeaderState() {
 		NextIndex:  make(map[string]int),
 		MatchIndex: make(map[string]int),
 	}
-	
+
 	nextIndex := len(rs.persistent.Log) + 1
 	for _, peer := range rs.peers {
 		if peer != rs.nodeID {

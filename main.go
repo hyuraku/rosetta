@@ -18,10 +18,10 @@ import (
 )
 
 type HTTPServer struct {
-	kvStore    *kvstore.KVStore
-	raftNode   *raft.RaftNode
-	config     *config.Config
-	server     *http.Server
+	kvStore  *kvstore.KVStore
+	raftNode *raft.RaftNode
+	config   *config.Config
+	server   *http.Server
 }
 
 func NewHTTPServer(kvs *kvstore.KVStore, raftNode *raft.RaftNode, cfg *config.Config) *HTTPServer {
@@ -145,7 +145,7 @@ func (hs *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 func (hs *HTTPServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	term, isLeader := hs.raftNode.GetState()
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"node_id":   hs.raftNode.GetNodeID(),
@@ -157,7 +157,7 @@ func (hs *HTTPServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (hs *HTTPServer) handleLeader(w http.ResponseWriter, r *http.Request) {
 	leader := hs.raftNode.GetLeader()
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"leader": leader,
@@ -215,7 +215,7 @@ func main() {
 
 	peerIDs := cfg.GetPeerIDs()
 	raftNode := raft.NewRaftNode(cfg.NodeID, peerIDs, transport, applyCh)
-	
+
 	kvs.SetRaft(raftNode)
 	transport.SetRaftNode(raftNode)
 

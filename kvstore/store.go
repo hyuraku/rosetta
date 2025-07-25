@@ -43,14 +43,14 @@ type KVStore struct {
 
 func NewKVStore(maxRaftState int) *KVStore {
 	applyCh := make(chan raft.ApplyMsg, 100)
-	
+
 	kvs := &KVStore{
 		data:         make(map[string]string),
 		applyCh:      applyCh,
 		pendingOps:   make(map[string]chan Result),
 		maxRaftState: maxRaftState,
 	}
-	
+
 	go kvs.applyLoop()
 	return kvs
 }
@@ -186,7 +186,7 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value string) 
 func (kvs *KVStore) GetSnapshot() map[string]string {
 	kvs.mu.RLock()
 	defer kvs.mu.RUnlock()
-	
+
 	snapshot := make(map[string]string)
 	for k, v := range kvs.data {
 		snapshot[k] = v
@@ -197,7 +197,7 @@ func (kvs *KVStore) GetSnapshot() map[string]string {
 func (kvs *KVStore) RestoreSnapshot(snapshot map[string]string) {
 	kvs.mu.Lock()
 	defer kvs.mu.Unlock()
-	
+
 	kvs.data = make(map[string]string)
 	for k, v := range snapshot {
 		kvs.data[k] = v
@@ -213,7 +213,7 @@ func (kvs *KVStore) Size() int {
 func (kvs *KVStore) Keys() []string {
 	kvs.mu.RLock()
 	defer kvs.mu.RUnlock()
-	
+
 	keys := make([]string, 0, len(kvs.data))
 	for k := range kvs.data {
 		keys = append(keys, k)
