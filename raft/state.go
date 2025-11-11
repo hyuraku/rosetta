@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -42,6 +43,12 @@ type LeaderState struct {
 	MatchIndex map[string]int
 }
 
+// Persister interface for saving/loading persistent state
+type Persister interface {
+	SaveRaftState(state *PersistentState) error
+	LoadRaftState() (*PersistentState, error)
+}
+
 type RaftState struct {
 	mu sync.RWMutex
 
@@ -60,7 +67,9 @@ type RaftState struct {
 	lastHeartbeat    time.Time
 	electionTimer    *time.Timer
 
-	applyCh chan ApplyMsg
+	applyCh   chan ApplyMsg
+	persister Persister
+	logger    *log.Logger
 }
 
 type ApplyMsg struct {
@@ -70,6 +79,10 @@ type ApplyMsg struct {
 }
 
 func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftState {
+	return NewRaftStateWithPersister(nodeID, peers, applyCh, nil)
+}
+
+func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan ApplyMsg, persister Persister) *RaftState {
 	rs := &RaftState{
 		nodeID:           nodeID,
 		state:            Follower,
@@ -80,11 +93,46 @@ func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftSta
 		heartbeatTimeout: 50 * time.Millisecond,
 		lastHeartbeat:    time.Now(),
 		applyCh:          applyCh,
+		persister:        persister,
+		logger:           log.New(log.Writer(), "[RAFT-STATE-"+nodeID+"] ", log.LstdFlags),
+	}
+
+	// Load persistent state if persister is available
+	if persister != nil {
+		if err := rs.loadPersistentState(); err != nil {
+			rs.logger.Printf("Warning: failed to load persistent state: %v", err)
+		}
 	}
 
 	rs.electionTimer = time.NewTimer(rs.electionTimeout)
 
 	return rs
+}
+
+// loadPersistentState loads the persistent state from storage
+func (rs *RaftState) loadPersistentState() error {
+	state, err := rs.persister.LoadRaftState()
+	if err != nil {
+		return err
+	}
+
+	if state != nil {
+		rs.persistent = *state
+		rs.logger.Printf("Loaded persistent state: term=%d, log_size=%d", state.CurrentTerm, len(state.Log))
+	}
+
+	return nil
+}
+
+// persist saves the current persistent state to storage
+func (rs *RaftState) persist() {
+	if rs.persister == nil {
+		return
+	}
+
+	if err := rs.persister.SaveRaftState(&rs.persistent); err != nil {
+		rs.logger.Printf("Error: failed to persist state: %v", err)
+	}
 }
 
 func (rs *RaftState) GetState() (int, bool) {
@@ -122,12 +170,14 @@ func (rs *RaftState) IncrementTerm() {
 	defer rs.mu.Unlock()
 	rs.persistent.CurrentTerm++
 	rs.persistent.VotedFor = nil
+	rs.persist()
 }
 
 func (rs *RaftState) SetVotedFor(nodeID *string) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.persistent.VotedFor = nodeID
+	rs.persist()
 }
 
 func (rs *RaftState) GetVotedFor() *string {

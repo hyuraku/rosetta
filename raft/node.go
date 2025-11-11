@@ -18,8 +18,12 @@ type RaftNode struct {
 }
 
 func NewRaftNode(nodeID string, peers []string, transport RPCTransport, applyCh chan ApplyMsg) *RaftNode {
+	return NewRaftNodeWithPersister(nodeID, peers, transport, applyCh, nil)
+}
+
+func NewRaftNodeWithPersister(nodeID string, peers []string, transport RPCTransport, applyCh chan ApplyMsg, persister Persister) *RaftNode {
 	node := &RaftNode{
-		state:     NewRaftState(nodeID, peers, applyCh),
+		state:     NewRaftStateWithPersister(nodeID, peers, applyCh, persister),
 		transport: transport,
 		done:      make(chan struct{}),
 		applyCh:   applyCh,

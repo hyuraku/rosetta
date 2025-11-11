@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
 	"rosetta/config"
 	"rosetta/kvstore"
 	"rosetta/network"
+	"rosetta/persistence"
 	"rosetta/raft"
 )
 
@@ -207,14 +209,27 @@ func main() {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
-	kvs := kvstore.NewKVStore(cfg.MaxRaftState)
+	// Setup persistence
+	dataDir := filepath.Join(cfg.DataDir, cfg.NodeID)
+	storage, err := persistence.NewFileStorage(dataDir)
+	if err != nil {
+		log.Fatalf("Failed to create storage: %v", err)
+	}
+	log.Printf("Persistence enabled: data directory = %s", dataDir)
+
+	// Create Raft persister and KV snapshotter
+	raftPersister := persistence.NewRaftPersister(storage)
+	kvSnapshotter := persistence.NewKVSnapshotter(storage)
+
+	// Create KV store with snapshotter
+	kvs := kvstore.NewKVStoreWithSnapshotter(cfg.MaxRaftState, kvSnapshotter)
 	applyCh := kvs.GetApplyCh()
 
 	transport := network.NewHTTPTransport(cfg.ListenAddr)
 	transport.SetPeers(cfg.Peers)
 
 	peerIDs := cfg.GetPeerIDs()
-	raftNode := raft.NewRaftNode(cfg.NodeID, peerIDs, transport, applyCh)
+	raftNode := raft.NewRaftNodeWithPersister(cfg.NodeID, peerIDs, transport, applyCh, raftPersister)
 
 	kvs.SetRaft(raftNode)
 	transport.SetRaftNode(raftNode)

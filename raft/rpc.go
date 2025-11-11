@@ -109,6 +109,7 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		for i := range rs.persistent.Log[args.PrevLogIndex:] {
 			rs.persistent.Log[args.PrevLogIndex+i].Index = args.PrevLogIndex + i + 1
 		}
+		rs.persist()
 	}
 
 	if args.LeaderCommit > rs.volatile.CommitIndex {
