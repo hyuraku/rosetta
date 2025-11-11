@@ -133,6 +133,7 @@ func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) int {
 		Type:    entryType,
 	}
 	rs.persistent.Log = append(rs.persistent.Log, entry)
+	rs.persist()
 	return index
 }
 
@@ -184,6 +185,7 @@ func (rs *RaftState) TruncateLogAfter(index int) {
 	} else if index < len(rs.persistent.Log) {
 		rs.persistent.Log = rs.persistent.Log[:index]
 	}
+	rs.persist()
 }
 
 func (rs *RaftState) appendLogEntries(prevLogIndex int, prevLogTerm int, entries []LogEntry) bool {
@@ -205,6 +207,7 @@ func (rs *RaftState) appendLogEntries(prevLogIndex int, prevLogTerm int, entries
 		for i := range rs.persistent.Log[prevLogIndex:] {
 			rs.persistent.Log[prevLogIndex+i].Index = prevLogIndex + i + 1
 		}
+		rs.persist()
 	}
 
 	return true

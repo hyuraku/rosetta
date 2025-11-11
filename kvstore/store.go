@@ -3,6 +3,7 @@ package kvstore
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -29,6 +30,12 @@ type Result struct {
 	Err   error  `json:"error"`
 }
 
+// Snapshotter interface for saving/loading snapshots
+type Snapshotter interface {
+	SaveSnapshot(data map[string]string, lastIncludedIndex, lastIncludedTerm int) error
+	LoadSnapshot() (data map[string]string, lastIncludedIndex, lastIncludedTerm int, err error)
+}
+
 type KVStore struct {
 	mu      sync.RWMutex
 	data    map[string]string
@@ -38,21 +45,80 @@ type KVStore struct {
 	pendingOps map[string]chan Result
 	opMu       sync.RWMutex
 
-	maxRaftState int
+	maxRaftState     int
+	snapshotter      Snapshotter
+	lastAppliedIndex int
+	lastAppliedTerm  int
+	logger           *log.Logger
 }
 
 func NewKVStore(maxRaftState int) *KVStore {
+	return NewKVStoreWithSnapshotter(maxRaftState, nil)
+}
+
+func NewKVStoreWithSnapshotter(maxRaftState int, snapshotter Snapshotter) *KVStore {
 	applyCh := make(chan raft.ApplyMsg, 100)
 
 	kvs := &KVStore{
-		data:         make(map[string]string),
-		applyCh:      applyCh,
-		pendingOps:   make(map[string]chan Result),
-		maxRaftState: maxRaftState,
+		data:             make(map[string]string),
+		applyCh:          applyCh,
+		pendingOps:       make(map[string]chan Result),
+		maxRaftState:     maxRaftState,
+		snapshotter:      snapshotter,
+		lastAppliedIndex: 0,
+		lastAppliedTerm:  0,
+		logger:           log.New(log.Writer(), "[KVSTORE] ", log.LstdFlags),
+	}
+
+	// Load snapshot if available
+	if snapshotter != nil {
+		if err := kvs.loadSnapshot(); err != nil {
+			kvs.logger.Printf("Warning: failed to load snapshot: %v", err)
+		}
 	}
 
 	go kvs.applyLoop()
 	return kvs
+}
+
+// loadSnapshot loads the snapshot from storage
+func (kvs *KVStore) loadSnapshot() error {
+	data, lastIndex, lastTerm, err := kvs.snapshotter.LoadSnapshot()
+	if err != nil {
+		return err
+	}
+
+	if data != nil {
+		kvs.mu.Lock()
+		kvs.data = data
+		kvs.lastAppliedIndex = lastIndex
+		kvs.lastAppliedTerm = lastTerm
+		kvs.mu.Unlock()
+		kvs.logger.Printf("Loaded snapshot: entries=%d, lastIndex=%d, lastTerm=%d", len(data), lastIndex, lastTerm)
+	}
+
+	return nil
+}
+
+// saveSnapshot saves the current state to a snapshot
+func (kvs *KVStore) saveSnapshot(lastIndex, lastTerm int) error {
+	if kvs.snapshotter == nil {
+		return nil
+	}
+
+	kvs.mu.RLock()
+	dataCopy := make(map[string]string, len(kvs.data))
+	for k, v := range kvs.data {
+		dataCopy[k] = v
+	}
+	kvs.mu.RUnlock()
+
+	if err := kvs.snapshotter.SaveSnapshot(dataCopy, lastIndex, lastTerm); err != nil {
+		return err
+	}
+
+	kvs.logger.Printf("Saved snapshot: entries=%d, lastIndex=%d, lastTerm=%d", len(dataCopy), lastIndex, lastTerm)
+	return nil
 }
 
 func (kvs *KVStore) SetRaft(raftNode *raft.RaftNode) {
