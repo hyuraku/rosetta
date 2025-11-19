@@ -138,6 +138,14 @@ func (rn *RaftNode) SetLogger(logger *log.Logger) {
 	rn.logger = logger
 }
 
+// TriggerSnapshot triggers log compaction up to the given index
+func (rn *RaftNode) TriggerSnapshot(lastIncludedIndex int) {
+	// This is called by the KV store when it has saved a snapshot
+	// The actual log truncation will happen asynchronously
+	rn.logger.Printf("Snapshot trigger received for index %d", lastIncludedIndex)
+	// Note: Actual log truncation is handled in the snapshot.go TakeSnapshot method
+}
+
 type MockTransport struct {
 	nodes map[string]*RaftNode
 	mu    sync.RWMutex
@@ -181,6 +189,20 @@ func (mt *MockTransport) SendAppendEntries(ctx context.Context, target string, a
 	reply := &AppendEntriesReply{}
 	err := node.AppendEntries(args, reply)
 	return reply, err
+}
+
+func (mt *MockTransport) SendInstallSnapshot(ctx context.Context, target string, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
+	mt.mu.RLock()
+	node, exists := mt.nodes[target]
+	mt.mu.RUnlock()
+
+	if !exists {
+		return nil, context.DeadlineExceeded
+	}
+
+	reply := &InstallSnapshotReply{}
+	node.state.InstallSnapshot(args, reply)
+	return reply, nil
 }
 
 func (mt *MockTransport) RemoveNode(nodeID string) {

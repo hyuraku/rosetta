@@ -9,6 +9,7 @@ A distributed key-value store implementation using the Raft consensus algorithm,
 - **Leader Election**: Automatic leader election with randomized timeouts
 - **Log Replication**: Ensures all nodes maintain consistent state
 - **Persistence**: Crash recovery with durable storage of Raft state and KV data
+- **Log Compaction**: Automatic snapshotting prevents unbounded log growth
 - **HTTP API**: RESTful interface for key-value operations
 - **Fault Tolerance**: Handles node failures and network partitions
 - **Testing Suite**: Comprehensive unit and integration tests

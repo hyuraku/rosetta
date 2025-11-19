@@ -31,6 +31,10 @@ type PersistentState struct {
 	CurrentTerm int
 	VotedFor    *string
 	Log         []LogEntry
+
+	// Snapshot metadata
+	LastIncludedIndex int // Index of last entry in snapshot
+	LastIncludedTerm  int // Term of last entry in snapshot
 }
 
 type VolatileState struct {
@@ -76,6 +80,12 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+
+	// For snapshots
+	SnapshotValid bool
+	SnapshotIndex int
+	SnapshotTerm  int
+	SnapshotData  []byte
 }
 
 func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftState {

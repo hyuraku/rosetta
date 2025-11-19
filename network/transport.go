@@ -44,6 +44,7 @@ func (ht *HTTPTransport) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/raft/requestvote", ht.handleRequestVote)
 	mux.HandleFunc("/raft/appendentries", ht.handleAppendEntries)
+	mux.HandleFunc("/raft/installsnapshot", ht.handleInstallSnapshot)
 
 	ht.server = &http.Server{
 		Addr:         ht.addr,
@@ -219,4 +220,81 @@ func (ht *HTTPTransport) GetPeers() map[string]string {
 		result[k] = v
 	}
 	return result
+}
+
+// SendInstallSnapshot sends an InstallSnapshot RPC to a peer
+func (ht *HTTPTransport) SendInstallSnapshot(ctx context.Context, target string, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	ht.mu.RLock()
+	addr, exists := ht.peers[target]
+	ht.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("peer %s not found", target)
+	}
+
+	data, err := json.Marshal(args)
+	if err != nil {
+		return nil, err
+	}
+
+	url := fmt.Sprintf("http://%s/raft/installsnapshot", addr)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ht.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var reply raft.InstallSnapshotReply
+	if err := json.Unmarshal(body, &reply); err != nil {
+		return nil, err
+	}
+
+	return &reply, nil
+}
+
+// handleInstallSnapshot handles incoming InstallSnapshot RPCs
+func (ht *HTTPTransport) handleInstallSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var args raft.InstallSnapshotArgs
+	if err := json.Unmarshal(body, &args); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var reply raft.InstallSnapshotReply
+	ht.raftNode.GetRaftState().InstallSnapshot(&args, &reply)
+
+	replyData, err := json.Marshal(&reply)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(replyData)
 }

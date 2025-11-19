@@ -126,7 +126,16 @@ func (kvs *KVStore) SetRaft(raftNode *raft.RaftNode) {
 }
 
 func (kvs *KVStore) applyLoop() {
+	commandsSinceSnapshot := 0
+
 	for applyMsg := range kvs.applyCh {
+		// Handle snapshot installation
+		if applyMsg.SnapshotValid {
+			kvs.installSnapshotFromApplyMsg(&applyMsg)
+			commandsSinceSnapshot = 0
+			continue
+		}
+
 		if !applyMsg.CommandValid {
 			continue
 		}
@@ -144,6 +153,11 @@ func (kvs *KVStore) applyLoop() {
 
 		result := kvs.executeCommand(&cmd)
 
+		// Update last applied index
+		kvs.mu.Lock()
+		kvs.lastAppliedIndex = applyMsg.CommandIndex
+		kvs.mu.Unlock()
+
 		kvs.opMu.RLock()
 		if ch, exists := kvs.pendingOps[cmd.ID]; exists {
 			select {
@@ -153,7 +167,45 @@ func (kvs *KVStore) applyLoop() {
 			delete(kvs.pendingOps, cmd.ID)
 		}
 		kvs.opMu.RUnlock()
+
+		// Check if we should take a snapshot
+		commandsSinceSnapshot++
+		if kvs.maxRaftState > 0 && commandsSinceSnapshot >= kvs.maxRaftState {
+			kvs.mu.RLock()
+			lastIndex := kvs.lastAppliedIndex
+			lastTerm := kvs.lastAppliedTerm
+			kvs.mu.RUnlock()
+
+			if err := kvs.saveSnapshot(lastIndex, lastTerm); err != nil {
+				kvs.logger.Printf("Failed to save snapshot: %v", err)
+			} else {
+				// Notify Raft to compact log
+				if kvs.raft != nil {
+					kvs.raft.TriggerSnapshot(lastIndex)
+				}
+				commandsSinceSnapshot = 0
+			}
+		}
 	}
+}
+
+// installSnapshotFromApplyMsg installs a snapshot received via apply channel
+func (kvs *KVStore) installSnapshotFromApplyMsg(msg *raft.ApplyMsg) {
+	// Deserialize snapshot data
+	var snapshotData map[string]string
+	if err := json.Unmarshal(msg.SnapshotData, &snapshotData); err != nil {
+		kvs.logger.Printf("Failed to unmarshal snapshot data: %v", err)
+		return
+	}
+
+	kvs.mu.Lock()
+	kvs.data = snapshotData
+	kvs.lastAppliedIndex = msg.SnapshotIndex
+	kvs.lastAppliedTerm = msg.SnapshotTerm
+	kvs.mu.Unlock()
+
+	kvs.logger.Printf("Installed snapshot: entries=%d, lastIndex=%d, lastTerm=%d",
+		len(snapshotData), msg.SnapshotIndex, msg.SnapshotTerm)
 }
 
 func (kvs *KVStore) executeCommand(cmd *Command) Result {
