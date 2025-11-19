@@ -32,9 +32,22 @@ type AppendEntriesReply struct {
 	Success bool `json:"success"`
 }
 
+type InstallSnapshotArgs struct {
+	Term              int    `json:"term"`
+	LeaderID          string `json:"leaderId"`
+	LastIncludedIndex int    `json:"lastIncludedIndex"`
+	LastIncludedTerm  int    `json:"lastIncludedTerm"`
+	Data              []byte `json:"data"`
+}
+
+type InstallSnapshotReply struct {
+	Term int `json:"term"`
+}
+
 type RPCTransport interface {
 	SendRequestVote(ctx context.Context, target string, args *RequestVoteArgs) (*RequestVoteReply, error)
 	SendAppendEntries(ctx context.Context, target string, args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	SendInstallSnapshot(ctx context.Context, target string, args *InstallSnapshotArgs) (*InstallSnapshotReply, error)
 }
 
 func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -344,6 +357,94 @@ func SerializeAppendEntriesReply(reply *AppendEntriesReply) ([]byte, error) {
 
 func DeserializeAppendEntriesReply(data []byte) (*AppendEntriesReply, error) {
 	var reply AppendEntriesReply
+	err := json.Unmarshal(data, &reply)
+	return &reply, err
+}
+
+// InstallSnapshot RPC handler
+func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	// Reply immediately if term is stale
+	if args.Term < rs.persistent.CurrentTerm {
+		reply.Term = rs.persistent.CurrentTerm
+		return
+	}
+
+	// Update term if necessary
+	if args.Term > rs.persistent.CurrentTerm {
+		rs.persistent.CurrentTerm = args.Term
+		rs.persistent.VotedFor = nil
+		rs.state = Follower
+		rs.persist()
+	}
+
+	reply.Term = rs.persistent.CurrentTerm
+
+	// Reset election timer - valid communication from leader
+	rs.state = Follower
+	rs.currentLeader = args.LeaderID
+	rs.ResetElectionTimer()
+
+	// Don't install older snapshots
+	if args.LastIncludedIndex <= rs.persistent.LastIncludedIndex {
+		return
+	}
+
+	//  Discard log entries covered by snapshot
+	newLog := make([]LogEntry, 0)
+	for _, entry := range rs.persistent.Log {
+		if entry.Index > args.LastIncludedIndex {
+			newLog = append(newLog, entry)
+		}
+	}
+	rs.persistent.Log = newLog
+
+	// Update snapshot metadata
+	rs.persistent.LastIncludedIndex = args.LastIncludedIndex
+	rs.persistent.LastIncludedTerm = args.LastIncludedTerm
+
+	// Update commit index and last applied
+	if rs.volatile.CommitIndex < args.LastIncludedIndex {
+		rs.volatile.CommitIndex = args.LastIncludedIndex
+	}
+	if rs.volatile.LastApplied < args.LastIncludedIndex {
+		rs.volatile.LastApplied = args.LastIncludedIndex
+	}
+
+	// Persist state
+	rs.persist()
+
+	// Send snapshot data to apply channel for state machine to install
+	rs.applyCh <- ApplyMsg{
+		CommandValid:  false,
+		Command:       args.Data,
+		CommandIndex:  args.LastIncludedIndex,
+		SnapshotValid: true,
+		SnapshotIndex: args.LastIncludedIndex,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotData:  args.Data,
+	}
+}
+
+// Serialization for InstallSnapshot
+func SerializeInstallSnapshotArgs(args *InstallSnapshotArgs) ([]byte, error) {
+	return json.Marshal(args)
+}
+
+func DeserializeInstallSnapshotArgs(data []byte) (*InstallSnapshotArgs, error) {
+	var args InstallSnapshotArgs
+	err := json.Unmarshal(data, &args)
+	return &args, err
+}
+
+func SerializeInstallSnapshotReply(reply *InstallSnapshotReply) ([]byte, error) {
+	return json.Marshal(reply)
+}
+
+func DeserializeInstallSnapshotReply(data []byte) (*InstallSnapshotReply, error) {
+	var reply InstallSnapshotReply
 	err := json.Unmarshal(data, &reply)
 	return &reply, err
 }
