@@ -81,8 +81,8 @@ func TestKVStoreClear(t *testing.T) {
 }
 
 func TestKVStoreWithMockRaft(t *testing.T) {
-	applyCh := make(chan raft.ApplyMsg, 10)
 	kvs := kvstore.NewKVStore(1000)
+	applyCh := kvs.GetApplyCh() // Use KVStore's apply channel
 
 	transport := raft.NewMockTransport()
 	peers := []string{"node1"}
@@ -92,9 +92,13 @@ func TestKVStoreWithMockRaft(t *testing.T) {
 
 	kvs.SetRaft(raftNode)
 
-	time.Sleep(100 * time.Millisecond)
+	// Wait for node to become leader (election timeout + some margin)
+	time.Sleep(350 * time.Millisecond)
 
-	raftNode.GetRaftState().SetState(raft.Leader)
+	// Verify node is leader
+	if !raftNode.IsLeader() {
+		t.Fatal("Node should be leader in single-node cluster")
+	}
 
 	err := kvs.Put("testkey", "testvalue")
 
@@ -102,6 +106,16 @@ func TestKVStoreWithMockRaft(t *testing.T) {
 		t.Errorf("Expected Put to succeed, got error: %v", err)
 	}
 
+	// Verify the value was stored
+	value, err := kvs.Get("testkey")
+	if err != nil {
+		t.Errorf("Expected Get to succeed, got error: %v", err)
+	}
+	if value != "testvalue" {
+		t.Errorf("Expected value 'testvalue', got '%s'", value)
+	}
+
+	kvs.Close()
 	raftNode.Kill()
 }
 

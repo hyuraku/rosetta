@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 )
 
@@ -140,18 +141,20 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	rs.state = Candidate
 	rs.persistent.VotedFor = &rs.nodeID
 	rs.currentLeader = "" // Clear current leader when starting election
+	rs.persist()
 	currentTerm := rs.persistent.CurrentTerm
 	lastLogIndex := len(rs.persistent.Log)
 	lastLogTerm := 0
 	if lastLogIndex > 0 {
 		lastLogTerm = rs.persistent.Log[lastLogIndex-1].Term
 	}
+
+	// Use a vote counter that's protected by the RaftState mutex
+	votes := 1
+	votesNeeded := len(rs.peers)/2 + 1
 	rs.mu.Unlock()
 
 	rs.ResetElectionTimer()
-
-	votes := 1
-	votesNeeded := len(rs.peers)/2 + 1
 
 	// If this is a single-node cluster, immediately become leader
 	if len(rs.peers) == 1 {
@@ -164,6 +167,9 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 		rs.electionTimer.Stop()
 		return
 	}
+
+	// Use a mutex to protect vote counting across goroutines
+	var voteMu sync.Mutex
 
 	for _, peer := range rs.peers {
 		if peer == rs.nodeID {
@@ -197,12 +203,17 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 				rs.persistent.CurrentTerm = reply.Term
 				rs.state = Follower
 				rs.persistent.VotedFor = nil
+				rs.persist()
 				return
 			}
 
 			if reply.VoteGranted {
+				voteMu.Lock()
 				votes++
-				if votes >= votesNeeded && rs.state == Candidate {
+				currentVotes := votes
+				voteMu.Unlock()
+
+				if currentVotes >= votesNeeded && rs.state == Candidate {
 					rs.state = Leader
 					rs.currentLeader = rs.nodeID // Set self as leader
 					rs.initializeLeaderState()

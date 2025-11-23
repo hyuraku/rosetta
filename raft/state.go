@@ -2,6 +2,7 @@ package raft
 
 import (
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -93,13 +94,17 @@ func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftSta
 }
 
 func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan ApplyMsg, persister Persister) *RaftState {
+	// Randomized election timeout between 150ms and 300ms
+	// This prevents split votes when nodes start at the same time
+	randomTimeout := 150 + rand.Intn(150)
+
 	rs := &RaftState{
 		nodeID:           nodeID,
 		state:            Follower,
 		peers:            peers,
 		persistent:       PersistentState{CurrentTerm: 0, VotedFor: nil, Log: make([]LogEntry, 0)},
 		volatile:         VolatileState{CommitIndex: 0, LastApplied: 0},
-		electionTimeout:  time.Duration(150+nodeID[0]*5) * time.Millisecond,
+		electionTimeout:  time.Duration(randomTimeout) * time.Millisecond,
 		heartbeatTimeout: 50 * time.Millisecond,
 		lastHeartbeat:    time.Now(),
 		applyCh:          applyCh,
@@ -197,6 +202,9 @@ func (rs *RaftState) GetVotedFor() *string {
 }
 
 func (rs *RaftState) ResetElectionTimer() {
+	// Randomize election timeout on each reset to prevent split votes
+	randomTimeout := 150 + rand.Intn(150)
+	rs.electionTimeout = time.Duration(randomTimeout) * time.Millisecond
 	rs.electionTimer.Reset(rs.electionTimeout)
 	rs.lastHeartbeat = time.Now()
 }
