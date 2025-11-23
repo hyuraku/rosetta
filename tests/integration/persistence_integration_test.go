@@ -174,8 +174,18 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 
 	kvStore1.SetRaft(raftNode1)
 
-	// Wait for node to stabilize
-	time.Sleep(200 * time.Millisecond)
+	// Wait for node to become leader (poll with timeout)
+	becameLeader := false
+	for i := 0; i < 10; i++ {
+		time.Sleep(100 * time.Millisecond)
+		if raftNode1.IsLeader() {
+			becameLeader = true
+			break
+		}
+	}
+	if !becameLeader {
+		t.Fatal("Node did not become leader within timeout")
+	}
 
 	// Perform some operations
 	testData := map[string]string{
