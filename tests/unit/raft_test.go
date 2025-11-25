@@ -288,3 +288,155 @@ func TestMockTransport(t *testing.T) {
 	node1.Kill()
 	node2.Kill()
 }
+
+// TestAppendEntriesConflictLogTooShort tests fast rollback when follower's log is too short
+func TestAppendEntriesConflictLogTooShort(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"follower", "leader"}
+
+	follower := raft.NewRaftState("follower", peers, applyCh)
+
+	// Leader tries to append at index 5, but follower has empty log
+	args := &raft.AppendEntriesArgs{
+		Term:         2,
+		LeaderID:     "leader",
+		PrevLogIndex: 5,
+		PrevLogTerm:  1,
+		Entries:      []raft.LogEntry{{Term: 2, Index: 6, Command: "cmd", Type: "command"}},
+		LeaderCommit: 0,
+	}
+
+	reply := &raft.AppendEntriesReply{}
+	follower.AppendEntries(args, reply)
+
+	if reply.Success {
+		t.Error("Expected AppendEntries to fail when log is too short")
+	}
+
+	if reply.ConflictTerm != -1 {
+		t.Errorf("Expected ConflictTerm to be -1 (log too short), got %d", reply.ConflictTerm)
+	}
+
+	if reply.ConflictIndex != 1 {
+		t.Errorf("Expected ConflictIndex to be 1 (empty log), got %d", reply.ConflictIndex)
+	}
+}
+
+// TestAppendEntriesConflictTermMismatch tests fast rollback with term mismatch
+func TestAppendEntriesConflictTermMismatch(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"follower", "leader"}
+
+	follower := raft.NewRaftState("follower", peers, applyCh)
+
+	// Populate follower's log with entries from term 1
+	follower.AppendEntries(&raft.AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "leader",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []raft.LogEntry{
+			{Term: 1, Index: 1, Command: "cmd1", Type: "command"},
+			{Term: 1, Index: 2, Command: "cmd2", Type: "command"},
+			{Term: 2, Index: 3, Command: "cmd3", Type: "command"},
+			{Term: 2, Index: 4, Command: "cmd4", Type: "command"},
+		},
+		LeaderCommit: 0,
+	}, &raft.AppendEntriesReply{})
+
+	// Leader tries to append at index 3, but expects term 3 (follower has term 2)
+	args := &raft.AppendEntriesArgs{
+		Term:         3,
+		LeaderID:     "leader",
+		PrevLogIndex: 3,
+		PrevLogTerm:  3, // Mismatch: follower has term 2 at index 3
+		Entries:      []raft.LogEntry{{Term: 3, Index: 4, Command: "cmd", Type: "command"}},
+		LeaderCommit: 0,
+	}
+
+	reply := &raft.AppendEntriesReply{}
+	follower.AppendEntries(args, reply)
+
+	if reply.Success {
+		t.Error("Expected AppendEntries to fail due to term mismatch")
+	}
+
+	if reply.ConflictTerm != 2 {
+		t.Errorf("Expected ConflictTerm to be 2, got %d", reply.ConflictTerm)
+	}
+
+	// ConflictIndex should point to first entry of term 2 (index 3)
+	if reply.ConflictIndex != 3 {
+		t.Errorf("Expected ConflictIndex to be 3 (first index of term 2), got %d", reply.ConflictIndex)
+	}
+}
+
+// TestAppendEntriesConflictFirstIndexOfTerm tests finding first index of conflicting term
+func TestAppendEntriesConflictFirstIndexOfTerm(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"follower", "leader"}
+
+	follower := raft.NewRaftState("follower", peers, applyCh)
+
+	// Create a log: [term1, term1, term2, term2, term2, term3]
+	follower.AppendEntries(&raft.AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "leader",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []raft.LogEntry{
+			{Term: 1, Index: 1, Command: "cmd1", Type: "command"},
+			{Term: 1, Index: 2, Command: "cmd2", Type: "command"},
+			{Term: 2, Index: 3, Command: "cmd3", Type: "command"},
+			{Term: 2, Index: 4, Command: "cmd4", Type: "command"},
+			{Term: 2, Index: 5, Command: "cmd5", Type: "command"},
+			{Term: 3, Index: 6, Command: "cmd6", Type: "command"},
+		},
+		LeaderCommit: 0,
+	}, &raft.AppendEntriesReply{})
+
+	// Leader expects term 4 at index 5, but follower has term 2
+	args := &raft.AppendEntriesArgs{
+		Term:         4,
+		LeaderID:     "leader",
+		PrevLogIndex: 5,
+		PrevLogTerm:  4, // Mismatch
+		Entries:      []raft.LogEntry{{Term: 4, Index: 6, Command: "cmd", Type: "command"}},
+		LeaderCommit: 0,
+	}
+
+	reply := &raft.AppendEntriesReply{}
+	follower.AppendEntries(args, reply)
+
+	if reply.Success {
+		t.Error("Expected AppendEntries to fail")
+	}
+
+	if reply.ConflictTerm != 2 {
+		t.Errorf("Expected ConflictTerm to be 2, got %d", reply.ConflictTerm)
+	}
+
+	// ConflictIndex should be 3 (first entry with term 2)
+	if reply.ConflictIndex != 3 {
+		t.Errorf("Expected ConflictIndex to be 3, got %d", reply.ConflictIndex)
+	}
+}
+
+// TestAppendEntriesReplyStructure tests that reply includes conflict information
+func TestAppendEntriesReplyStructure(t *testing.T) {
+	// This test verifies that AppendEntriesReply has the necessary fields for fast rollback
+	reply := &raft.AppendEntriesReply{
+		Term:          5,
+		Success:       false,
+		ConflictTerm:  3,
+		ConflictIndex: 10,
+	}
+
+	if reply.ConflictTerm != 3 {
+		t.Errorf("Expected ConflictTerm to be 3, got %d", reply.ConflictTerm)
+	}
+
+	if reply.ConflictIndex != 10 {
+		t.Errorf("Expected ConflictIndex to be 10, got %d", reply.ConflictIndex)
+	}
+}

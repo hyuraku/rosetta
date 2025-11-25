@@ -31,6 +31,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  `json:"term"`
 	Success bool `json:"success"`
+
+	// Fast rollback optimization (Section 5.3)
+	ConflictTerm  int `json:"conflictTerm,omitempty"`  // Term of conflicting entry
+	ConflictIndex int `json:"conflictIndex,omitempty"` // First index of ConflictTerm
 }
 
 type InstallSnapshotArgs struct {
@@ -106,11 +110,23 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	rs.currentLeader = args.LeaderID // Track who the current leader is
 	rs.ResetElectionTimer()
 
+	// Fast rollback optimization: handle log consistency check
 	if args.PrevLogIndex > len(rs.persistent.Log) {
+		// Log is too short - return the length so leader can jump back
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = len(rs.persistent.Log) + 1
 		return
 	}
 
 	if args.PrevLogIndex > 0 && rs.persistent.Log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		// Term mismatch - find first index of the conflicting term
+		reply.ConflictTerm = rs.persistent.Log[args.PrevLogIndex-1].Term
+		// Search backwards to find first entry with ConflictTerm
+		conflictIndex := args.PrevLogIndex
+		for conflictIndex > 1 && rs.persistent.Log[conflictIndex-2].Term == reply.ConflictTerm {
+			conflictIndex--
+		}
+		reply.ConflictIndex = conflictIndex
 		return
 	}
 
@@ -300,8 +316,33 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 				rs.leader.NextIndex[peerID] = rs.leader.MatchIndex[peerID] + 1
 				rs.updateCommitIndex()
 			} else {
-				if rs.leader.NextIndex[peerID] > 1 {
-					rs.leader.NextIndex[peerID]--
+				// Fast rollback optimization using conflict information
+				if reply.ConflictTerm == -1 {
+					// Follower's log is too short
+					rs.leader.NextIndex[peerID] = reply.ConflictIndex
+				} else {
+					// Follower has a conflicting term
+					// Search leader's log for the last entry with ConflictTerm
+					lastIndexOfConflictTerm := -1
+					for i := len(rs.persistent.Log) - 1; i >= 0; i-- {
+						if rs.persistent.Log[i].Term == reply.ConflictTerm {
+							lastIndexOfConflictTerm = i + 1 // Convert to 1-based index
+							break
+						}
+					}
+
+					if lastIndexOfConflictTerm > 0 {
+						// Leader has entries from ConflictTerm, skip past them
+						rs.leader.NextIndex[peerID] = lastIndexOfConflictTerm + 1
+					} else {
+						// Leader doesn't have ConflictTerm, use follower's ConflictIndex
+						rs.leader.NextIndex[peerID] = reply.ConflictIndex
+					}
+				}
+
+				// Ensure nextIndex doesn't go below 1
+				if rs.leader.NextIndex[peerID] < 1 {
+					rs.leader.NextIndex[peerID] = 1
 				}
 			}
 		}(peer)
