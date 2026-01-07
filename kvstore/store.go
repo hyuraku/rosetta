@@ -235,11 +235,39 @@ func (kvs *KVStore) Put(key, value string) error {
 }
 
 func (kvs *KVStore) Get(key string) (string, error) {
+	if kvs.raft == nil {
+		return "", fmt.Errorf("raft node not initialized")
+	}
+
+	// Read-only optimization (Raft paper Section 8):
+	// If the leader has recently confirmed leadership via heartbeats,
+	// we can serve reads directly from local state without going through Raft.
+	if kvs.raft.CanServeReadOnlyQuery() {
+		return kvs.getLocal(key)
+	}
+
+	// Fall back to going through Raft for strong consistency
+	// This happens when:
+	// 1. This node is not the leader
+	// 2. The leader hasn't received heartbeat confirmations from a majority recently
 	result := kvs.executeOperationWithResult(OpGet, key, "")
 	if result.Err != nil {
 		return "", result.Err
 	}
 	return result.Value, nil
+}
+
+// getLocal reads directly from local state.
+// This should only be called when CanServeReadOnlyQuery() returns true.
+func (kvs *KVStore) getLocal(key string) (string, error) {
+	kvs.mu.RLock()
+	defer kvs.mu.RUnlock()
+
+	value, exists := kvs.data[key]
+	if !exists {
+		return "", fmt.Errorf("key not found")
+	}
+	return value, nil
 }
 
 func (kvs *KVStore) Delete(key string) error {

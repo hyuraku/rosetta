@@ -128,6 +128,13 @@ func (rn *RaftNode) IsLeader() bool {
 	return isLeader
 }
 
+// CanServeReadOnlyQuery returns true if the leader can safely serve
+// read-only queries without going through the Raft log.
+// This implements the lease-based read optimization from Raft paper Section 8.
+func (rn *RaftNode) CanServeReadOnlyQuery() bool {
+	return rn.state.CanServeReadOnlyQuery()
+}
+
 func (rn *RaftNode) GetRaftState() *RaftState {
 	return rn.state
 }

@@ -440,3 +440,74 @@ func TestAppendEntriesReplyStructure(t *testing.T) {
 		t.Errorf("Expected ConflictIndex to be 10, got %d", reply.ConflictIndex)
 	}
 }
+
+// TestCanServeReadOnlyQuery tests the read-only optimization (Raft paper Section 8)
+func TestCanServeReadOnlyQuery(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1"}
+
+	// Single node cluster - should always allow reads when leader
+	state := raft.NewRaftState("node1", peers, applyCh)
+
+	// Initially follower - cannot serve reads
+	if state.CanServeReadOnlyQuery() {
+		t.Error("Follower should not be able to serve read-only queries")
+	}
+
+	// Become leader (single node, so immediately leader after election)
+	state.SetState(raft.Leader)
+
+	// Single node cluster - should be able to serve reads immediately
+	if !state.CanServeReadOnlyQuery() {
+		t.Error("Single-node leader should be able to serve read-only queries")
+	}
+}
+
+// TestCanServeReadOnlyQueryMultiNode tests read-only optimization in multi-node cluster
+func TestCanServeReadOnlyQueryMultiNode(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1", "node2", "node3"}
+
+	state := raft.NewRaftState("node1", peers, applyCh)
+
+	// Initially follower - cannot serve reads
+	if state.CanServeReadOnlyQuery() {
+		t.Error("Follower should not be able to serve read-only queries")
+	}
+
+	// Become leader
+	state.SetState(raft.Leader)
+
+	// Leader without recent heartbeat confirmation - cannot serve reads
+	// (lastLeaderConfirmation is zero value)
+	if state.CanServeReadOnlyQuery() {
+		t.Error("Leader without heartbeat confirmation should not be able to serve read-only queries")
+	}
+
+	// Simulate successful heartbeat confirmation from majority
+	state.UpdateLeaderConfirmation()
+
+	// Now should be able to serve reads
+	if !state.CanServeReadOnlyQuery() {
+		t.Error("Leader with recent heartbeat confirmation should be able to serve read-only queries")
+	}
+}
+
+// TestRaftNodeCanServeReadOnlyQuery tests the RaftNode wrapper method
+func TestRaftNodeCanServeReadOnlyQuery(t *testing.T) {
+	transport := raft.NewMockTransport()
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"node1"}
+
+	node := raft.NewRaftNode("node1", peers, transport, applyCh)
+	transport.RegisterNode("node1", node)
+	defer node.Kill()
+
+	// Wait for leader election (single node)
+	time.Sleep(500 * time.Millisecond)
+
+	// Single node should be able to serve reads
+	if !node.CanServeReadOnlyQuery() {
+		t.Error("Single-node leader should be able to serve read-only queries via RaftNode")
+	}
+}

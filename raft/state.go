@@ -67,10 +67,11 @@ type RaftState struct {
 
 	currentLeader string // Track the current leader ID
 
-	electionTimeout  time.Duration
-	heartbeatTimeout time.Duration
-	lastHeartbeat    time.Time
-	electionTimer    *time.Timer
+	electionTimeout        time.Duration
+	heartbeatTimeout       time.Duration
+	lastHeartbeat          time.Time
+	electionTimer          *time.Timer
+	lastLeaderConfirmation time.Time // For read-only query optimization (Section 8)
 
 	applyCh   chan ApplyMsg
 	persister Persister
@@ -244,4 +245,38 @@ func (rs *RaftState) GetLastHeartbeat() time.Time {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	return rs.lastHeartbeat
+}
+
+// UpdateLeaderConfirmation updates the time when leadership was confirmed
+// via successful heartbeat responses from a majority of peers.
+// This is used for read-only query optimization (Raft paper Section 8).
+func (rs *RaftState) UpdateLeaderConfirmation() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.lastLeaderConfirmation = time.Now()
+}
+
+// CanServeReadOnlyQuery returns true if the leader can safely serve
+// read-only queries without going through the Raft log.
+// This implements the lease-based read optimization from Raft paper Section 8.
+// The leader can serve reads if:
+//  1. It is currently the leader
+//  2. It has received successful heartbeat responses from a majority within
+//     the election timeout period (indicating it's still the valid leader)
+func (rs *RaftState) CanServeReadOnlyQuery() bool {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
+	if rs.state != Leader {
+		return false
+	}
+
+	// For single-node cluster, always allow reads
+	if len(rs.peers) == 1 {
+		return true
+	}
+
+	// Check if leadership was confirmed within the election timeout
+	// Using election timeout as the lease period ensures safety
+	return time.Since(rs.lastLeaderConfirmation) < rs.electionTimeout
 }
