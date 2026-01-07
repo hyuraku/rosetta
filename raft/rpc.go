@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -250,15 +251,24 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	currentTerm := rs.persistent.CurrentTerm
 	commitIndex := rs.volatile.CommitIndex
 	isSingleNode := len(rs.peers) == 1
+	totalPeers := len(rs.peers)
 	rs.mu.RUnlock()
 
 	// For single-node cluster, immediately commit any uncommitted entries
+	// and confirm leadership (for read-only optimization)
 	if isSingleNode {
 		rs.mu.Lock()
 		rs.updateCommitIndex()
+		rs.lastLeaderConfirmation = time.Now()
 		rs.mu.Unlock()
 		return
 	}
+
+	// Track successful heartbeat responses for read-only optimization
+	// Count starts at 1 because leader counts itself
+	var successCount int32 = 1
+	majority := totalPeers/2 + 1
+	var leaderConfirmed int32 = 0
 
 	for _, peer := range rs.peers {
 		if peer == rs.nodeID {
@@ -315,6 +325,13 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 				rs.leader.MatchIndex[peerID] = prevLogIndex + len(entries)
 				rs.leader.NextIndex[peerID] = rs.leader.MatchIndex[peerID] + 1
 				rs.updateCommitIndex()
+
+				// Track successful response for read-only optimization
+				newCount := atomic.AddInt32(&successCount, 1)
+				if int(newCount) >= majority && atomic.CompareAndSwapInt32(&leaderConfirmed, 0, 1) {
+					// Majority confirmed - update leader confirmation time
+					rs.lastLeaderConfirmation = time.Now()
+				}
 			} else {
 				// Fast rollback optimization using conflict information
 				if reply.ConflictTerm == -1 {
