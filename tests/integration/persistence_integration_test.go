@@ -80,6 +80,10 @@ func TestRaftPersistence_CrashRecovery(t *testing.T) {
 
 	// Cleanup
 	raftNode2.Kill()
+
+	// Wait for goroutines to finish writing to disk
+	time.Sleep(200 * time.Millisecond)
+
 	storage.Close()
 }
 
@@ -146,6 +150,10 @@ func TestKVStorePersistence_SnapshotRecovery(t *testing.T) {
 
 	// Cleanup
 	kvStore2.Close()
+
+	// Wait for goroutines to finish writing to disk
+	time.Sleep(200 * time.Millisecond)
+
 	storage.Close()
 }
 
@@ -273,6 +281,10 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 	// Cleanup
 	raftNode2.Kill()
 	kvStore2.Close()
+
+	// Wait for goroutines to finish writing to disk
+	time.Sleep(200 * time.Millisecond)
+
 	storage.Close()
 }
 
