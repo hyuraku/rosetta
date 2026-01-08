@@ -2,11 +2,14 @@ package kvstore
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -14,11 +17,18 @@ type Client struct {
 	servers []string
 	leader  int
 	client  *http.Client
+
+	// Duplicate detection (Raft paper Section 8)
+	clientID string     // Unique client identifier
+	seqNum   int        // Monotonically increasing sequence number
+	mu       sync.Mutex // Protects seqNum
 }
 
 type PutArgs struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	Key      string `json:"key"`
+	Value    string `json:"value"`
+	ClientID string `json:"client_id,omitempty"`
+	SeqNum   int    `json:"seq_num,omitempty"`
 }
 
 type GetArgs struct {
@@ -26,7 +36,9 @@ type GetArgs struct {
 }
 
 type DeleteArgs struct {
-	Key string `json:"key"`
+	Key      string `json:"key"`
+	ClientID string `json:"client_id,omitempty"`
+	SeqNum   int    `json:"seq_num,omitempty"`
 }
 
 type Reply struct {
@@ -35,10 +47,22 @@ type Reply struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// generateClientID creates a random client identifier
+func generateClientID() string {
+	b := make([]byte, 16) // 128-bit identifier
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-based ID if crypto/rand fails
+		return fmt.Sprintf("client-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
 func NewClient(servers []string) *Client {
 	return &Client{
-		servers: servers,
-		leader:  0,
+		servers:  servers,
+		leader:   0,
+		clientID: generateClientID(),
+		seqNum:   0,
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
@@ -46,7 +70,16 @@ func NewClient(servers []string) *Client {
 }
 
 func (c *Client) Put(key, value string) error {
-	args := PutArgs{Key: key, Value: value}
+	c.mu.Lock()
+	c.seqNum++
+	args := PutArgs{
+		Key:      key,
+		Value:    value,
+		ClientID: c.clientID,
+		SeqNum:   c.seqNum,
+	}
+	c.mu.Unlock()
+
 	return c.sendRequest("PUT", "/kv", args, nil)
 }
 
@@ -64,7 +97,15 @@ func (c *Client) Get(key string) (string, error) {
 }
 
 func (c *Client) Delete(key string) error {
-	args := DeleteArgs{Key: key}
+	c.mu.Lock()
+	c.seqNum++
+	args := DeleteArgs{
+		Key:      key,
+		ClientID: c.clientID,
+		SeqNum:   c.seqNum,
+	}
+	c.mu.Unlock()
+
 	return c.sendRequest("DELETE", "/kv/"+key, args, nil)
 }
 
