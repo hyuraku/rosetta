@@ -113,46 +113,55 @@ func NewKVStoreWithSnapshotter(maxRaftState int, snapshotter Snapshotter) *KVSto
 func (kvs *KVStore) loadSnapshot() error {
 	// Try V2 interface first for session support
 	if snapshotterV2, ok := kvs.snapshotter.(SnapshotterV2); ok {
-		snapshotData, lastIndex, lastTerm, err := snapshotterV2.LoadSnapshotV2()
-		if err != nil {
-			return err
-		}
+		return kvs.loadSnapshotV2(snapshotterV2)
+	}
+	return kvs.loadSnapshotV1()
+}
 
-		if snapshotData != nil {
-			kvs.mu.Lock()
-			kvs.data = snapshotData.KVData
-			kvs.lastAppliedIndex = lastIndex
-			kvs.lastAppliedTerm = lastTerm
-			kvs.mu.Unlock()
-
-			// Restore sessions for duplicate detection
-			if snapshotData.Sessions != nil {
-				kvs.sessionMu.Lock()
-				kvs.sessions = snapshotData.Sessions
-				kvs.sessionMu.Unlock()
-			}
-
-			kvs.logger.Printf("Loaded snapshot V2: kvEntries=%d, sessions=%d, lastIndex=%d, lastTerm=%d",
-				len(snapshotData.KVData), len(snapshotData.Sessions), lastIndex, lastTerm)
-		}
+// loadSnapshotV2 loads snapshot with session data for duplicate detection
+func (kvs *KVStore) loadSnapshotV2(snapshotter SnapshotterV2) error {
+	snapshotData, lastIndex, lastTerm, err := snapshotter.LoadSnapshotV2()
+	if err != nil {
+		return err
+	}
+	if snapshotData == nil {
 		return nil
 	}
 
-	// Fallback to V1 interface
+	kvs.mu.Lock()
+	kvs.data = snapshotData.KVData
+	kvs.lastAppliedIndex = lastIndex
+	kvs.lastAppliedTerm = lastTerm
+	kvs.mu.Unlock()
+
+	if snapshotData.Sessions != nil {
+		kvs.sessionMu.Lock()
+		kvs.sessions = snapshotData.Sessions
+		kvs.sessionMu.Unlock()
+	}
+
+	kvs.logger.Printf("Loaded snapshot V2: kvEntries=%d, sessions=%d, lastIndex=%d, lastTerm=%d",
+		len(snapshotData.KVData), len(snapshotData.Sessions), lastIndex, lastTerm)
+	return nil
+}
+
+// loadSnapshotV1 loads snapshot without session data (backward compatibility)
+func (kvs *KVStore) loadSnapshotV1() error {
 	data, lastIndex, lastTerm, err := kvs.snapshotter.LoadSnapshot()
 	if err != nil {
 		return err
 	}
-
-	if data != nil {
-		kvs.mu.Lock()
-		kvs.data = data
-		kvs.lastAppliedIndex = lastIndex
-		kvs.lastAppliedTerm = lastTerm
-		kvs.mu.Unlock()
-		kvs.logger.Printf("Loaded snapshot: entries=%d, lastIndex=%d, lastTerm=%d", len(data), lastIndex, lastTerm)
+	if data == nil {
+		return nil
 	}
 
+	kvs.mu.Lock()
+	kvs.data = data
+	kvs.lastAppliedIndex = lastIndex
+	kvs.lastAppliedTerm = lastTerm
+	kvs.mu.Unlock()
+
+	kvs.logger.Printf("Loaded snapshot: entries=%d, lastIndex=%d, lastTerm=%d", len(data), lastIndex, lastTerm)
 	return nil
 }
 
@@ -162,23 +171,8 @@ func (kvs *KVStore) saveSnapshot(lastIndex, lastTerm int) error {
 		return nil
 	}
 
-	kvs.mu.RLock()
-	dataCopy := make(map[string]string, len(kvs.data))
-	for k, v := range kvs.data {
-		dataCopy[k] = v
-	}
-	kvs.mu.RUnlock()
-
-	// Copy session data for duplicate detection
-	kvs.sessionMu.RLock()
-	sessionsCopy := make(map[string]*ClientSession, len(kvs.sessions))
-	for clientID, session := range kvs.sessions {
-		sessionsCopy[clientID] = &ClientSession{
-			LastSeqNum: session.LastSeqNum,
-			LastResult: session.LastResult,
-		}
-	}
-	kvs.sessionMu.RUnlock()
+	dataCopy := kvs.copyKVData()
+	sessionsCopy := kvs.copySessionData()
 
 	// Use V2 interface if available for session persistence
 	if snapshotterV2, ok := kvs.snapshotter.(SnapshotterV2); ok {
@@ -201,6 +195,33 @@ func (kvs *KVStore) saveSnapshot(lastIndex, lastTerm int) error {
 
 	kvs.logger.Printf("Saved snapshot: entries=%d, lastIndex=%d, lastTerm=%d", len(dataCopy), lastIndex, lastTerm)
 	return nil
+}
+
+// copyKVData returns a deep copy of the KV data
+func (kvs *KVStore) copyKVData() map[string]string {
+	kvs.mu.RLock()
+	defer kvs.mu.RUnlock()
+
+	dataCopy := make(map[string]string, len(kvs.data))
+	for k, v := range kvs.data {
+		dataCopy[k] = v
+	}
+	return dataCopy
+}
+
+// copySessionData returns a deep copy of the session data
+func (kvs *KVStore) copySessionData() map[string]*ClientSession {
+	kvs.sessionMu.RLock()
+	defer kvs.sessionMu.RUnlock()
+
+	sessionsCopy := make(map[string]*ClientSession, len(kvs.sessions))
+	for clientID, session := range kvs.sessions {
+		sessionsCopy[clientID] = &ClientSession{
+			LastSeqNum: session.LastSeqNum,
+			LastResult: session.LastResult,
+		}
+	}
+	return sessionsCopy
 }
 
 func (kvs *KVStore) SetRaft(raftNode *raft.RaftNode) {
@@ -291,63 +312,81 @@ func (kvs *KVStore) installSnapshotFromApplyMsg(msg *raft.ApplyMsg) {
 }
 
 func (kvs *KVStore) executeCommand(cmd *Command) Result {
-	// Duplicate detection (Raft paper Section 8)
-	// If ClientID is set, check for duplicate requests
+	// Check for duplicate/stale requests (Raft paper Section 8)
 	if cmd.ClientID != "" {
-		kvs.sessionMu.RLock()
-		session, exists := kvs.sessions[cmd.ClientID]
-		kvs.sessionMu.RUnlock()
-
-		if exists {
-			if cmd.SeqNum < session.LastSeqNum {
-				// Stale request - already processed a newer one
-				kvs.logger.Printf("Stale request from client %s: seqNum=%d < lastSeqNum=%d",
-					cmd.ClientID, cmd.SeqNum, session.LastSeqNum)
-				return Result{Value: "", Err: fmt.Errorf("stale request")}
-			}
-			if cmd.SeqNum == session.LastSeqNum {
-				// Duplicate request - return cached result
-				kvs.logger.Printf("Duplicate request from client %s: seqNum=%d (returning cached result)",
-					cmd.ClientID, cmd.SeqNum)
-				return session.LastResult
-			}
-			// cmd.SeqNum > session.LastSeqNum: new request, proceed
+		if result, isDuplicate := kvs.checkDuplicateRequest(cmd); isDuplicate {
+			return result
 		}
 	}
 
-	// Execute the actual operation
-	kvs.mu.Lock()
-	var result Result
-	switch cmd.Op {
-	case OpPut:
-		kvs.data[cmd.Key] = cmd.Value
-		result = Result{Value: "", Err: nil}
-	case OpGet:
-		value, exists := kvs.data[cmd.Key]
-		if !exists {
-			result = Result{Value: "", Err: fmt.Errorf("key not found")}
-		} else {
-			result = Result{Value: value, Err: nil}
-		}
-	case OpDelete:
-		delete(kvs.data, cmd.Key)
-		result = Result{Value: "", Err: nil}
-	default:
-		result = Result{Value: "", Err: fmt.Errorf("unknown operation")}
-	}
-	kvs.mu.Unlock()
+	result := kvs.applyOperation(cmd)
 
 	// Update session for duplicate detection
 	if cmd.ClientID != "" {
-		kvs.sessionMu.Lock()
-		kvs.sessions[cmd.ClientID] = &ClientSession{
-			LastSeqNum: cmd.SeqNum,
-			LastResult: result,
-		}
-		kvs.sessionMu.Unlock()
+		kvs.updateClientSession(cmd.ClientID, cmd.SeqNum, result)
 	}
 
 	return result
+}
+
+// checkDuplicateRequest checks if a request is a duplicate or stale.
+// Returns the cached result and true if the request should not be executed.
+func (kvs *KVStore) checkDuplicateRequest(cmd *Command) (Result, bool) {
+	kvs.sessionMu.RLock()
+	session, exists := kvs.sessions[cmd.ClientID]
+	kvs.sessionMu.RUnlock()
+
+	if !exists {
+		return Result{}, false
+	}
+
+	if cmd.SeqNum < session.LastSeqNum {
+		kvs.logger.Printf("Stale request from client %s: seqNum=%d < lastSeqNum=%d",
+			cmd.ClientID, cmd.SeqNum, session.LastSeqNum)
+		return Result{Err: fmt.Errorf("stale request")}, true
+	}
+
+	if cmd.SeqNum == session.LastSeqNum {
+		kvs.logger.Printf("Duplicate request from client %s: seqNum=%d (returning cached result)",
+			cmd.ClientID, cmd.SeqNum)
+		return session.LastResult, true
+	}
+
+	return Result{}, false
+}
+
+// applyOperation applies a KV operation and returns the result
+func (kvs *KVStore) applyOperation(cmd *Command) Result {
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+
+	switch cmd.Op {
+	case OpPut:
+		kvs.data[cmd.Key] = cmd.Value
+		return Result{}
+	case OpGet:
+		value, exists := kvs.data[cmd.Key]
+		if !exists {
+			return Result{Err: fmt.Errorf("key not found")}
+		}
+		return Result{Value: value}
+	case OpDelete:
+		delete(kvs.data, cmd.Key)
+		return Result{}
+	default:
+		return Result{Err: fmt.Errorf("unknown operation")}
+	}
+}
+
+// updateClientSession updates the session state for duplicate detection
+func (kvs *KVStore) updateClientSession(clientID string, seqNum int, result Result) {
+	kvs.sessionMu.Lock()
+	defer kvs.sessionMu.Unlock()
+
+	kvs.sessions[clientID] = &ClientSession{
+		LastSeqNum: seqNum,
+		LastResult: result,
+	}
 }
 
 func (kvs *KVStore) Put(key, value string) error {

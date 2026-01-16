@@ -23,6 +23,34 @@ type FileStorage struct {
 	mu      sync.RWMutex
 }
 
+// atomicWrite writes data to a file atomically using write-rename pattern.
+// This ensures that the file is never partially written.
+// Note: This method assumes the caller holds the write lock.
+func (fs *FileStorage) atomicWrite(filename string, data []byte) error {
+	targetPath := filepath.Join(fs.dataDir, filename)
+	tempPath := targetPath + tempSuffix
+
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary file: %w", err)
+	}
+
+	if err := syncFile(tempPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to sync temporary file: %w", err)
+	}
+
+	if err := os.Rename(tempPath, targetPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to rename file: %w", err)
+	}
+
+	if err := syncDir(fs.dataDir); err != nil {
+		return fmt.Errorf("failed to sync data directory: %w", err)
+	}
+
+	return nil
+}
+
 // NewFileStorage creates a new file-based storage
 func NewFileStorage(dataDir string) (*FileStorage, error) {
 	// Create data directory if it doesn't exist
@@ -40,38 +68,12 @@ func (fs *FileStorage) SaveRaftState(state *raft.PersistentState) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	statePath := filepath.Join(fs.dataDir, stateFileName)
-	tempPath := statePath + tempSuffix
-
-	// Marshal state to JSON
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal raft state: %w", err)
 	}
 
-	// Write to temporary file first
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write temporary state file: %w", err)
-	}
-
-	// Sync to ensure data is on disk
-	if err := syncFile(tempPath); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to sync temporary state file: %w", err)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tempPath, statePath); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to rename state file: %w", err)
-	}
-
-	// Sync directory to ensure rename is persisted
-	if err := syncDir(fs.dataDir); err != nil {
-		return fmt.Errorf("failed to sync data directory: %w", err)
-	}
-
-	return nil
+	return fs.atomicWrite(stateFileName, data)
 }
 
 // LoadRaftState loads the Raft state from disk
@@ -116,38 +118,12 @@ func (fs *FileStorage) SaveSnapshot(snapshot *Snapshot) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	snapshotPath := filepath.Join(fs.dataDir, snapshotFileName)
-	tempPath := snapshotPath + tempSuffix
-
-	// Marshal snapshot to JSON
 	data, err := json.MarshalIndent(snapshot, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal snapshot: %w", err)
 	}
 
-	// Write to temporary file first
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write temporary snapshot file: %w", err)
-	}
-
-	// Sync to ensure data is on disk
-	if err := syncFile(tempPath); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to sync temporary snapshot file: %w", err)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tempPath, snapshotPath); err != nil {
-		os.Remove(tempPath)
-		return fmt.Errorf("failed to rename snapshot file: %w", err)
-	}
-
-	// Sync directory to ensure rename is persisted
-	if err := syncDir(fs.dataDir); err != nil {
-		return fmt.Errorf("failed to sync data directory: %w", err)
-	}
-
-	return nil
+	return fs.atomicWrite(snapshotFileName, data)
 }
 
 // LoadSnapshot loads the snapshot from disk

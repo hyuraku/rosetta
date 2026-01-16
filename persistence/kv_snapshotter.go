@@ -7,21 +7,18 @@ import (
 	"rosetta/kvstore"
 )
 
-// KVSnapshotter implements the kvstore.Snapshotter interface
+// KVSnapshotter implements the kvstore.Snapshotter and kvstore.SnapshotterV2 interfaces
 type KVSnapshotter struct {
 	storage Storage
 }
 
 // NewKVSnapshotter creates a new KV snapshotter
 func NewKVSnapshotter(storage Storage) *KVSnapshotter {
-	return &KVSnapshotter{
-		storage: storage,
-	}
+	return &KVSnapshotter{storage: storage}
 }
 
-// SaveSnapshot saves the KV store data as a snapshot
-func (ks *KVSnapshotter) SaveSnapshot(data map[string]string, lastIncludedIndex, lastIncludedTerm int) error {
-	// Marshal the data
+// saveSnapshotWithData is a helper that saves any data type as a snapshot
+func (ks *KVSnapshotter) saveSnapshotWithData(data interface{}, lastIncludedIndex, lastIncludedTerm int) error {
 	dataBytes, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal snapshot data: %w", err)
@@ -32,22 +29,26 @@ func (ks *KVSnapshotter) SaveSnapshot(data map[string]string, lastIncludedIndex,
 		LastIncludedTerm:  lastIncludedTerm,
 		Data:              dataBytes,
 	}
-
 	return ks.storage.SaveSnapshot(snapshot)
 }
 
-// LoadSnapshot loads the KV store data from a snapshot
-func (ks *KVSnapshotter) LoadSnapshot() (data map[string]string, lastIncludedIndex, lastIncludedTerm int, err error) {
+// SaveSnapshot saves the KV store data as a snapshot (V1 interface)
+func (ks *KVSnapshotter) SaveSnapshot(data map[string]string, lastIncludedIndex, lastIncludedTerm int) error {
+	return ks.saveSnapshotWithData(data, lastIncludedIndex, lastIncludedTerm)
+}
+
+// SaveSnapshotV2 saves the KV store data with session information as a snapshot
+func (ks *KVSnapshotter) SaveSnapshotV2(data *kvstore.SnapshotData, lastIncludedIndex, lastIncludedTerm int) error {
+	return ks.saveSnapshotWithData(data, lastIncludedIndex, lastIncludedTerm)
+}
+
+// LoadSnapshot loads the KV store data from a snapshot (V1 interface)
+func (ks *KVSnapshotter) LoadSnapshot() (map[string]string, int, int, error) {
 	snapshot, err := ks.storage.LoadSnapshot()
-	if err != nil {
+	if err != nil || snapshot == nil {
 		return nil, 0, 0, err
 	}
 
-	if snapshot == nil {
-		return nil, 0, 0, nil
-	}
-
-	// Unmarshal the data
 	var kvData map[string]string
 	if err := json.Unmarshal(snapshot.Data, &kvData); err != nil {
 		return nil, 0, 0, fmt.Errorf("failed to unmarshal snapshot data: %w", err)
@@ -56,49 +57,25 @@ func (ks *KVSnapshotter) LoadSnapshot() (data map[string]string, lastIncludedInd
 	return kvData, snapshot.LastIncludedIndex, snapshot.LastIncludedTerm, nil
 }
 
-// SaveSnapshotV2 saves the KV store data with session information as a snapshot
-// This implements the kvstore.SnapshotterV2 interface for duplicate detection support
-func (ks *KVSnapshotter) SaveSnapshotV2(data *kvstore.SnapshotData, lastIncludedIndex, lastIncludedTerm int) error {
-	// Marshal the full snapshot data including sessions
-	dataBytes, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal snapshot data V2: %w", err)
-	}
-
-	snapshot := &Snapshot{
-		LastIncludedIndex: lastIncludedIndex,
-		LastIncludedTerm:  lastIncludedTerm,
-		Data:              dataBytes,
-	}
-
-	return ks.storage.SaveSnapshot(snapshot)
-}
-
 // LoadSnapshotV2 loads the KV store data with session information from a snapshot
-// This implements the kvstore.SnapshotterV2 interface for duplicate detection support
-func (ks *KVSnapshotter) LoadSnapshotV2() (data *kvstore.SnapshotData, lastIncludedIndex, lastIncludedTerm int, err error) {
+func (ks *KVSnapshotter) LoadSnapshotV2() (*kvstore.SnapshotData, int, int, error) {
 	snapshot, err := ks.storage.LoadSnapshot()
-	if err != nil {
+	if err != nil || snapshot == nil {
 		return nil, 0, 0, err
 	}
 
-	if snapshot == nil {
-		return nil, 0, 0, nil
-	}
-
-	// Try to unmarshal as V2 format first (with sessions)
+	// Try V2 format first (with sessions)
 	var snapshotData kvstore.SnapshotData
 	if err := json.Unmarshal(snapshot.Data, &snapshotData); err == nil && snapshotData.KVData != nil {
 		return &snapshotData, snapshot.LastIncludedIndex, snapshot.LastIncludedTerm, nil
 	}
 
-	// Fallback: try to unmarshal as V1 format (plain map[string]string)
+	// Fallback to V1 format (plain map[string]string)
 	var kvData map[string]string
 	if err := json.Unmarshal(snapshot.Data, &kvData); err != nil {
 		return nil, 0, 0, fmt.Errorf("failed to unmarshal snapshot data: %w", err)
 	}
 
-	// Convert V1 to V2 format
 	return &kvstore.SnapshotData{
 		KVData:   kvData,
 		Sessions: nil,
