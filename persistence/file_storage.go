@@ -30,7 +30,7 @@ func (fs *FileStorage) atomicWrite(filename string, data []byte) error {
 	targetPath := filepath.Join(fs.dataDir, filename)
 	tempPath := targetPath + tempSuffix
 
-	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+	if err := os.WriteFile(tempPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write temporary file: %w", err)
 	}
 
@@ -54,7 +54,7 @@ func (fs *FileStorage) atomicWrite(filename string, data []byte) error {
 // NewFileStorage creates a new file-based storage
 func NewFileStorage(dataDir string) (*FileStorage, error) {
 	// Create data directory if it doesn't exist
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
@@ -232,7 +232,7 @@ func (fs *FileStorage) CopyTo(destDir string) error {
 	defer fs.mu.RUnlock()
 
 	// Create destination directory
-	if err := os.MkdirAll(destDir, 0755); err != nil {
+	if err := os.MkdirAll(destDir, 0700); err != nil {
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
@@ -263,7 +263,7 @@ func copyFile(src, dst string) error {
 	}
 	defer srcFile.Close()
 
-	dstFile, err := os.Create(dst)
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
