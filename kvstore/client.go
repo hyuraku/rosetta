@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,13 @@ import (
 	"net/http"
 	"sync"
 	"time"
+)
+
+const (
+	// clientIDBytes is the number of random bytes used for the client identifier (128-bit).
+	clientIDBytes = 16
+	// defaultHTTPTimeout is the timeout for HTTP requests to cluster nodes.
+	defaultHTTPTimeout = 5 * time.Second
 )
 
 type Client struct {
@@ -49,7 +57,7 @@ type Reply struct {
 
 // generateClientID creates a random client identifier
 func generateClientID() string {
-	b := make([]byte, 16) // 128-bit identifier
+	b := make([]byte, clientIDBytes)
 	if _, err := rand.Read(b); err != nil {
 		// Fallback to timestamp-based ID if crypto/rand fails
 		return fmt.Sprintf("client-%d", time.Now().UnixNano())
@@ -64,7 +72,7 @@ func NewClient(servers []string) *Client {
 		clientID: generateClientID(),
 		seqNum:   0,
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: defaultHTTPTimeout,
 		},
 	}
 }
@@ -109,7 +117,7 @@ func (c *Client) Delete(key string) error {
 	return c.sendRequest("DELETE", "/kv/"+key, args, nil)
 }
 
-func (c *Client) sendRequest(method, path string, args interface{}, reply interface{}) error {
+func (c *Client) sendRequest(method, path string, args, reply interface{}) error {
 	for i := 0; i < len(c.servers); i++ {
 		server := c.servers[c.leader]
 		url := fmt.Sprintf("http://%s%s", server, path)
@@ -123,7 +131,7 @@ func (c *Client) sendRequest(method, path string, args interface{}, reply interf
 			body = bytes.NewBuffer(jsonData)
 		}
 
-		req, err := http.NewRequest(method, url, body)
+		req, err := http.NewRequestWithContext(context.Background(), method, url, body)
 		if err != nil {
 			c.leader = (c.leader + 1) % len(c.servers)
 			continue
@@ -133,7 +141,8 @@ func (c *Client) sendRequest(method, path string, args interface{}, reply interf
 			req.Header.Set("Content-Type", "application/json")
 		}
 
-		resp, err := c.client.Do(req)
+		// Server addresses originate from trusted cluster configuration, not user input.
+		resp, err := c.client.Do(req) //nolint:gosec // G704: request targets are trusted, configured cluster peers
 		if err != nil {
 			c.leader = (c.leader + 1) % len(c.servers)
 			continue

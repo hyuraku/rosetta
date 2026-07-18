@@ -2,12 +2,22 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"sync"
 	"time"
+)
+
+const (
+	// joinClientTimeout bounds an outbound cluster-join request.
+	joinClientTimeout = 5 * time.Second
+	// leaveClientTimeout bounds an outbound cluster-leave notification.
+	leaveClientTimeout = 2 * time.Second
+	// discoveryReadHeaderTimeout mitigates Slowloris by bounding header reads.
+	discoveryReadHeaderTimeout = 5 * time.Second
 )
 
 type NodeInfo struct {
@@ -93,8 +103,9 @@ func (cm *ClusterManager) StartDiscovery() {
 	mux.HandleFunc("/cluster/nodes", cm.handleNodes)
 
 	server := &http.Server{
-		Addr:    cm.self.Addr,
-		Handler: mux,
+		Addr:              cm.self.Addr,
+		Handler:           mux,
+		ReadHeaderTimeout: discoveryReadHeaderTimeout,
 	}
 
 	go func() {
@@ -105,7 +116,7 @@ func (cm *ClusterManager) StartDiscovery() {
 }
 
 func (cm *ClusterManager) handleJoin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -120,14 +131,14 @@ func (cm *ClusterManager) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	nodes := cm.GetNodes()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"nodes":   nodes,
 	})
 }
 
 func (cm *ClusterManager) handleLeave(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -143,24 +154,24 @@ func (cm *ClusterManager) handleLeave(w http.ResponseWriter, r *http.Request) {
 	cm.RemoveNode(request.ID)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 	})
 }
 
 func (cm *ClusterManager) handleNodes(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "GET" {
+	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	nodes := cm.GetNodes()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(nodes)
+	_ = json.NewEncoder(w).Encode(nodes)
 }
 
 func (cm *ClusterManager) JoinCluster(existingNodeAddr string) error {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: joinClientTimeout}
 
 	joinData, err := json.Marshal(cm.self)
 	if err != nil {
@@ -168,11 +179,19 @@ func (cm *ClusterManager) JoinCluster(existingNodeAddr string) error {
 	}
 
 	url := fmt.Sprintf("http://%s/cluster/join", existingNodeAddr)
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(joinData))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewBuffer(joinData))
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	req.Header.Set("Content-Type", "application/json")
+
+	// existingNodeAddr is an operator-provided cluster seed address, not
+	// untrusted request input, so this is not an SSRF sink.
+	resp, err := client.Do(req) //nolint:gosec // G704: URL host is an operator-provided cluster seed address
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("join failed with status %d", resp.StatusCode)
@@ -200,7 +219,7 @@ func (cm *ClusterManager) JoinCluster(existingNodeAddr string) error {
 
 func (cm *ClusterManager) LeaveCluster() {
 	nodes := cm.GetNodes()
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: leaveClientTimeout}
 
 	leaveData, _ := json.Marshal(map[string]string{"id": cm.self.ID})
 
@@ -211,7 +230,20 @@ func (cm *ClusterManager) LeaveCluster() {
 
 		url := fmt.Sprintf("http://%s/cluster/leave", node.Addr)
 		go func() {
-			client.Post(url, "application/json", bytes.NewBuffer(leaveData))
+			req, err := http.NewRequestWithContext(
+				context.Background(), http.MethodPost, url, bytes.NewBuffer(leaveData),
+			)
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			// node.Addr is a known cluster member address, not untrusted input.
+			resp, err := client.Do(req) //nolint:gosec // G704: URL host is a known cluster member address
+			if err != nil {
+				return
+			}
+			_ = resp.Body.Close()
 		}()
 	}
 }

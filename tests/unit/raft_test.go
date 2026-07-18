@@ -86,11 +86,11 @@ func TestVoting(t *testing.T) {
 
 	state := raft.NewRaftState("node1", peers, applyCh)
 
-	nodeID := "node2"
+	nodeID := nodeID2
 	state.SetVotedFor(&nodeID)
 
 	votedFor := state.GetVotedFor()
-	if votedFor == nil || *votedFor != "node2" {
+	if votedFor == nil || *votedFor != nodeID2 {
 		t.Errorf("Expected votedFor to be 'node2', got %v", votedFor)
 	}
 }
@@ -157,7 +157,7 @@ func TestRequestVote(t *testing.T) {
 	}
 
 	votedFor := state.GetVotedFor()
-	if votedFor == nil || *votedFor != "node2" {
+	if votedFor == nil || *votedFor != nodeID2 {
 		t.Errorf("Expected to have voted for node2, got %v", votedFor)
 	}
 }

@@ -43,7 +43,7 @@ func (ks *KVSnapshotter) SaveSnapshotV2(data *kvstore.SnapshotData, lastIncluded
 }
 
 // LoadSnapshot loads the KV store data from a snapshot (V1 interface)
-func (ks *KVSnapshotter) LoadSnapshot() (map[string]string, int, int, error) {
+func (ks *KVSnapshotter) LoadSnapshot() (data map[string]string, lastIncludedIndex, lastIncludedTerm int, err error) {
 	snapshot, err := ks.storage.LoadSnapshot()
 	if err != nil || snapshot == nil {
 		return nil, 0, 0, err
@@ -58,7 +58,7 @@ func (ks *KVSnapshotter) LoadSnapshot() (map[string]string, int, int, error) {
 }
 
 // LoadSnapshotV2 loads the KV store data with session information from a snapshot
-func (ks *KVSnapshotter) LoadSnapshotV2() (*kvstore.SnapshotData, int, int, error) {
+func (ks *KVSnapshotter) LoadSnapshotV2() (data *kvstore.SnapshotData, lastIncludedIndex, lastIncludedTerm int, err error) {
 	snapshot, err := ks.storage.LoadSnapshot()
 	if err != nil || snapshot == nil {
 		return nil, 0, 0, err

@@ -1,6 +1,7 @@
 package unit
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -182,7 +183,7 @@ func TestSnapshotSerializationDeserialization(t *testing.T) {
 	if deserialized.LastIncludedIndex != args.LastIncludedIndex {
 		t.Errorf("LastIncludedIndex mismatch: got %d, want %d", deserialized.LastIncludedIndex, args.LastIncludedIndex)
 	}
-	if string(deserialized.Data) != string(args.Data) {
+	if !bytes.Equal(deserialized.Data, args.Data) {
 		t.Errorf("Data mismatch")
 	}
 }

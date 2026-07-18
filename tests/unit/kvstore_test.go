@@ -111,7 +111,7 @@ func TestKVStoreWithMockRaft(t *testing.T) {
 	if err != nil {
 		t.Errorf("Expected Get to succeed, got error: %v", err)
 	}
-	if value != "testvalue" {
+	if value != valTestValue {
 		t.Errorf("Expected value 'testvalue', got '%s'", value)
 	}
 
@@ -135,7 +135,7 @@ func TestCommandSerialization(t *testing.T) {
 		t.Errorf("Expected key to be 'testkey', got %s", cmd.Key)
 	}
 
-	if cmd.Value != "testvalue" {
+	if cmd.Value != valTestValue {
 		t.Errorf("Expected value to be 'testvalue', got %s", cmd.Value)
 	}
 

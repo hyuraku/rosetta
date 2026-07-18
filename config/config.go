@@ -8,6 +8,18 @@ import (
 	"time"
 )
 
+const (
+	defaultElectionTimeout  = 150 * time.Millisecond
+	defaultHeartbeatTimeout = 50 * time.Millisecond
+	defaultMaxRaftState     = 1000
+	defaultSnapshotInterval = 100
+	defaultHTTPReadTimeout  = 10 * time.Second
+	defaultHTTPWriteTimeout = 10 * time.Second
+
+	// configFilePerm restricts the persisted config file to owner read/write only.
+	configFilePerm os.FileMode = 0o600
+)
+
 type Config struct {
 	NodeID     string            `json:"node_id"`
 	ListenAddr string            `json:"listen_addr"`
@@ -34,15 +46,15 @@ func DefaultConfig() *Config {
 		DataDir:    "./data",
 		LogLevel:   "INFO",
 
-		ElectionTimeout:  150 * time.Millisecond,
-		HeartbeatTimeout: 50 * time.Millisecond,
+		ElectionTimeout:  defaultElectionTimeout,
+		HeartbeatTimeout: defaultHeartbeatTimeout,
 
-		MaxRaftState:     1000,
-		SnapshotInterval: 100,
+		MaxRaftState:     defaultMaxRaftState,
+		SnapshotInterval: defaultSnapshotInterval,
 
 		HTTPServerAddr:   "localhost:9080",
-		HTTPReadTimeout:  10 * time.Second,
-		HTTPWriteTimeout: 10 * time.Second,
+		HTTPReadTimeout:  defaultHTTPReadTimeout,
+		HTTPWriteTimeout: defaultHTTPWriteTimeout,
 	}
 }
 
@@ -76,7 +88,7 @@ func (c *Config) SaveConfig(filename string) error {
 		return fmt.Errorf("failed to marshal config: %v", err)
 	}
 
-	if err := os.WriteFile(filename, data, 0644); err != nil {
+	if err := os.WriteFile(filename, data, configFilePerm); err != nil {
 		return fmt.Errorf("failed to write config file: %v", err)
 	}
 

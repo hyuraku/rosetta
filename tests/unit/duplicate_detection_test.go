@@ -40,7 +40,7 @@ func TestDuplicateDetectionBackwardCompatibility(t *testing.T) {
 	if err != nil {
 		t.Errorf("Expected Get to succeed, got error: %v", err)
 	}
-	if value != "value1" {
+	if value != valValue1 {
 		t.Errorf("Expected value 'value1', got '%s'", value)
 	}
 
@@ -124,7 +124,7 @@ func TestSnapshotDataStruct(t *testing.T) {
 		t.Errorf("Expected 2 KV entries, got %d", len(snapshotData.KVData))
 	}
 
-	if snapshotData.KVData["key1"] != "value1" {
+	if snapshotData.KVData["key1"] != valValue1 {
 		t.Errorf("Expected key1 to be 'value1', got '%s'", snapshotData.KVData["key1"])
 	}
 
@@ -161,7 +161,7 @@ func TestCommandWithClientIDAndSeqNum(t *testing.T) {
 		t.Errorf("Expected Key to be 'key', got '%s'", cmd.Key)
 	}
 
-	if cmd.Value != "value" {
+	if cmd.Value != valValue {
 		t.Errorf("Expected Value to be 'value', got '%s'", cmd.Value)
 	}
 
@@ -236,7 +236,7 @@ func TestDuplicateDetectionIntegration(t *testing.T) {
 	if err != nil {
 		t.Errorf("Expected Get to succeed, got error: %v", err)
 	}
-	if value != "value" {
+	if value != valValue {
 		t.Errorf("Expected value 'value', got '%s'", value)
 	}
 

@@ -76,7 +76,7 @@ func (lm *LogManager) TruncateAfter(index int) {
 	}
 }
 
-func (lm *LogManager) AppendEntries(prevLogIndex int, prevLogTerm int, entries []LogEntry) bool {
+func (lm *LogManager) AppendEntries(prevLogIndex, prevLogTerm int, entries []LogEntry) bool {
 	if prevLogIndex > 0 {
 		if prevLogIndex > len(lm.entries) {
 			return false
@@ -188,31 +188,6 @@ func (rs *RaftState) TruncateLogAfter(index int) {
 	rs.persist()
 }
 
-func (rs *RaftState) appendLogEntries(prevLogIndex int, prevLogTerm int, entries []LogEntry) bool {
-	if prevLogIndex > 0 {
-		if prevLogIndex > len(rs.persistent.Log) {
-			return false
-		}
-		if rs.persistent.Log[prevLogIndex-1].Term != prevLogTerm {
-			return false
-		}
-	}
-
-	if len(entries) > 0 {
-		if prevLogIndex < len(rs.persistent.Log) {
-			rs.persistent.Log = rs.persistent.Log[:prevLogIndex]
-		}
-		rs.persistent.Log = append(rs.persistent.Log, entries...)
-
-		for i := range rs.persistent.Log[prevLogIndex:] {
-			rs.persistent.Log[prevLogIndex+i].Index = prevLogIndex + i + 1
-		}
-		rs.persist()
-	}
-
-	return true
-}
-
 func (rs *RaftState) UpdateCommitIndex(leaderCommit int) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -241,4 +216,3 @@ func (rs *RaftState) applyEntries() {
 		}
 	}
 }
-

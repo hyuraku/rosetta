@@ -18,6 +18,13 @@ const (
 	OpDelete Operation = "DELETE"
 )
 
+const (
+	// applyChBufferSize is the buffer size for the apply channel bridging Raft and the KV store.
+	applyChBufferSize = 100
+	// operationTimeout is how long a pending operation waits to be committed and applied.
+	operationTimeout = 5 * time.Second
+)
+
 type Command struct {
 	Op    Operation `json:"op"`
 	Key   string    `json:"key"`
@@ -42,8 +49,8 @@ type ClientSession struct {
 
 // SnapshotData contains all data to be persisted in a snapshot
 type SnapshotData struct {
-	KVData   map[string]string          `json:"kv_data"`
-	Sessions map[string]*ClientSession  `json:"sessions,omitempty"` // For duplicate detection
+	KVData   map[string]string         `json:"kv_data"`
+	Sessions map[string]*ClientSession `json:"sessions,omitempty"` // For duplicate detection
 }
 
 // Snapshotter interface for saving/loading snapshots
@@ -84,7 +91,7 @@ func NewKVStore(maxRaftState int) *KVStore {
 }
 
 func NewKVStoreWithSnapshotter(maxRaftState int, snapshotter Snapshotter) *KVStore {
-	applyCh := make(chan raft.ApplyMsg, 100)
+	applyCh := make(chan raft.ApplyMsg, applyChBufferSize)
 
 	kvs := &KVStore{
 		data:             make(map[string]string),
@@ -470,7 +477,7 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value string) 
 	kvs.pendingOps[opID] = resultCh
 	kvs.opMu.Unlock()
 
-	timeout := time.NewTimer(5 * time.Second)
+	timeout := time.NewTimer(operationTimeout)
 	defer timeout.Stop()
 
 	select {

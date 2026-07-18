@@ -183,15 +183,7 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 	kvStore1.SetRaft(raftNode1)
 
 	// Wait for node to become leader (poll with timeout)
-	becameLeader := false
-	for i := 0; i < 10; i++ {
-		time.Sleep(100 * time.Millisecond)
-		if raftNode1.IsLeader() {
-			becameLeader = true
-			break
-		}
-	}
-	if !becameLeader {
+	if !waitForNodeLeadership(raftNode1, 10, 100*time.Millisecond) {
 		t.Fatal("Node did not become leader within timeout")
 	}
 
@@ -218,16 +210,7 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 	}
 
 	// Verify data before crash
-	for key, expectedValue := range testData {
-		value, err := kvStore1.Get(key)
-		if err != nil {
-			t.Errorf("Failed to get key %s before crash: %v", key, err)
-			continue
-		}
-		if value != expectedValue {
-			t.Errorf("Key %s value mismatch before crash: got %s, want %s", key, value, expectedValue)
-		}
-	}
+	verifyStoreData(t, kvStore1, testData, "before crash")
 
 	// Get state before crash
 	term1, _ := raftNode1.GetState()
@@ -270,13 +253,7 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 		t.Errorf("Snapshot size mismatch after recovery: got %d, want %d", len(snapshot2), len(testData))
 	}
 
-	for key, expectedValue := range testData {
-		if value, exists := snapshot2[key]; !exists {
-			t.Errorf("Key %s not found after recovery", key)
-		} else if value != expectedValue {
-			t.Errorf("Key %s value mismatch after recovery: got %s, want %s", key, value, expectedValue)
-		}
-	}
+	verifySnapshotData(t, snapshot2, testData)
 
 	// Cleanup
 	raftNode2.Kill()
@@ -286,6 +263,47 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	storage.Close()
+}
+
+// waitForNodeLeadership polls node up to attempts times, sleeping between each
+// check, returning true as soon as it reports leadership.
+func waitForNodeLeadership(node *raft.RaftNode, attempts int, sleep time.Duration) bool {
+	for i := 0; i < attempts; i++ {
+		time.Sleep(sleep)
+		if node.IsLeader() {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyStoreData asserts every key in testData reads back its expected value
+// from the live store. phase labels the assertion (e.g. "before crash").
+func verifyStoreData(t *testing.T, store *kvstore.KVStore, testData map[string]string, phase string) {
+	t.Helper()
+	for key, expectedValue := range testData {
+		value, err := store.Get(key)
+		if err != nil {
+			t.Errorf("Failed to get key %s %s: %v", key, phase, err)
+			continue
+		}
+		if value != expectedValue {
+			t.Errorf("Key %s value mismatch %s: got %s, want %s", key, phase, value, expectedValue)
+		}
+	}
+}
+
+// verifySnapshotData asserts a recovered snapshot map contains every key in
+// testData with its expected value.
+func verifySnapshotData(t *testing.T, snapshot, testData map[string]string) {
+	t.Helper()
+	for key, expectedValue := range testData {
+		if value, exists := snapshot[key]; !exists {
+			t.Errorf("Key %s not found after recovery", key)
+		} else if value != expectedValue {
+			t.Errorf("Key %s value mismatch after recovery: got %s, want %s", key, value, expectedValue)
+		}
+	}
 }
 
 func TestPersistence_MultipleCrashes(t *testing.T) {

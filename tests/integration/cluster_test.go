@@ -255,14 +255,7 @@ func TestNetworkPartition(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Verify initial leader election
-	leaderCount := 0
-	for _, node := range nodes {
-		if node.IsLeader() {
-			leaderCount++
-		}
-	}
-
-	if leaderCount != 1 {
+	if countActiveLeaders(nodes, nil) != 1 {
 		t.Fatal("No initial leader found")
 	}
 
@@ -276,27 +269,7 @@ func TestNetworkPartition(t *testing.T) {
 	}
 
 	// Poll for leader in majority partition with retry logic
-	majorityHasLeader := false
-	for attempt := 0; attempt < 5; attempt++ {
-		time.Sleep(300 * time.Millisecond)
-
-		majorityLeaderCount := 0
-		for nodeID, node := range nodes {
-			if contains(minorityNodes, nodeID) {
-				continue
-			}
-			if node.IsLeader() {
-				majorityLeaderCount++
-			}
-		}
-
-		if majorityLeaderCount == 1 {
-			majorityHasLeader = true
-			break
-		}
-	}
-
-	if !majorityHasLeader {
+	if !pollForSingleLeader(nodes, minorityNodes, 5, 300*time.Millisecond) {
 		t.Error("Expected 1 leader in majority partition after 5 attempts")
 	}
 
@@ -306,27 +279,7 @@ func TestNetworkPartition(t *testing.T) {
 	}
 
 	// Poll for single leader after healing
-	healedHasLeader := false
-	for attempt := 0; attempt < 3; attempt++ {
-		time.Sleep(200 * time.Millisecond)
-
-		totalLeaderCount := 0
-		for nodeID, node := range nodes {
-			if contains(minorityNodes, nodeID) {
-				continue // Skip killed nodes
-			}
-			if node.IsLeader() {
-				totalLeaderCount++
-			}
-		}
-
-		if totalLeaderCount == 1 {
-			healedHasLeader = true
-			break
-		}
-	}
-
-	if !healedHasLeader {
+	if !pollForSingleLeader(nodes, minorityNodes, 3, 200*time.Millisecond) {
 		t.Error("Expected 1 leader after partition heals")
 	}
 
@@ -336,6 +289,33 @@ func TestNetworkPartition(t *testing.T) {
 			node.Kill()
 		}
 	}
+}
+
+// countActiveLeaders counts how many nodes currently report leadership,
+// skipping any node IDs present in exclude.
+func countActiveLeaders(nodes map[string]*raft.RaftNode, exclude []string) int {
+	count := 0
+	for nodeID, node := range nodes {
+		if contains(exclude, nodeID) {
+			continue
+		}
+		if node.IsLeader() {
+			count++
+		}
+	}
+	return count
+}
+
+// pollForSingleLeader retries up to attempts times, sleeping between each,
+// until exactly one non-excluded node reports leadership.
+func pollForSingleLeader(nodes map[string]*raft.RaftNode, exclude []string, attempts int, sleep time.Duration) bool {
+	for attempt := 0; attempt < attempts; attempt++ {
+		time.Sleep(sleep)
+		if countActiveLeaders(nodes, exclude) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func TestConcurrentCommands(t *testing.T) {

@@ -168,7 +168,7 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 
 	// Use a vote counter that's protected by the RaftState mutex
 	votes := 1
-	votesNeeded := len(rs.peers)/2 + 1
+	votesNeeded := len(rs.peers)/quorumDivisor + 1
 	rs.mu.Unlock()
 
 	rs.ResetElectionTimer()
@@ -193,52 +193,63 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 			continue
 		}
 
-		go func(peerID string) {
-			args := &RequestVoteArgs{
-				Term:         currentTerm,
-				CandidateID:  rs.nodeID,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
-			}
+		go rs.requestVoteFromPeer(transport, peer, currentTerm, lastLogIndex, lastLogTerm, votesNeeded, &votes, &voteMu)
+	}
+}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			defer cancel()
+// requestVoteFromPeer sends a single RequestVote RPC and, on a granted vote,
+// promotes this node to Leader once a quorum is reached. Intended to run in
+// its own goroutine.
+func (rs *RaftState) requestVoteFromPeer(
+	transport RPCTransport,
+	peerID string,
+	currentTerm, lastLogIndex, lastLogTerm, votesNeeded int,
+	votes *int,
+	voteMu *sync.Mutex,
+) {
+	args := &RequestVoteArgs{
+		Term:         currentTerm,
+		CandidateID:  rs.nodeID,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
 
-			reply, err := transport.SendRequestVote(ctx, peerID, args)
-			if err != nil {
-				return
-			}
+	ctx, cancel := context.WithTimeout(context.Background(), requestVoteTimeout)
+	defer cancel()
 
-			rs.mu.Lock()
-			defer rs.mu.Unlock()
+	reply, err := transport.SendRequestVote(ctx, peerID, args)
+	if err != nil {
+		return
+	}
 
-			if rs.persistent.CurrentTerm != currentTerm || rs.state != Candidate {
-				return
-			}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
 
-			if reply.Term > rs.persistent.CurrentTerm {
-				rs.persistent.CurrentTerm = reply.Term
-				rs.state = Follower
-				rs.persistent.VotedFor = nil
-				rs.persist()
-				return
-			}
+	if rs.persistent.CurrentTerm != currentTerm || rs.state != Candidate {
+		return
+	}
 
-			if reply.VoteGranted {
-				voteMu.Lock()
-				votes++
-				currentVotes := votes
-				voteMu.Unlock()
+	if reply.Term > rs.persistent.CurrentTerm {
+		rs.persistent.CurrentTerm = reply.Term
+		rs.state = Follower
+		rs.persistent.VotedFor = nil
+		rs.persist()
+		return
+	}
 
-				if currentVotes >= votesNeeded && rs.state == Candidate {
-					rs.state = Leader
-					rs.currentLeader = rs.nodeID // Set self as leader
-					rs.initializeLeaderState()
-					// Stop election timer for leader
-					rs.electionTimer.Stop()
-				}
-			}
-		}(peer)
+	if reply.VoteGranted {
+		voteMu.Lock()
+		*votes++
+		currentVotes := *votes
+		voteMu.Unlock()
+
+		if currentVotes >= votesNeeded && rs.state == Candidate {
+			rs.state = Leader
+			rs.currentLeader = rs.nodeID // Set self as leader
+			rs.initializeLeaderState()
+			// Stop election timer for leader
+			rs.electionTimer.Stop()
+		}
 	}
 }
 
@@ -267,7 +278,7 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	// Track successful heartbeat responses for read-only optimization
 	// Count starts at 1 because leader counts itself
 	var successCount int32 = 1
-	majority := totalPeers/2 + 1
+	majority := totalPeers/quorumDivisor + 1
 	var leaderConfirmed int32 = 0
 
 	for _, peer := range rs.peers {
@@ -275,150 +286,180 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 			continue
 		}
 
-		go func(peerID string) {
-			rs.mu.RLock()
-			nextIndex := rs.leader.NextIndex[peerID]
-			lastIncludedIndex := rs.persistent.LastIncludedIndex
-			lastIncludedTerm := rs.persistent.LastIncludedTerm
-			snapshotter := rs.snapshotter
-
-			// If nextIndex falls under the snapshot boundary, the entries this
-			// follower needs have already been compacted away — fall through to
-			// InstallSnapshot below. Otherwise translate the absolute prevLogIndex
-			// into a slice position within the post-truncation log.
-			sendSnapshot := false
-			prevLogIndex := nextIndex - 1
-			prevLogTerm := 0
-			if prevLogIndex == lastIncludedIndex {
-				prevLogTerm = lastIncludedTerm
-			} else if prevLogIndex > lastIncludedIndex {
-				prevLogTerm = rs.persistent.Log[prevLogIndex-lastIncludedIndex-1].Term
-			} else {
-				sendSnapshot = true
-			}
-
-			entries := make([]LogEntry, 0)
-			if nextIndex > lastIncludedIndex {
-				entries = rs.persistent.Log[nextIndex-lastIncludedIndex-1:]
-			}
-
-			rs.mu.RUnlock()
-
-			if sendSnapshot {
-				if snapshotter == nil {
-					// Log compaction not wired up; nothing to send.
-					return
-				}
-				data, err := snapshotter.ReadSnapshot()
-				if err != nil || data == nil {
-					return
-				}
-				snapArgs := &InstallSnapshotArgs{
-					Term:              currentTerm,
-					LeaderID:          rs.nodeID,
-					LastIncludedIndex: lastIncludedIndex,
-					LastIncludedTerm:  lastIncludedTerm,
-					Data:              data,
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				reply, err := transport.SendInstallSnapshot(ctx, peerID, snapArgs)
-				if err != nil {
-					return
-				}
-
-				rs.mu.Lock()
-				defer rs.mu.Unlock()
-
-				if reply.Term > rs.persistent.CurrentTerm {
-					rs.persistent.CurrentTerm = reply.Term
-					rs.state = Follower
-					rs.persistent.VotedFor = nil
-					return
-				}
-				if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
-					return
-				}
-				// Follower has now installed the snapshot up to lastIncludedIndex.
-				rs.leader.MatchIndex[peerID] = lastIncludedIndex
-				rs.leader.NextIndex[peerID] = lastIncludedIndex + 1
-				return
-			}
-
-			args := &AppendEntriesArgs{
-				Term:         currentTerm,
-				LeaderID:     rs.nodeID,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: commitIndex,
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-			defer cancel()
-
-			reply, err := transport.SendAppendEntries(ctx, peerID, args)
-			if err != nil {
-				return
-			}
-
-			rs.mu.Lock()
-			defer rs.mu.Unlock()
-
-			if reply.Term > rs.persistent.CurrentTerm {
-				rs.persistent.CurrentTerm = reply.Term
-				rs.state = Follower
-				rs.persistent.VotedFor = nil
-				return
-			}
-
-			if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
-				return
-			}
-
-			if reply.Success {
-				rs.leader.MatchIndex[peerID] = prevLogIndex + len(entries)
-				rs.leader.NextIndex[peerID] = rs.leader.MatchIndex[peerID] + 1
-				rs.updateCommitIndex()
-
-				// Track successful response for read-only optimization
-				newCount := atomic.AddInt32(&successCount, 1)
-				if int(newCount) >= majority && atomic.CompareAndSwapInt32(&leaderConfirmed, 0, 1) {
-					// Majority confirmed - update leader confirmation time
-					rs.lastLeaderConfirmation = time.Now()
-				}
-			} else {
-				// Fast rollback optimization using conflict information
-				if reply.ConflictTerm == -1 {
-					// Follower's log is too short
-					rs.leader.NextIndex[peerID] = reply.ConflictIndex
-				} else {
-					// Follower has a conflicting term
-					// Search leader's log for the last entry with ConflictTerm
-					lastIndexOfConflictTerm := -1
-					for i := len(rs.persistent.Log) - 1; i >= 0; i-- {
-						if rs.persistent.Log[i].Term == reply.ConflictTerm {
-							lastIndexOfConflictTerm = i + 1 // Convert to 1-based index
-							break
-						}
-					}
-
-					if lastIndexOfConflictTerm > 0 {
-						// Leader has entries from ConflictTerm, skip past them
-						rs.leader.NextIndex[peerID] = lastIndexOfConflictTerm + 1
-					} else {
-						// Leader doesn't have ConflictTerm, use follower's ConflictIndex
-						rs.leader.NextIndex[peerID] = reply.ConflictIndex
-					}
-				}
-
-				// Ensure nextIndex doesn't go below 1
-				if rs.leader.NextIndex[peerID] < 1 {
-					rs.leader.NextIndex[peerID] = 1
-				}
-			}
-		}(peer)
+		go rs.replicateToPeer(transport, peer, currentTerm, commitIndex, majority, &successCount, &leaderConfirmed)
 	}
+}
+
+// replicateToPeer sends one round of replication to a single follower. It
+// decides between AppendEntries and InstallSnapshot based on whether the
+// follower's nextIndex still lies within the leader's (post-compaction) log.
+// Intended to run in its own goroutine.
+func (rs *RaftState) replicateToPeer(
+	transport RPCTransport,
+	peerID string,
+	currentTerm, commitIndex, majority int,
+	successCount, leaderConfirmed *int32,
+) {
+	rs.mu.RLock()
+	nextIndex := rs.leader.NextIndex[peerID]
+	lastIncludedIndex := rs.persistent.LastIncludedIndex
+	lastIncludedTerm := rs.persistent.LastIncludedTerm
+	snapshotter := rs.snapshotter
+
+	// If nextIndex falls under the snapshot boundary, the entries this
+	// follower needs have already been compacted away — fall through to
+	// InstallSnapshot below. Otherwise translate the absolute prevLogIndex
+	// into a slice position within the post-truncation log.
+	sendSnapshot := false
+	prevLogIndex := nextIndex - 1
+	prevLogTerm := 0
+	switch {
+	case prevLogIndex == lastIncludedIndex:
+		prevLogTerm = lastIncludedTerm
+	case prevLogIndex > lastIncludedIndex:
+		prevLogTerm = rs.persistent.Log[prevLogIndex-lastIncludedIndex-1].Term
+	default:
+		sendSnapshot = true
+	}
+
+	entries := make([]LogEntry, 0)
+	if nextIndex > lastIncludedIndex {
+		entries = rs.persistent.Log[nextIndex-lastIncludedIndex-1:]
+	}
+
+	rs.mu.RUnlock()
+
+	if sendSnapshot {
+		rs.sendSnapshotToPeer(transport, peerID, currentTerm, lastIncludedIndex, lastIncludedTerm, snapshotter)
+		return
+	}
+
+	args := &AppendEntriesArgs{
+		Term:         currentTerm,
+		LeaderID:     rs.nodeID,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), appendEntriesTimeout)
+	defer cancel()
+
+	reply, err := transport.SendAppendEntries(ctx, peerID, args)
+	if err != nil {
+		return
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if reply.Term > rs.persistent.CurrentTerm {
+		rs.persistent.CurrentTerm = reply.Term
+		rs.state = Follower
+		rs.persistent.VotedFor = nil
+		return
+	}
+
+	if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
+		return
+	}
+
+	if reply.Success {
+		rs.leader.MatchIndex[peerID] = prevLogIndex + len(entries)
+		rs.leader.NextIndex[peerID] = rs.leader.MatchIndex[peerID] + 1
+		rs.updateCommitIndex()
+
+		// Track successful response for read-only optimization
+		newCount := atomic.AddInt32(successCount, 1)
+		if int(newCount) >= majority && atomic.CompareAndSwapInt32(leaderConfirmed, 0, 1) {
+			// Majority confirmed - update leader confirmation time
+			rs.lastLeaderConfirmation = time.Now()
+		}
+	} else {
+		rs.handleReplicationConflict(peerID, reply)
+	}
+}
+
+// handleReplicationConflict applies the fast-rollback optimization (Section 5.3)
+// to reset a follower's nextIndex using the conflict information the follower
+// returned. Callers must hold rs.mu.
+func (rs *RaftState) handleReplicationConflict(peerID string, reply *AppendEntriesReply) {
+	if reply.ConflictTerm == -1 {
+		// Follower's log is too short
+		rs.leader.NextIndex[peerID] = reply.ConflictIndex
+	} else {
+		// Follower has a conflicting term
+		// Search leader's log for the last entry with ConflictTerm
+		lastIndexOfConflictTerm := -1
+		for i := len(rs.persistent.Log) - 1; i >= 0; i-- {
+			if rs.persistent.Log[i].Term == reply.ConflictTerm {
+				lastIndexOfConflictTerm = i + 1 // Convert to 1-based index
+				break
+			}
+		}
+
+		if lastIndexOfConflictTerm > 0 {
+			// Leader has entries from ConflictTerm, skip past them
+			rs.leader.NextIndex[peerID] = lastIndexOfConflictTerm + 1
+		} else {
+			// Leader doesn't have ConflictTerm, use follower's ConflictIndex
+			rs.leader.NextIndex[peerID] = reply.ConflictIndex
+		}
+	}
+
+	// Ensure nextIndex doesn't go below 1
+	if rs.leader.NextIndex[peerID] < 1 {
+		rs.leader.NextIndex[peerID] = 1
+	}
+}
+
+// sendSnapshotToPeer ships the current snapshot to a follower whose required
+// entries have been compacted away, then advances that follower's match/next
+// index on success. Intended to run in its own goroutine.
+func (rs *RaftState) sendSnapshotToPeer(
+	transport RPCTransport,
+	peerID string,
+	currentTerm, lastIncludedIndex, lastIncludedTerm int,
+	snapshotter Snapshotter,
+) {
+	if snapshotter == nil {
+		// Log compaction not wired up; nothing to send.
+		return
+	}
+	data, err := snapshotter.ReadSnapshot()
+	if err != nil || data == nil {
+		return
+	}
+	snapArgs := &InstallSnapshotArgs{
+		Term:              currentTerm,
+		LeaderID:          rs.nodeID,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+		Data:              data,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), installSnapshotTimeout)
+	defer cancel()
+	reply, err := transport.SendInstallSnapshot(ctx, peerID, snapArgs)
+	if err != nil {
+		return
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if reply.Term > rs.persistent.CurrentTerm {
+		rs.persistent.CurrentTerm = reply.Term
+		rs.state = Follower
+		rs.persistent.VotedFor = nil
+		return
+	}
+	if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
+		return
+	}
+	// Follower has now installed the snapshot up to lastIncludedIndex.
+	rs.leader.MatchIndex[peerID] = lastIncludedIndex
+	rs.leader.NextIndex[peerID] = lastIncludedIndex + 1
 }
 
 func (rs *RaftState) updateCommitIndex() {
