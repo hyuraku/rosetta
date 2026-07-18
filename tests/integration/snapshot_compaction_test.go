@@ -67,11 +67,12 @@ func (f *fakeSnapshotter) seed(data []byte, idx, term int) {
 }
 
 // TestInstallSnapshotCatchUp drives a 3-node cluster through:
-//   1. start a 2-node majority (node1, node2). node3 exists in peers but
-//      is not connected to the transport — it is a "late joiner".
-//   2. submit many commands so the leader builds up a log.
-//   3. compact the leader's log past where node3 would need to start.
-//   4. spin up node3 and attach it to the transport.
+//  1. start a 2-node majority (node1, node2). node3 exists in peers but
+//     is not connected to the transport — it is a "late joiner".
+//  2. submit many commands so the leader builds up a log.
+//  3. compact the leader's log past where node3 would need to start.
+//  4. spin up node3 and attach it to the transport.
+//
 // and verifies that node3 catches up via InstallSnapshot, not AppendEntries.
 //
 // Why we do not use partition+heal: removing a node from MockTransport only
@@ -82,32 +83,13 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	peers := []string{"node1", "node2", "node3"}
 	const laggerID = "node3"
 
-	nodes := make(map[string]*raft.RaftNode)
-	snapshotters := make(map[string]*fakeSnapshotter)
 	transport := raft.NewMockTransport()
 
 	// 1) Bring up only the two-node majority. node3 is intentionally absent
 	//    from both nodes and transport so the leader sees its RPCs to node3
 	//    time out (DeadlineExceeded), letting the cluster operate on
 	//    node1+node2 alone.
-	for _, id := range peers {
-		if id == laggerID {
-			continue
-		}
-		applyCh := make(chan raft.ApplyMsg, 256)
-		// Drain applyCh so it never blocks the raft state machine.
-		go func() {
-			for range applyCh {
-			}
-		}()
-
-		node := raft.NewRaftNode(id, peers, transport, applyCh)
-		sn := &fakeSnapshotter{}
-		node.SetSnapshotter(sn)
-		nodes[id] = node
-		snapshotters[id] = sn
-		transport.RegisterNode(id, node)
-	}
+	nodes, snapshotters := startMajority(peers, laggerID, transport)
 	defer func() {
 		for _, n := range nodes {
 			n.Kill()
@@ -115,20 +97,7 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	}()
 
 	// 2) Wait for a leader to emerge among node1/node2.
-	var leader *raft.RaftNode
-	var leaderID string
-	for attempt := 0; attempt < 20 && leader == nil; attempt++ {
-		time.Sleep(100 * time.Millisecond)
-		for id, n := range nodes {
-			if n.IsLeader() {
-				leader, leaderID = n, id
-				break
-			}
-		}
-	}
-	if leader == nil {
-		t.Fatal("no leader elected within budget")
-	}
+	leader, leaderID := waitForLeader(t, nodes)
 	t.Logf("leader=%s (lagger %s not yet attached)", leaderID, laggerID)
 
 	// 3) Submit enough commands that the leader's log grows.
@@ -184,17 +153,65 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	// than on raw snapshot bytes (a) because the metadata advance proves
 	// the follower's raft state — not just the state machine — accepted
 	// the snapshot and rewrote its log boundary.
+	if !waitForSnapshotCatchUp(nodes, laggerID, compactUpTo) {
+		t.Errorf("lagger %s did not catch up via InstallSnapshot within deadline", laggerID)
+	}
+}
+
+// startMajority brings up every peer except laggerID as a live RaftNode wired
+// to transport, each with its own drained applyCh and fakeSnapshotter.
+func startMajority(
+	peers []string, laggerID string, transport *raft.MockTransport,
+) (nodes map[string]*raft.RaftNode, snapshotters map[string]*fakeSnapshotter) {
+	nodes = make(map[string]*raft.RaftNode)
+	snapshotters = make(map[string]*fakeSnapshotter)
+	for _, id := range peers {
+		if id == laggerID {
+			continue
+		}
+		applyCh := make(chan raft.ApplyMsg, 256)
+		// Drain applyCh so it never blocks the raft state machine.
+		go func() {
+			for range applyCh {
+			}
+		}()
+
+		node := raft.NewRaftNode(id, peers, transport, applyCh)
+		sn := &fakeSnapshotter{}
+		node.SetSnapshotter(sn)
+		nodes[id] = node
+		snapshotters[id] = sn
+		transport.RegisterNode(id, node)
+	}
+	return nodes, snapshotters
+}
+
+// waitForLeader polls the given nodes until one reports leadership, failing the
+// test if none is elected within the budget.
+func waitForLeader(t *testing.T, nodes map[string]*raft.RaftNode) (leader *raft.RaftNode, leaderID string) {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		time.Sleep(100 * time.Millisecond)
+		for id, n := range nodes {
+			if n.IsLeader() {
+				return n, id
+			}
+		}
+	}
+	t.Fatal("no leader elected within budget")
+	return nil, ""
+}
+
+// waitForSnapshotCatchUp polls the lagger's snapshot metadata until its
+// LastIncludedIndex reaches compactUpTo, returning false on timeout.
+func waitForSnapshotCatchUp(nodes map[string]*raft.RaftNode, laggerID string, compactUpTo int) bool {
 	deadline := time.Now().Add(2 * time.Second)
-	caughtUp := false
 	for time.Now().Before(deadline) {
 		idx, _ := nodes[laggerID].GetRaftState().GetSnapshotMetadata()
 		if idx >= compactUpTo {
-			caughtUp = true
-			break
+			return true
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if !caughtUp {
-		t.Errorf("lagger %s did not catch up via InstallSnapshot within deadline", laggerID)
-	}
+	return false
 }

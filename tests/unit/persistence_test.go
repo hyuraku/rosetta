@@ -1,6 +1,7 @@
 package unit
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +22,7 @@ func TestFileStorage_SaveAndLoadRaftState(t *testing.T) {
 	defer storage.Close()
 
 	// Create test state
-	votedFor := "node2"
+	votedFor := nodeID2
 	testState := &raft.PersistentState{
 		CurrentTerm: 5,
 		VotedFor:    &votedFor,
@@ -138,7 +139,7 @@ func TestFileStorage_SaveAndLoadSnapshot(t *testing.T) {
 			loadedSnapshot.LastIncludedTerm, testSnapshot.LastIncludedTerm)
 	}
 
-	if string(loadedSnapshot.Data) != string(testSnapshot.Data) {
+	if !bytes.Equal(loadedSnapshot.Data, testSnapshot.Data) {
 		t.Errorf("Data mismatch: got %s, want %s",
 			string(loadedSnapshot.Data), string(testSnapshot.Data))
 	}
@@ -281,7 +282,7 @@ func TestRaftPersister_Integration(t *testing.T) {
 
 	// Save multiple states
 	for term := 1; term <= 5; term++ {
-		votedFor := "node1"
+		votedFor := nodeID1
 		state := &raft.PersistentState{
 			CurrentTerm: term,
 			VotedFor:    &votedFor,
@@ -323,7 +324,7 @@ func TestFileStorage_CopyTo(t *testing.T) {
 	defer srcStorage.Close()
 
 	// Save some data
-	votedFor := "node1"
+	votedFor := nodeID1
 	testState := &raft.PersistentState{
 		CurrentTerm: 10,
 		VotedFor:    &votedFor,

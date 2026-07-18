@@ -14,7 +14,7 @@ func TestDefaultConfig(t *testing.T) {
 		t.Fatal("DefaultConfig returned nil")
 	}
 
-	if cfg.NodeID != "node1" {
+	if cfg.NodeID != nodeID1 {
 		t.Errorf("Expected default NodeID to be 'node1', got %s", cfg.NodeID)
 	}
 
@@ -115,7 +115,7 @@ func TestPeerManagement(t *testing.T) {
 	if !exists {
 		t.Error("Expected node2 to exist")
 	}
-	if addr != "localhost:8081" {
+	if addr != addrNode2 {
 		t.Errorf("Expected node2 address to be 'localhost:8081', got %s", addr)
 	}
 
@@ -132,7 +132,7 @@ func TestPeerManagement(t *testing.T) {
 
 func TestGetPeerIDs(t *testing.T) {
 	cfg := config.DefaultConfig()
-	cfg.NodeID = "node1"
+	cfg.NodeID = nodeID1
 	cfg.AddPeer("node2", "localhost:8081")
 	cfg.AddPeer("node3", "localhost:8082")
 
@@ -209,7 +209,7 @@ func TestConfigPeersNilSafety(t *testing.T) {
 	}
 
 	addr, exists := cfg.GetPeerAddr("node2")
-	if !exists || addr != "localhost:8081" {
+	if !exists || addr != addrNode2 {
 		t.Error("Expected to find node2 with correct address")
 	}
 }

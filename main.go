@@ -19,6 +19,13 @@ import (
 	"rosetta/raft"
 )
 
+const (
+	// kvPath is the base path (without trailing slash) for key-value endpoints.
+	kvPath = "/kv"
+	// minPeerParts is the minimum number of colon-separated fields in a peer spec (id:addr).
+	minPeerParts = 2
+)
+
 type HTTPServer struct {
 	kvStore  *kvstore.KVStore
 	raftNode *raft.RaftNode
@@ -86,14 +93,14 @@ func (hs *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 	})
 }
 
 func (hs *HTTPServer) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/kv/")
-	if key == "" || key == "/kv" {
+	if key == "" || key == kvPath {
 		http.Error(w, "Key required", http.StatusBadRequest)
 		return
 	}
@@ -115,7 +122,7 @@ func (hs *HTTPServer) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"value":   value,
 	})
@@ -123,7 +130,7 @@ func (hs *HTTPServer) handleGet(w http.ResponseWriter, r *http.Request) {
 
 func (hs *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/kv/")
-	if key == "" || key == "/kv" {
+	if key == "" || key == kvPath {
 		http.Error(w, "Key required", http.StatusBadRequest)
 		return
 	}
@@ -140,7 +147,7 @@ func (hs *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 	})
 }
@@ -149,7 +156,7 @@ func (hs *HTTPServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	term, isLeader := hs.raftNode.GetState()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"node_id":   hs.raftNode.GetNodeID(),
 		"term":      term,
 		"is_leader": isLeader,
@@ -161,9 +168,22 @@ func (hs *HTTPServer) handleLeader(w http.ResponseWriter, r *http.Request) {
 	leader := hs.raftNode.GetLeader()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"leader": leader,
 	})
+}
+
+func parsePeers(peers string) map[string]string {
+	result := make(map[string]string)
+	for _, peer := range strings.Split(peers, ",") {
+		parts := strings.Split(peer, ":")
+		if len(parts) >= minPeerParts {
+			peerID := parts[0]
+			peerAddr := strings.Join(parts[1:], ":")
+			result[peerID] = peerAddr
+		}
+	}
+	return result
 }
 
 func main() {
@@ -192,16 +212,7 @@ func main() {
 		cfg.HTTPServerAddr = *httpAddr
 
 		if *peers != "" {
-			cfg.Peers = make(map[string]string)
-			peerList := strings.Split(*peers, ",")
-			for _, peer := range peerList {
-				parts := strings.Split(peer, ":")
-				if len(parts) >= 2 {
-					peerID := parts[0]
-					peerAddr := strings.Join(parts[1:], ":")
-					cfg.Peers[peerID] = peerAddr
-				}
-			}
+			cfg.Peers = parsePeers(*peers)
 		}
 	}
 
@@ -269,7 +280,7 @@ func main() {
 
 	clusterManager.LeaveCluster()
 	raftNode.Kill()
-	transport.Stop()
+	_ = transport.Stop()
 	kvs.Close()
 
 	log.Println("Shutdown complete")

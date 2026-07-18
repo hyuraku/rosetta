@@ -35,7 +35,7 @@ func NewRaftNodeWithPersister(nodeID string, peers []string, transport RPCTransp
 }
 
 func (rn *RaftNode) run() {
-	ticker := time.NewTicker(50 * time.Millisecond)
+	ticker := time.NewTicker(raftTickInterval)
 	defer ticker.Stop()
 
 	for {
@@ -80,16 +80,16 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	return nil
 }
 
-func (rn *RaftNode) Start(command interface{}) (int, int, bool) {
+func (rn *RaftNode) Start(command interface{}) (index, term int, isLeader bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	term, isLeader := rn.state.GetState()
+	term, isLeader = rn.state.GetState()
 	if !isLeader {
 		return -1, term, false
 	}
 
-	index := rn.state.AppendLogEntry(command, "command")
+	index = rn.state.AppendLogEntry(command, "command")
 	rn.logger.Printf("Started command at index %d, term %d", index, term)
 
 	return index, term, true

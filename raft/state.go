@@ -15,6 +15,26 @@ const (
 	Leader
 )
 
+const (
+	// electionTimeoutBaseMs is the minimum election timeout in milliseconds.
+	electionTimeoutBaseMs = 150
+	// electionTimeoutJitterMs bounds the additional randomized election
+	// timeout (added on top of the base) to prevent split votes.
+	electionTimeoutJitterMs = 150
+	// heartbeatInterval is the leader heartbeat period.
+	heartbeatInterval = 50 * time.Millisecond
+	// raftTickInterval is how often the node event loop ticks.
+	raftTickInterval = 50 * time.Millisecond
+	// quorumDivisor is used to compute a majority quorum (n/quorumDivisor + 1).
+	quorumDivisor = 2
+	// requestVoteTimeout bounds a single RequestVote RPC.
+	requestVoteTimeout = 100 * time.Millisecond
+	// appendEntriesTimeout bounds a single AppendEntries RPC.
+	appendEntriesTimeout = 50 * time.Millisecond
+	// installSnapshotTimeout bounds a single InstallSnapshot RPC.
+	installSnapshotTimeout = 5 * time.Second
+)
+
 func (s NodeState) String() string {
 	switch s {
 	case Follower:
@@ -109,7 +129,8 @@ func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftSta
 func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan ApplyMsg, persister Persister) *RaftState {
 	// Randomized election timeout between 150ms and 300ms
 	// This prevents split votes when nodes start at the same time
-	randomTimeout := 150 + rand.Intn(150)
+	//nolint:gosec // G404: election timeout jitter does not need a crypto RNG
+	randomTimeout := electionTimeoutBaseMs + rand.Intn(electionTimeoutJitterMs)
 
 	rs := &RaftState{
 		nodeID:           nodeID,
@@ -118,7 +139,7 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 		persistent:       PersistentState{CurrentTerm: 0, VotedFor: nil, Log: make([]LogEntry, 0)},
 		volatile:         VolatileState{CommitIndex: 0, LastApplied: 0},
 		electionTimeout:  time.Duration(randomTimeout) * time.Millisecond,
-		heartbeatTimeout: 50 * time.Millisecond,
+		heartbeatTimeout: heartbeatInterval,
 		lastHeartbeat:    time.Now(),
 		applyCh:          applyCh,
 		persister:        persister,
@@ -216,7 +237,8 @@ func (rs *RaftState) GetVotedFor() *string {
 
 func (rs *RaftState) ResetElectionTimer() {
 	// Randomize election timeout on each reset to prevent split votes
-	randomTimeout := 150 + rand.Intn(150)
+	//nolint:gosec // G404: election timeout jitter does not need a crypto RNG
+	randomTimeout := electionTimeoutBaseMs + rand.Intn(electionTimeoutJitterMs)
 	rs.electionTimeout = time.Duration(randomTimeout) * time.Millisecond
 	rs.electionTimer.Reset(rs.electionTimeout)
 	rs.lastHeartbeat = time.Now()
