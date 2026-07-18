@@ -14,6 +14,7 @@ import (
 
 	"rosetta/config"
 	"rosetta/kvstore"
+	"rosetta/monitoring"
 	"rosetta/network"
 	"rosetta/persistence"
 	"rosetta/raft"
@@ -45,6 +46,9 @@ func NewHTTPServer(kvs *kvstore.KVStore, raftNode *raft.RaftNode, cfg *config.Co
 	mux.HandleFunc("/kv", hs.handleKV)
 	mux.HandleFunc("/status", hs.handleStatus)
 	mux.HandleFunc("/leader", hs.handleLeader)
+	mux.HandleFunc("/metrics", hs.handleMetrics)
+	mux.HandleFunc("/health", hs.handleHealth)
+	mux.HandleFunc("/ready", hs.handleReady)
 
 	hs.server = &http.Server{
 		Addr:         cfg.HTTPServerAddr,
@@ -171,6 +175,48 @@ func (hs *HTTPServer) handleLeader(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"leader": leader,
 	})
+}
+
+// collectSnapshot gathers the node's current observable state for monitoring.
+func (hs *HTTPServer) collectSnapshot() monitoring.Snapshot {
+	term, isLeader := hs.raftNode.GetState()
+	leader := hs.raftNode.GetLeader()
+	return monitoring.Snapshot{
+		NodeID:     hs.raftNode.GetNodeID(),
+		State:      hs.raftNode.GetRaftState().GetNodeState().String(),
+		Term:       term,
+		IsLeader:   isLeader,
+		HasLeader:  leader != "",
+		LogEntries: hs.raftNode.GetLogLength(),
+		KVKeys:     hs.kvStore.Size(),
+	}
+}
+
+func (hs *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if err := monitoring.WritePrometheus(w, hs.collectSnapshot()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// handleHealth reports liveness: reaching this handler means the process is alive.
+func (hs *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	report := monitoring.Evaluate(hs.collectSnapshot())
+	writeHealthJSON(w, report, report.Live)
+}
+
+// handleReady reports readiness per the policy in monitoring.readinessCheck.
+func (hs *HTTPServer) handleReady(w http.ResponseWriter, r *http.Request) {
+	report := monitoring.Evaluate(hs.collectSnapshot())
+	writeHealthJSON(w, report, report.Ready)
+}
+
+func writeHealthJSON(w http.ResponseWriter, report monitoring.HealthReport, ok bool) {
+	w.Header().Set("Content-Type", "application/json")
+	if !ok {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	_ = json.NewEncoder(w).Encode(report)
 }
 
 func parsePeers(peers string) map[string]string {
