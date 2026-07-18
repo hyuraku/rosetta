@@ -76,6 +76,18 @@ type RaftState struct {
 	applyCh   chan ApplyMsg
 	persister Persister
 	logger    *log.Logger
+
+	// snapshotter is consulted by the leader when a follower needs InstallSnapshot.
+	// May be nil if log compaction is not configured (snapshot RPCs will be skipped).
+	snapshotter Snapshotter
+}
+
+// SetSnapshotter wires the state machine snapshotter so the leader can serve
+// InstallSnapshot RPCs to lagging followers.
+func (rs *RaftState) SetSnapshotter(s Snapshotter) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.snapshotter = s
 }
 
 type ApplyMsg struct {
