@@ -278,17 +278,72 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 		go func(peerID string) {
 			rs.mu.RLock()
 			nextIndex := rs.leader.NextIndex[peerID]
+			lastIncludedIndex := rs.persistent.LastIncludedIndex
+			lastIncludedTerm := rs.persistent.LastIncludedTerm
+			snapshotter := rs.snapshotter
+
+			// If nextIndex falls under the snapshot boundary, the entries this
+			// follower needs have already been compacted away — fall through to
+			// InstallSnapshot below. Otherwise translate the absolute prevLogIndex
+			// into a slice position within the post-truncation log.
+			sendSnapshot := false
 			prevLogIndex := nextIndex - 1
 			prevLogTerm := 0
-			if prevLogIndex > 0 {
-				prevLogTerm = rs.persistent.Log[prevLogIndex-1].Term
+			if prevLogIndex == lastIncludedIndex {
+				prevLogTerm = lastIncludedTerm
+			} else if prevLogIndex > lastIncludedIndex {
+				prevLogTerm = rs.persistent.Log[prevLogIndex-lastIncludedIndex-1].Term
+			} else {
+				sendSnapshot = true
 			}
 
 			entries := make([]LogEntry, 0)
-			if nextIndex <= len(rs.persistent.Log) {
-				entries = rs.persistent.Log[nextIndex-1:]
+			if nextIndex > lastIncludedIndex {
+				entries = rs.persistent.Log[nextIndex-lastIncludedIndex-1:]
 			}
+
 			rs.mu.RUnlock()
+
+			if sendSnapshot {
+				if snapshotter == nil {
+					// Log compaction not wired up; nothing to send.
+					return
+				}
+				data, err := snapshotter.ReadSnapshot()
+				if err != nil || data == nil {
+					return
+				}
+				snapArgs := &InstallSnapshotArgs{
+					Term:              currentTerm,
+					LeaderID:          rs.nodeID,
+					LastIncludedIndex: lastIncludedIndex,
+					LastIncludedTerm:  lastIncludedTerm,
+					Data:              data,
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				reply, err := transport.SendInstallSnapshot(ctx, peerID, snapArgs)
+				if err != nil {
+					return
+				}
+
+				rs.mu.Lock()
+				defer rs.mu.Unlock()
+
+				if reply.Term > rs.persistent.CurrentTerm {
+					rs.persistent.CurrentTerm = reply.Term
+					rs.state = Follower
+					rs.persistent.VotedFor = nil
+					return
+				}
+				if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
+					return
+				}
+				// Follower has now installed the snapshot up to lastIncludedIndex.
+				rs.leader.MatchIndex[peerID] = lastIncludedIndex
+				rs.leader.NextIndex[peerID] = lastIncludedIndex + 1
+				return
+			}
 
 			args := &AppendEntriesArgs{
 				Term:         currentTerm,

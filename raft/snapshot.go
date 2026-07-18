@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 )
 
@@ -18,6 +19,11 @@ type Snapshotter interface {
 
 	// InstallSnapshot installs a snapshot into the state machine
 	InstallSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm int) error
+
+	// ReadSnapshot returns the current persisted snapshot bytes.
+	// The leader calls this when sending InstallSnapshot RPC to a lagging follower.
+	// Returns (nil, nil) when no snapshot has been taken yet.
+	ReadSnapshot() ([]byte, error)
 }
 
 // TakeSnapshot creates a snapshot and truncates the log
@@ -129,6 +135,47 @@ func (rs *RaftState) GetSnapshotMetadata() (lastIncludedIndex, lastIncludedTerm 
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	return rs.persistent.LastIncludedIndex, rs.persistent.LastIncludedTerm
+}
+
+// TruncateLogTo discards log entries up to and including absoluteIndex,
+// updating snapshot metadata so future replication uses the new boundary.
+//
+// Unlike TakeSnapshot, this method does NOT call Snapshotter.CreateSnapshot:
+// it assumes the state machine (e.g. kvstore) has already persisted its
+// snapshot bytes by some other route. This avoids double-marshaling the
+// state machine on every compaction trigger.
+//
+// The boundary entry's term is read from the live log before truncation.
+// If absoluteIndex falls outside the current log range the call becomes a no-op
+// (idempotent: safe to invoke from concurrent triggers).
+func (rs *RaftState) TruncateLogTo(absoluteIndex int) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if absoluteIndex <= rs.persistent.LastIncludedIndex {
+		return nil // already truncated past this point
+	}
+
+	logEnd := rs.persistent.LastIncludedIndex + len(rs.persistent.Log)
+	if absoluteIndex > logEnd {
+		return fmt.Errorf("truncate index %d beyond log end %d", absoluteIndex, logEnd)
+	}
+
+	// Term of the entry that becomes the new LastIncludedTerm.
+	sliceIdx := absoluteIndex - rs.persistent.LastIncludedIndex - 1
+	boundaryTerm := rs.persistent.Log[sliceIdx].Term
+
+	// Discard entries up to and including the boundary.
+	discarded := absoluteIndex - rs.persistent.LastIncludedIndex
+	rs.persistent.Log = rs.persistent.Log[discarded:]
+
+	rs.persistent.LastIncludedIndex = absoluteIndex
+	rs.persistent.LastIncludedTerm = boundaryTerm
+	rs.persist()
+
+	rs.logger.Printf("Log truncated up to index %d (term %d), remaining log size %d",
+		absoluteIndex, boundaryTerm, len(rs.persistent.Log))
+	return nil
 }
 
 // ShouldTakeSnapshot checks if a snapshot should be taken based on log size

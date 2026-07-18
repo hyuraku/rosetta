@@ -145,12 +145,28 @@ func (rn *RaftNode) SetLogger(logger *log.Logger) {
 	rn.logger = logger
 }
 
-// TriggerSnapshot triggers log compaction up to the given index
+// TriggerSnapshot is called by the state machine (kvstore) after it has
+// persisted its own snapshot up to lastIncludedIndex. It schedules raft log
+// truncation asynchronously so the apply loop is not blocked by disk IO.
+//
+// Concurrency: TruncateLogTo is idempotent and self-locks via rs.mu, so we
+// do not need an extra mutex here. Stacked goroutines from rapid triggers
+// will each acquire rs.mu in turn; the second-and-later calls become no-ops
+// because absoluteIndex <= LastIncludedIndex by then.
 func (rn *RaftNode) TriggerSnapshot(lastIncludedIndex int) {
-	// This is called by the KV store when it has saved a snapshot
-	// The actual log truncation will happen asynchronously
 	rn.logger.Printf("Snapshot trigger received for index %d", lastIncludedIndex)
-	// Note: Actual log truncation is handled in the snapshot.go TakeSnapshot method
+	go func() {
+		if err := rn.state.TruncateLogTo(lastIncludedIndex); err != nil {
+			rn.logger.Printf("Failed to truncate log at index %d: %v", lastIncludedIndex, err)
+		}
+	}()
+}
+
+// SetSnapshotter delegates to the underlying RaftState. Callers (typically
+// kvstore wiring in main.go) supply a Snapshotter so the leader can serve
+// InstallSnapshot RPCs and so log compaction can persist state.
+func (rn *RaftNode) SetSnapshotter(s Snapshotter) {
+	rn.state.SetSnapshotter(s)
 }
 
 type MockTransport struct {
