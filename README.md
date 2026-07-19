@@ -52,6 +52,55 @@ curl http://localhost:9080/leader
 
 ## Architecture
 
+### Cluster Overview
+
+```mermaid
+flowchart LR
+    Client([Client])
+
+    subgraph Cluster[Rosetta Cluster]
+        direction TB
+        Leader[Leader Node]
+        F1[Follower Node]
+        F2[Follower Node]
+
+        Leader <-->|AppendEntries / RequestVote| F1
+        Leader <-->|AppendEntries / RequestVote| F2
+        F1 <-.->|RequestVote on election| F2
+    end
+
+    Client -->|HTTP: PUT / DELETE / GET| Leader
+    Client -.->|HTTP 503 redirect| F1
+
+    Leader --> DL[(Disk: raft_state.json<br/>kv_snapshot.json)]
+    F1 --> DF1[(Disk: raft_state.json<br/>kv_snapshot.json)]
+    F2 --> DF2[(Disk: raft_state.json<br/>kv_snapshot.json)]
+```
+
+Writes always go through the Leader; Followers redirect clients via HTTP 503. Each node independently persists its Raft state and KV snapshot for crash recovery.
+
+### Raft State Transitions
+
+```mermaid
+stateDiagram-v2
+    [*] --> Follower: node startup
+
+    Follower --> Candidate: election timeout<br/>(150-300ms)
+
+    Candidate --> Leader: receives majority votes
+    Candidate --> Follower: discovers higher term<br/>or valid leader heartbeat
+    Candidate --> Candidate: split vote<br/>(retry with new term)
+
+    Leader --> Follower: discovers higher term
+
+    note right of Leader
+        sends AppendEntries
+        heartbeat every 50ms
+    end note
+```
+
+Implemented in [`raft/state.go`](raft/state.go). Randomized election timeouts prevent split votes; any node that observes a higher term immediately steps down to Follower.
+
 ### Core Components
 
 - **raft/**: Raft consensus algorithm implementation
