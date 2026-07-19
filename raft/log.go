@@ -210,9 +210,13 @@ func (rs *RaftState) applyEntries() {
 			CommandIndex: entry.Index,
 		}
 
-		select {
-		case rs.applyCh <- applyMsg:
-		default:
-		}
+		// Block until the state machine consumes the entry. Dropping the
+		// message here (as a non-blocking send with a default case would)
+		// while LastApplied has already advanced would permanently skip a
+		// committed entry, violating the Raft state-machine safety property.
+		// The consumer (kvstore applyLoop) never acquires rs.mu synchronously,
+		// so this send always drains and cannot deadlock. This mirrors the
+		// blocking send already used on the InstallSnapshot apply path.
+		rs.applyCh <- applyMsg
 	}
 }
