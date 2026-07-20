@@ -186,6 +186,36 @@ func parsePeers(peers string) map[string]string {
 	return result
 }
 
+// resolveConfig loads configuration from a file when configFile is set,
+// otherwise builds it from the individual flags. It aborts the process on an
+// invalid configuration.
+func resolveConfig(configFile, nodeID, listenAddr, httpAddr, peers string) *config.Config {
+	var cfg *config.Config
+
+	if configFile != "" {
+		var err error
+		cfg, err = config.LoadConfig(configFile)
+		if err != nil {
+			log.Fatalf("Failed to load config: %v", err)
+		}
+	} else {
+		cfg = config.DefaultConfig()
+		cfg.NodeID = nodeID
+		cfg.ListenAddr = listenAddr
+		cfg.HTTPServerAddr = httpAddr
+
+		if peers != "" {
+			cfg.Peers = parsePeers(peers)
+		}
+	}
+
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
+
+	return cfg
+}
+
 func main() {
 	var (
 		configFile = flag.String("config", "", "Configuration file path")
@@ -197,28 +227,7 @@ func main() {
 	)
 	flag.Parse()
 
-	var cfg *config.Config
-	var err error
-
-	if *configFile != "" {
-		cfg, err = config.LoadConfig(*configFile)
-		if err != nil {
-			log.Fatalf("Failed to load config: %v", err)
-		}
-	} else {
-		cfg = config.DefaultConfig()
-		cfg.NodeID = *nodeID
-		cfg.ListenAddr = *listenAddr
-		cfg.HTTPServerAddr = *httpAddr
-
-		if *peers != "" {
-			cfg.Peers = parsePeers(*peers)
-		}
-	}
-
-	if err := cfg.Validate(); err != nil {
-		log.Fatalf("Invalid configuration: %v", err)
-	}
+	cfg := resolveConfig(*configFile, *nodeID, *listenAddr, *httpAddr, *peers)
 
 	// Setup persistence
 	dataDir := filepath.Join(cfg.DataDir, cfg.NodeID)
