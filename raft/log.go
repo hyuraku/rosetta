@@ -133,7 +133,9 @@ func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) int {
 		Type:    entryType,
 	}
 	rs.persistent.Log = append(rs.persistent.Log, entry)
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		rs.logger.Printf("AppendLogEntry: persist failed: %v", err)
+	}
 	return index
 }
 
@@ -185,7 +187,9 @@ func (rs *RaftState) TruncateLogAfter(index int) {
 	} else if index < len(rs.persistent.Log) {
 		rs.persistent.Log = rs.persistent.Log[:index]
 	}
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		rs.logger.Printf("TruncateLogAfter: persist failed: %v", err)
+	}
 }
 
 func (rs *RaftState) UpdateCommitIndex(leaderCommit int) {

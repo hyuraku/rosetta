@@ -18,12 +18,23 @@ type RaftNode struct {
 }
 
 func NewRaftNode(nodeID string, peers []string, transport RPCTransport, applyCh chan ApplyMsg) *RaftNode {
-	return NewRaftNodeWithPersister(nodeID, peers, transport, applyCh, nil)
+	// A nil persister never loads state from disk, so construction cannot fail.
+	node, _ := NewRaftNodeWithPersister(nodeID, peers, transport, applyCh, nil)
+	return node
 }
 
-func NewRaftNodeWithPersister(nodeID string, peers []string, transport RPCTransport, applyCh chan ApplyMsg, persister Persister) *RaftNode {
+func NewRaftNodeWithPersister(
+	nodeID string, peers []string, transport RPCTransport, applyCh chan ApplyMsg, persister Persister,
+) (*RaftNode, error) {
+	state, err := NewRaftStateWithPersister(nodeID, peers, applyCh, persister)
+	if err != nil {
+		// Refuse to construct/start the node when persistent state cannot be
+		// trusted; the caller is expected to abort startup.
+		return nil, err
+	}
+
 	node := &RaftNode{
-		state:     NewRaftStateWithPersister(nodeID, peers, applyCh, persister),
+		state:     state,
 		transport: transport,
 		done:      make(chan struct{}),
 		applyCh:   applyCh,
@@ -31,7 +42,7 @@ func NewRaftNodeWithPersister(nodeID string, peers []string, transport RPCTransp
 	}
 
 	go node.run()
-	return node
+	return node, nil
 }
 
 func (rn *RaftNode) run() {

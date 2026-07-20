@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -123,10 +124,12 @@ type ApplyMsg struct {
 }
 
 func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftState {
-	return NewRaftStateWithPersister(nodeID, peers, applyCh, nil)
+	// A nil persister never touches disk, so construction cannot fail here.
+	rs, _ := NewRaftStateWithPersister(nodeID, peers, applyCh, nil)
+	return rs
 }
 
-func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan ApplyMsg, persister Persister) *RaftState {
+func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan ApplyMsg, persister Persister) (*RaftState, error) {
 	// Randomized election timeout between 150ms and 300ms
 	// This prevents split votes when nodes start at the same time
 	//nolint:gosec // G404: election timeout jitter does not need a crypto RNG
@@ -146,16 +149,20 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 		logger:           log.New(log.Writer(), "[RAFT-STATE-"+nodeID+"] ", log.LstdFlags),
 	}
 
-	// Load persistent state if persister is available
+	// Load persistent state if a persister is configured. A missing state file
+	// is not an error (LoadRaftState returns a zero-valued state), so this only
+	// fails on a genuine read/corruption error. In that case we cannot trust
+	// our on-disk term and vote, so we refuse to start rather than silently
+	// resetting to term 0 and risking a double vote in a term we already acted in.
 	if persister != nil {
 		if err := rs.loadPersistentState(); err != nil {
-			rs.logger.Printf("Warning: failed to load persistent state: %v", err)
+			return nil, fmt.Errorf("refusing to start: cannot load persistent state: %w", err)
 		}
 	}
 
 	rs.electionTimer = time.NewTimer(rs.electionTimeout)
 
-	return rs
+	return rs, nil
 }
 
 // loadPersistentState loads the persistent state from storage
@@ -173,15 +180,21 @@ func (rs *RaftState) loadPersistentState() error {
 	return nil
 }
 
-// persist saves the current persistent state to storage
-func (rs *RaftState) persist() {
+// persist saves the current persistent state to storage. It returns an error
+// when the write fails so that callers on the RPC path can refuse to
+// acknowledge a vote or term change that was not durably stored. This upholds
+// the Raft rule (Figure 2) that persistent state must be written to stable
+// storage before responding to RPCs.
+func (rs *RaftState) persist() error {
 	if rs.persister == nil {
-		return
+		return nil
 	}
 
 	if err := rs.persister.SaveRaftState(&rs.persistent); err != nil {
 		rs.logger.Printf("Error: failed to persist state: %v", err)
+		return err
 	}
+	return nil
 }
 
 func (rs *RaftState) GetState() (int, bool) {
@@ -219,14 +232,18 @@ func (rs *RaftState) IncrementTerm() {
 	defer rs.mu.Unlock()
 	rs.persistent.CurrentTerm++
 	rs.persistent.VotedFor = nil
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		rs.logger.Printf("IncrementTerm: persist failed: %v", err)
+	}
 }
 
 func (rs *RaftState) SetVotedFor(nodeID *string) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.persistent.VotedFor = nodeID
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		rs.logger.Printf("SetVotedFor: persist failed: %v", err)
+	}
 }
 
 func (rs *RaftState) GetVotedFor() *string {
