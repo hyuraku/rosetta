@@ -78,11 +78,11 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	}
 
 	if rs.persistent.VotedFor == nil || *rs.persistent.VotedFor == args.CandidateID {
-		lastLogIndex := len(rs.persistent.Log)
-		lastLogTerm := 0
-		if lastLogIndex > 0 {
-			lastLogTerm = rs.persistent.Log[lastLogIndex-1].Term
-		}
+		// Evaluate the election restriction (§5.4.1) against the absolute last
+		// log index/term, which after compaction is the snapshot boundary plus
+		// the live log, not merely len(Log).
+		lastLogIndex := rs.lastAbsLogIndex()
+		lastLogTerm := rs.lastAbsLogTerm()
 
 		if args.LastLogTerm > lastLogTerm ||
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
@@ -142,24 +142,39 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 	reply.Term = rs.persistent.CurrentTerm
 
-	// Fast rollback optimization: handle log consistency check
-	if args.PrevLogIndex > len(rs.persistent.Log) {
-		// Log is too short - return the length so leader can jump back
+	// Fast rollback optimization: handle log consistency check against the
+	// (possibly compacted) log. All indices here are absolute.
+	lastIdx := rs.lastAbsLogIndex()
+	lii := rs.persistent.LastIncludedIndex
+	switch {
+	case args.PrevLogIndex > lastIdx:
+		// Log is too short - return the absolute end so the leader can jump back.
 		reply.ConflictTerm = -1
-		reply.ConflictIndex = len(rs.persistent.Log) + 1
+		reply.ConflictIndex = lastIdx + 1
 		return
-	}
-
-	if args.PrevLogIndex > 0 && rs.persistent.Log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-		// Term mismatch - find first index of the conflicting term
-		reply.ConflictTerm = rs.persistent.Log[args.PrevLogIndex-1].Term
-		// Search backwards to find first entry with ConflictTerm
-		conflictIndex := args.PrevLogIndex
-		for conflictIndex > 1 && rs.persistent.Log[conflictIndex-2].Term == reply.ConflictTerm {
-			conflictIndex--
+	case args.PrevLogIndex == lii:
+		// PrevLogIndex sits exactly on our snapshot boundary (or the origin when
+		// lii == 0). Its term is LastIncludedTerm by construction, so a mismatch
+		// would mean the leader's committed prefix disagrees with our snapshot,
+		// which Raft safety forbids. Nothing to verify; fall through to merge.
+	case args.PrevLogIndex < lii:
+		// PrevLogIndex refers to an entry our snapshot already subsumes. We can
+		// no longer read that entry's term, but every index up to
+		// LastIncludedIndex is committed and identical on all nodes, so the
+		// prefix trivially matches. Accept and let mergeLogEntries skip the
+		// entries that predate the boundary.
+	default: // lii < PrevLogIndex <= lastIdx
+		if rs.logTermAt(args.PrevLogIndex) != args.PrevLogTerm {
+			// Term mismatch - find first index of the conflicting term, never
+			// walking below the snapshot boundary (compacted terms are unknown).
+			reply.ConflictTerm = rs.logTermAt(args.PrevLogIndex)
+			conflictIndex := args.PrevLogIndex
+			for conflictIndex > lii+1 && rs.logTermAt(conflictIndex-1) == reply.ConflictTerm {
+				conflictIndex--
+			}
+			reply.ConflictIndex = conflictIndex
+			return
 		}
-		reply.ConflictIndex = conflictIndex
-		return
 	}
 
 	// Only persist/acknowledge if the merge actually changed the log; a delayed
@@ -176,7 +191,7 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 
 	if args.LeaderCommit > rs.volatile.CommitIndex {
-		rs.volatile.CommitIndex = min(args.LeaderCommit, len(rs.persistent.Log))
+		rs.volatile.CommitIndex = min(args.LeaderCommit, rs.lastAbsLogIndex())
 		rs.applyEntries()
 	}
 
@@ -191,18 +206,25 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 // truncating a suffix the leader has already committed. It returns true only
 // when the log was actually modified. Callers must hold rs.mu.
 func (rs *RaftState) mergeLogEntries(args *AppendEntriesArgs) bool {
+	lii := rs.persistent.LastIncludedIndex
 	for i, entry := range args.Entries {
-		index := args.PrevLogIndex + i + 1 // 1-based log index of this entry
-		if index <= len(rs.persistent.Log) && rs.persistent.Log[index-1].Term == entry.Term {
+		absIndex := args.PrevLogIndex + i + 1 // absolute log index of this entry
+		if absIndex <= lii {
+			// Already subsumed by our snapshot; nothing to compare or write.
+			continue
+		}
+		pos := rs.slicePos(absIndex) // position within the live log
+		if pos < len(rs.persistent.Log) && rs.persistent.Log[pos].Term == entry.Term {
 			continue // already present, no conflict
 		}
-		if index <= len(rs.persistent.Log) {
+		if pos < len(rs.persistent.Log) {
 			// Conflicting term at this index: drop it and everything after.
-			rs.persistent.Log = rs.persistent.Log[:index-1]
+			rs.persistent.Log = rs.persistent.Log[:pos]
 		}
 		rs.persistent.Log = append(rs.persistent.Log, args.Entries[i:]...)
-		for j := index - 1; j < len(rs.persistent.Log); j++ {
-			rs.persistent.Log[j].Index = j + 1
+		// Re-stamp absolute indices on the appended suffix.
+		for j := pos; j < len(rs.persistent.Log); j++ {
+			rs.persistent.Log[j].Index = lii + j + 1
 		}
 		return true
 	}
@@ -229,11 +251,10 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 		return
 	}
 	currentTerm := rs.persistent.CurrentTerm
-	lastLogIndex := len(rs.persistent.Log)
-	lastLogTerm := 0
-	if lastLogIndex > 0 {
-		lastLogTerm = rs.persistent.Log[lastLogIndex-1].Term
-	}
+	// Advertise the absolute last log index/term so peers evaluate our
+	// candidacy correctly across a compaction boundary (§5.4.1).
+	lastLogIndex := rs.lastAbsLogIndex()
+	lastLogTerm := rs.lastAbsLogTerm()
 
 	// Use a vote counter that's protected by the RaftState mutex
 	votes := 1
@@ -468,7 +489,7 @@ func (rs *RaftState) handleReplicationConflict(peerID string, reply *AppendEntri
 		lastIndexOfConflictTerm := -1
 		for i := len(rs.persistent.Log) - 1; i >= 0; i-- {
 			if rs.persistent.Log[i].Term == reply.ConflictTerm {
-				lastIndexOfConflictTerm = i + 1 // Convert to 1-based index
+				lastIndexOfConflictTerm = rs.persistent.LastIncludedIndex + i + 1 // absolute index
 				break
 			}
 		}
@@ -544,8 +565,8 @@ func (rs *RaftState) updateCommitIndex() {
 		return
 	}
 
-	for n := rs.volatile.CommitIndex + 1; n <= len(rs.persistent.Log); n++ {
-		if rs.persistent.Log[n-1].Term != rs.persistent.CurrentTerm {
+	for n := rs.volatile.CommitIndex + 1; n <= rs.lastAbsLogIndex(); n++ {
+		if rs.logTermAt(n) != rs.persistent.CurrentTerm {
 			continue
 		}
 

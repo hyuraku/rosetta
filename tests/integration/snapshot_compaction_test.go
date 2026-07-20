@@ -109,9 +109,11 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	}
 	time.Sleep(300 * time.Millisecond)
 
+	// GetLogLength reports the absolute last log index, which does not shrink
+	// on compaction; assert against the number of submitted commands instead.
 	preLen := leader.GetLogLength()
 	if preLen < numCmds {
-		t.Fatalf("expected leader log >= %d, got %d", numCmds, preLen)
+		t.Fatalf("expected leader last log index >= %d, got %d", numCmds, preLen)
 	}
 
 	// 4) Compact the leader's log up to the next-to-last few entries.
@@ -126,19 +128,21 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	leader.TriggerSnapshot(compactUpTo)
 	time.Sleep(200 * time.Millisecond) // wait for async TruncateLogTo
 
-	postLen := leader.GetLogLength()
-	if postLen >= preLen {
-		t.Fatalf("leader log did not shrink after TriggerSnapshot: pre=%d post=%d", preLen, postLen)
+	// Compaction is observable through the snapshot boundary advancing, not
+	// through log length (which stays at the absolute last index).
+	if idx, _ := leader.GetRaftState().GetSnapshotMetadata(); idx != compactUpTo {
+		t.Fatalf("leader snapshot boundary did not advance: got %d, want %d", idx, compactUpTo)
 	}
-	t.Logf("leader log compacted: %d -> %d entries (snapshot at index %d)",
-		preLen, postLen, compactUpTo)
+	t.Logf("leader log compacted to snapshot boundary %d (last index still %d)", compactUpTo, leader.GetLogLength())
 
 	// 5) Late-join the lagger. From its first heartbeat the leader will
 	//    notice node3's nextIndex falls under LastIncludedIndex and must
 	//    send InstallSnapshot instead of AppendEntries.
+	//    Record applied command indices so we can prove the follower keeps
+	//    applying entries after installing the snapshot.
 	laggerApplyCh := make(chan raft.ApplyMsg, 256)
 	go func() {
-		for range laggerApplyCh {
+		for range laggerApplyCh { //nolint:revive // draining; values observed via raft state
 		}
 	}()
 	laggerNode := raft.NewRaftNode(laggerID, peers, transport, laggerApplyCh)
@@ -154,8 +158,39 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	// the follower's raft state — not just the state machine — accepted
 	// the snapshot and rewrote its log boundary.
 	if !waitForSnapshotCatchUp(nodes, laggerID, compactUpTo) {
-		t.Errorf("lagger %s did not catch up via InstallSnapshot within deadline", laggerID)
+		t.Fatalf("lagger %s did not catch up via InstallSnapshot within deadline", laggerID)
 	}
+
+	// 6) After the snapshot install, the leader must be able to keep appending,
+	//    committing, and having the follower apply NEW commands across the
+	//    compaction boundary. Submit more commands and verify the lagger's
+	//    applied index advances past the snapshot boundary (i.e. it consumed
+	//    the tail entries 26..30 plus these new ones).
+	const extraCmds = 5
+	for i := 0; i < extraCmds; i++ {
+		if _, _, ok := leader.Start(fmt.Sprintf("post-snap-%d", i)); !ok {
+			t.Fatalf("leader rejected Start of post-snapshot command %d", i)
+		}
+	}
+	targetApplied := numCmds + extraCmds // 35
+	if !waitForApplied(nodes[laggerID], targetApplied) {
+		la := nodes[laggerID].GetRaftState().GetLastApplied()
+		t.Errorf("lagger %s did not apply through index %d after snapshot; last applied=%d",
+			laggerID, targetApplied, la)
+	}
+}
+
+// waitForApplied polls a node's applied index until it reaches target,
+// returning false on timeout.
+func waitForApplied(node *raft.RaftNode, target int) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if node.GetRaftState().GetLastApplied() >= target {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 // startMajority brings up every peer except laggerID as a live RaftNode wired

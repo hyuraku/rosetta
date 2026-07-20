@@ -115,6 +115,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For snapshots
 	SnapshotValid bool
@@ -174,7 +175,15 @@ func (rs *RaftState) loadPersistentState() error {
 
 	if state != nil {
 		rs.persistent = *state
-		rs.logger.Printf("Loaded persistent state: term=%d, log_size=%d", state.CurrentTerm, len(state.Log))
+		// Everything up to LastIncludedIndex was already applied and folded into
+		// the snapshot before this node crashed, so the volatile indices must
+		// start at the snapshot boundary rather than 0. Otherwise applyEntries
+		// would try to re-read (already compacted) positions below the boundary
+		// and either panic or re-apply entries that no longer exist in the log.
+		rs.volatile.CommitIndex = state.LastIncludedIndex
+		rs.volatile.LastApplied = state.LastIncludedIndex
+		rs.logger.Printf("Loaded persistent state: term=%d, log_size=%d, lastIncludedIndex=%d",
+			state.CurrentTerm, len(state.Log), state.LastIncludedIndex)
 	}
 
 	return nil
@@ -207,6 +216,23 @@ func (rs *RaftState) GetCurrentTerm() int {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	return rs.persistent.CurrentTerm
+}
+
+// GetCommitIndex returns the current commit index (an absolute log index).
+// Exposed for observability and tests that assert commit progress across the
+// log-compaction boundary.
+func (rs *RaftState) GetCommitIndex() int {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.volatile.CommitIndex
+}
+
+// GetLastApplied returns the index of the last entry applied to the state
+// machine (an absolute log index).
+func (rs *RaftState) GetLastApplied() int {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.volatile.LastApplied
 }
 
 func (rs *RaftState) GetNodeState() NodeState {
@@ -271,7 +297,7 @@ func (rs *RaftState) initializeLeaderState() {
 		MatchIndex: make(map[string]int),
 	}
 
-	nextIndex := len(rs.persistent.Log) + 1
+	nextIndex := rs.lastAbsLogIndex() + 1
 	for _, peer := range rs.peers {
 		if peer != rs.nodeID {
 			rs.leader.NextIndex[peer] = nextIndex
