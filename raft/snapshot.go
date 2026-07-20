@@ -74,7 +74,9 @@ func (rs *RaftState) TakeSnapshot(lastIncludedIndex int, snapshotter Snapshotter
 	rs.persistent.LastIncludedTerm = lastIncludedTerm
 
 	// Persist the updated state
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		return fmt.Errorf("failed to persist state after taking snapshot: %w", err)
+	}
 
 	rs.logger.Printf("Snapshot taken: lastIndex=%d, lastTerm=%d, logSize=%d, snapshotSize=%d",
 		lastIncludedIndex, lastIncludedTerm, len(rs.persistent.Log), len(snapshotData))
@@ -122,7 +124,9 @@ func (rs *RaftState) InstallSnapshotFromData(lastIncludedIndex, lastIncludedTerm
 	}
 
 	// Persist the updated state
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		return fmt.Errorf("failed to persist state after installing snapshot: %w", err)
+	}
 
 	rs.logger.Printf("Snapshot installed: lastIndex=%d, lastTerm=%d, logSize=%d",
 		lastIncludedIndex, lastIncludedTerm, len(rs.persistent.Log))
@@ -171,7 +175,9 @@ func (rs *RaftState) TruncateLogTo(absoluteIndex int) error {
 
 	rs.persistent.LastIncludedIndex = absoluteIndex
 	rs.persistent.LastIncludedTerm = boundaryTerm
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		return fmt.Errorf("failed to persist state after truncating log: %w", err)
+	}
 
 	rs.logger.Printf("Log truncated up to index %d (term %d), remaining log size %d",
 		absoluteIndex, boundaryTerm, len(rs.persistent.Log))

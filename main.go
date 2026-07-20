@@ -240,7 +240,10 @@ func main() {
 	transport.SetPeers(cfg.Peers)
 
 	peerIDs := cfg.GetPeerIDs()
-	raftNode := raft.NewRaftNodeWithPersister(cfg.NodeID, peerIDs, transport, applyCh, raftPersister)
+	raftNode, err := raft.NewRaftNodeWithPersister(cfg.NodeID, peerIDs, transport, applyCh, raftPersister)
+	if err != nil {
+		log.Fatalf("Failed to start Raft node: %v", err)
+	}
 
 	kvs.SetRaft(raftNode)
 	transport.SetRaftNode(raftNode)

@@ -67,10 +67,14 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 		return
 	}
 
+	// Track whether we mutated persistent state (term or vote) so we can flush
+	// it to stable storage before replying.
+	dirty := false
 	if args.Term > rs.persistent.CurrentTerm {
 		rs.persistent.CurrentTerm = args.Term
 		rs.persistent.VotedFor = nil
 		rs.state = Follower
+		dirty = true
 	}
 
 	if rs.persistent.VotedFor == nil || *rs.persistent.VotedFor == args.CandidateID {
@@ -85,6 +89,19 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 			rs.persistent.VotedFor = &args.CandidateID
 			reply.VoteGranted = true
 			rs.ResetElectionTimer()
+			dirty = true
+		}
+	}
+
+	// Persist the vote/term change before responding. If the write fails we must
+	// not tell the candidate we voted for it: the vote is not durable, so a crash
+	// here could let us vote again for a different candidate in the same term.
+	// The in-memory VotedFor stays set, which is the safe direction (it only
+	// prevents further votes this term); a later successful persist reconciles it.
+	if dirty {
+		if err := rs.persist(); err != nil {
+			reply.VoteGranted = false
+			rs.logger.Printf("RequestVote: refusing to grant vote, persist failed: %v", err)
 		}
 	}
 
@@ -102,14 +119,28 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		return
 	}
 
+	termChanged := false
 	if args.Term > rs.persistent.CurrentTerm {
 		rs.persistent.CurrentTerm = args.Term
 		rs.persistent.VotedFor = nil
+		termChanged = true
 	}
 
 	rs.state = Follower
 	rs.currentLeader = args.LeaderID // Track who the current leader is
 	rs.ResetElectionTimer()
+
+	// A term bump must reach stable storage before we respond. On failure we
+	// leave Success=false and bail out rather than acknowledging under a term
+	// we have not durably recorded.
+	if termChanged {
+		if err := rs.persist(); err != nil {
+			rs.logger.Printf("AppendEntries: persist of term change failed: %v", err)
+			reply.Term = rs.persistent.CurrentTerm
+			return
+		}
+	}
+	reply.Term = rs.persistent.CurrentTerm
 
 	// Fast rollback optimization: handle log consistency check
 	if args.PrevLogIndex > len(rs.persistent.Log) {
@@ -140,7 +171,15 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		for i := range rs.persistent.Log[args.PrevLogIndex:] {
 			rs.persistent.Log[args.PrevLogIndex+i].Index = args.PrevLogIndex + i + 1
 		}
-		rs.persist()
+
+		// The appended entries must be durable before we acknowledge them: a
+		// leader that sees Success advances its commit index, so reporting
+		// success for entries we could lose on a crash would break the log
+		// matching guarantee.
+		if err := rs.persist(); err != nil {
+			rs.logger.Printf("AppendEntries: persist of log entries failed: %v", err)
+			return
+		}
 	}
 
 	if args.LeaderCommit > rs.volatile.CommitIndex {
@@ -158,7 +197,19 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	rs.state = Candidate
 	rs.persistent.VotedFor = &rs.nodeID
 	rs.currentLeader = "" // Clear current leader when starting election
-	rs.persist()
+	if err := rs.persist(); err != nil {
+		// Could not durably record our candidacy (incremented term + self-vote).
+		// Abort this election attempt; a later election timeout will retry once
+		// storage recovers, rather than campaigning under an unpersisted term.
+		rs.logger.Printf("startElection: persist failed, aborting election: %v", err)
+		rs.state = Follower
+		rs.mu.Unlock()
+		// Re-arm the (already fired) election timer so we retry on the next
+		// timeout once storage recovers; otherwise this node would never
+		// campaign again until it hears from a leader.
+		rs.ResetElectionTimer()
+		return
+	}
 	currentTerm := rs.persistent.CurrentTerm
 	lastLogIndex := len(rs.persistent.Log)
 	lastLogTerm := 0
@@ -233,7 +284,9 @@ func (rs *RaftState) requestVoteFromPeer(
 		rs.persistent.CurrentTerm = reply.Term
 		rs.state = Follower
 		rs.persistent.VotedFor = nil
-		rs.persist()
+		if err := rs.persist(); err != nil {
+			rs.logger.Printf("requestVoteFromPeer: persist of higher term failed: %v", err)
+		}
 		return
 	}
 
@@ -358,6 +411,9 @@ func (rs *RaftState) replicateToPeer(
 		rs.persistent.CurrentTerm = reply.Term
 		rs.state = Follower
 		rs.persistent.VotedFor = nil
+		if err := rs.persist(); err != nil {
+			rs.logger.Printf("replicateToPeer: persist of higher term failed: %v", err)
+		}
 		return
 	}
 
@@ -452,6 +508,9 @@ func (rs *RaftState) sendSnapshotToPeer(
 		rs.persistent.CurrentTerm = reply.Term
 		rs.state = Follower
 		rs.persistent.VotedFor = nil
+		if err := rs.persist(); err != nil {
+			rs.logger.Printf("sendSnapshotToPeer: persist of higher term failed: %v", err)
+		}
 		return
 	}
 	if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
@@ -542,7 +601,11 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		rs.persistent.CurrentTerm = args.Term
 		rs.persistent.VotedFor = nil
 		rs.state = Follower
-		rs.persist()
+		if err := rs.persist(); err != nil {
+			rs.logger.Printf("InstallSnapshot: persist of term change failed: %v", err)
+			reply.Term = rs.persistent.CurrentTerm
+			return
+		}
 	}
 
 	reply.Term = rs.persistent.CurrentTerm
@@ -578,8 +641,14 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		rs.volatile.LastApplied = args.LastIncludedIndex
 	}
 
-	// Persist state
-	rs.persist()
+	// Persist the new snapshot boundary before handing the data to the state
+	// machine. If this fails, do not apply: letting the state machine advance
+	// past a snapshot index we did not durably record would leave the state
+	// machine ahead of our Raft metadata after a crash.
+	if err := rs.persist(); err != nil {
+		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed: %v", err)
+		return
+	}
 
 	// Send snapshot data to apply channel for state machine to install
 	rs.applyCh <- ApplyMsg{

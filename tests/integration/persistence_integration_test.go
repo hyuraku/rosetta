@@ -26,7 +26,10 @@ func TestRaftPersistence_CrashRecovery(t *testing.T) {
 	peers := []string{"node1", "node2", "node3"}
 	transport1 := raft.NewMockTransport()
 
-	raftNode1 := raft.NewRaftNodeWithPersister("node1", peers, transport1, applyCh, persister)
+	raftNode1, err := raft.NewRaftNodeWithPersister("node1", peers, transport1, applyCh, persister)
+	if err != nil {
+		t.Fatalf("failed to create raft node: %v", err)
+	}
 	transport1.RegisterNode("node1", raftNode1)
 
 	// Simulate some state changes
@@ -58,7 +61,10 @@ func TestRaftPersistence_CrashRecovery(t *testing.T) {
 	applyCh2 := make(chan raft.ApplyMsg, 10)
 	transport2 := raft.NewMockTransport()
 
-	raftNode2 := raft.NewRaftNodeWithPersister("node1", peers, transport2, applyCh2, persister)
+	raftNode2, err := raft.NewRaftNodeWithPersister("node1", peers, transport2, applyCh2, persister)
+	if err != nil {
+		t.Fatalf("failed to create raft node: %v", err)
+	}
 	transport2.RegisterNode("node1", raftNode2)
 
 	// Verify recovered state
@@ -177,7 +183,10 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 	// Create Raft node with persister
 	peers := []string{"node1"}
 	transport1 := raft.NewMockTransport()
-	raftNode1 := raft.NewRaftNodeWithPersister("node1", peers, transport1, applyCh1, persister)
+	raftNode1, err := raft.NewRaftNodeWithPersister("node1", peers, transport1, applyCh1, persister)
+	if err != nil {
+		t.Fatalf("failed to create raft node: %v", err)
+	}
 	transport1.RegisterNode("node1", raftNode1)
 
 	kvStore1.SetRaft(raftNode1)
@@ -226,7 +235,10 @@ func TestFullSystemPersistence_CrashAndRecover(t *testing.T) {
 	applyCh2 := kvStore2.GetApplyCh()
 
 	transport2 := raft.NewMockTransport()
-	raftNode2 := raft.NewRaftNodeWithPersister("node1", peers, transport2, applyCh2, persister)
+	raftNode2, err := raft.NewRaftNodeWithPersister("node1", peers, transport2, applyCh2, persister)
+	if err != nil {
+		t.Fatalf("failed to create raft node: %v", err)
+	}
 	transport2.RegisterNode("node1", raftNode2)
 
 	kvStore2.SetRaft(raftNode2)
@@ -327,7 +339,10 @@ func TestPersistence_MultipleCrashes(t *testing.T) {
 
 		applyCh := make(chan raft.ApplyMsg, 10)
 		transport := raft.NewMockTransport()
-		raftNode := raft.NewRaftNodeWithPersister("node1", peers, transport, applyCh, persister)
+		raftNode, err := raft.NewRaftNodeWithPersister("node1", peers, transport, applyCh, persister)
+		if err != nil {
+			t.Fatalf("failed to create raft node: %v", err)
+		}
 		transport.RegisterNode("node1", raftNode)
 
 		// Wait for recovery
