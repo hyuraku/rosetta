@@ -268,7 +268,7 @@ func (kvs *KVStore) applyLoop() {
 		kvs.lastAppliedIndex = applyMsg.CommandIndex
 		kvs.mu.Unlock()
 
-		kvs.opMu.RLock()
+		kvs.opMu.Lock()
 		if ch, exists := kvs.pendingOps[cmd.ID]; exists {
 			select {
 			case ch <- result:
@@ -276,7 +276,7 @@ func (kvs *KVStore) applyLoop() {
 			}
 			delete(kvs.pendingOps, cmd.ID)
 		}
-		kvs.opMu.RUnlock()
+		kvs.opMu.Unlock()
 
 		// Check if we should take a snapshot
 		commandsSinceSnapshot++
@@ -467,7 +467,7 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value string) 
 		return Result{Value: "", Err: err}
 	}
 
-	_, term, isLeader := kvs.raft.Start(string(cmdBytes))
+	_, _, isLeader := kvs.raft.Start(string(cmdBytes))
 	if !isLeader {
 		return Result{Value: "", Err: fmt.Errorf("not leader")}
 	}
@@ -477,15 +477,20 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value string) 
 	kvs.pendingOps[opID] = resultCh
 	kvs.opMu.Unlock()
 
+	return kvs.awaitOperationResult(resultCh, opID)
+}
+
+// awaitOperationResult blocks until the committed result for opID is delivered
+// or the operation times out. A received result corresponds to an entry that
+// Raft has already committed and applied; by the Leader Completeness Property
+// such an entry is durable, so the result is returned regardless of any later
+// leadership or term change.
+func (kvs *KVStore) awaitOperationResult(resultCh chan Result, opID string) Result {
 	timeout := time.NewTimer(operationTimeout)
 	defer timeout.Stop()
 
 	select {
 	case result := <-resultCh:
-		currentTerm, stillLeader := kvs.raft.GetState()
-		if !stillLeader || currentTerm != term {
-			return Result{Value: "", Err: fmt.Errorf("leadership lost")}
-		}
 		return result
 	case <-timeout.C:
 		kvs.opMu.Lock()
