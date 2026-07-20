@@ -96,8 +96,10 @@ func TestFiveNodeCluster(t *testing.T) {
 				t.Errorf("Leader should be able to start command %d", i)
 				break
 			}
-			if index != i+1 {
-				t.Errorf("Expected index %d for command %d, got %d", i+1, i, index)
+			// Index 1 is the no-op the leader appends on election (§6.4), so the
+			// first client command lands at index 2.
+			if index != i+2 {
+				t.Errorf("Expected index %d for command %d, got %d", i+2, i, index)
 			}
 			if term <= 0 {
 				t.Errorf("Expected positive term for command %d, got %d", i, term)
@@ -224,11 +226,14 @@ func TestLogReplication(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
+	// Every node's log holds the leader's election no-op (index 1) plus the
+	// replicated commands, so the expected last index is len(commands)+1.
+	wantLogLen := len(commands) + 1
 	for nodeID, node := range nodes {
 		logLength := node.GetLogLength()
-		if logLength != len(commands) {
+		if logLength != wantLogLen {
 			t.Errorf("Node %s should have %d log entries, got %d",
-				nodeID, len(commands), logLength)
+				nodeID, wantLogLen, logLength)
 		}
 	}
 

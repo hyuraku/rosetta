@@ -23,6 +23,9 @@ const (
 	applyChBufferSize = 100
 	// operationTimeout is how long a pending operation waits to be committed and applied.
 	operationTimeout = 5 * time.Second
+	// applyWaitPollInterval is how often a linearizable read polls the applied
+	// index while waiting to catch up to a ReadIndex.
+	applyWaitPollInterval = 2 * time.Millisecond
 )
 
 type Command struct {
@@ -250,6 +253,19 @@ func (kvs *KVStore) applyLoop() {
 			continue
 		}
 
+		// A no-op entry (appended by a newly elected leader, Raft §6.4) carries
+		// no state-machine command. We must still advance lastAppliedIndex over
+		// it — both the log-compaction accounting and the ReadIndex catch-up in
+		// waitForApplied rely on lastAppliedIndex reflecting every committed
+		// index — then skip execution and pendingOps matching.
+		if isNoOpCommand(applyMsg.Command) {
+			kvs.mu.Lock()
+			kvs.lastAppliedIndex = applyMsg.CommandIndex
+			kvs.lastAppliedTerm = applyMsg.CommandTerm
+			kvs.mu.Unlock()
+			continue
+		}
+
 		var cmd Command
 		if err := json.Unmarshal([]byte(fmt.Sprintf("%v", applyMsg.Command)), &cmd); err != nil {
 			cmdBytes, ok := applyMsg.Command.([]byte)
@@ -460,26 +476,75 @@ func (kvs *KVStore) Get(key string) (string, error) {
 		return "", fmt.Errorf("raft node not initialized")
 	}
 
-	// Read-only optimization (Raft paper Section 8):
-	// If the leader has recently confirmed leadership via heartbeats,
-	// we can serve reads directly from local state without going through Raft.
-	if kvs.raft.CanServeReadOnlyQuery() {
-		return kvs.getLocal(key)
+	// Linearizable read via the ReadIndex protocol (Raft dissertation §6.4):
+	//  1. ask raft for a commit index that is safe to read. ReadIndex confirms,
+	//     via a fresh quorum of heartbeats, that we are still the leader and
+	//     captures the current commit index as the read index;
+	//  2. wait until our state machine has applied through that index; and
+	//  3. serve the value from local state.
+	// Unlike the removed lease optimization this trusts no clock: a leader that
+	// has lost its quorum (e.g. is partitioned) fails the read instead of
+	// returning a value that a newly elected leader may already have superseded.
+	// A non-leader returns raft.ErrNotLeader ("not leader"), which the HTTP layer
+	// maps to a 503 leader redirect, preserving the previous client behavior.
+	readIndex, err := kvs.raft.ReadIndex()
+	if err != nil {
+		return "", err
 	}
-
-	// Fall back to going through Raft for strong consistency
-	// This happens when:
-	// 1. This node is not the leader
-	// 2. The leader hasn't received heartbeat confirmations from a majority recently
-	result := kvs.executeOperationWithResult(OpGet, key, "", "", 0)
-	if result.Err != nil {
-		return "", result.Err
+	if err := kvs.waitForApplied(readIndex); err != nil {
+		return "", err
 	}
-	return result.Value, nil
+	return kvs.getLocal(key)
 }
 
-// getLocal reads directly from local state.
-// This should only be called when CanServeReadOnlyQuery() returns true.
+// waitForApplied blocks until the state machine has applied through index, or
+// until operationTimeout elapses. It is the local half of a ReadIndex read: the
+// captured read index may only be served once our applied index has caught up to
+// it (§6.4 step 3).
+func (kvs *KVStore) waitForApplied(index int) error {
+	kvs.mu.RLock()
+	applied := kvs.lastAppliedIndex
+	kvs.mu.RUnlock()
+	if applied >= index {
+		return nil
+	}
+
+	deadline := time.NewTimer(operationTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(applyWaitPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			kvs.mu.RLock()
+			applied := kvs.lastAppliedIndex
+			kvs.mu.RUnlock()
+			if applied >= index {
+				return nil
+			}
+		case <-deadline.C:
+			return fmt.Errorf("timed out waiting for state machine to apply through index %d", index)
+		}
+	}
+}
+
+// isNoOpCommand reports whether an ApplyMsg command is the leader's no-op marker
+// (raft.NoOpCommand). The command reaches the apply loop either as a string
+// (in-process MockTransport) or as bytes (decoded RPC), so both are handled.
+func isNoOpCommand(command interface{}) bool {
+	switch c := command.(type) {
+	case string:
+		return c == raft.NoOpCommand
+	case []byte:
+		return string(c) == raft.NoOpCommand
+	default:
+		return false
+	}
+}
+
+// getLocal reads directly from local state. It must only be called once a
+// ReadIndex has been confirmed and the apply index has caught up to it.
 func (kvs *KVStore) getLocal(key string) (string, error) {
 	kvs.mu.RLock()
 	defer kvs.mu.RUnlock()

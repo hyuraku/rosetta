@@ -139,11 +139,13 @@ func (rn *RaftNode) IsLeader() bool {
 	return isLeader
 }
 
-// CanServeReadOnlyQuery returns true if the leader can safely serve
-// read-only queries without going through the Raft log.
-// This implements the lease-based read optimization from Raft paper Section 8.
-func (rn *RaftNode) CanServeReadOnlyQuery() bool {
-	return rn.state.CanServeReadOnlyQuery()
+// ReadIndex runs the ReadIndex protocol (Raft dissertation §6.4) and returns a
+// commit index that is safe for a linearizable read once the caller's state
+// machine has applied through it. It confirms current leadership with a fresh
+// quorum of heartbeats and returns an error rather than a possibly stale index
+// when this node is not the leader or cannot reach a quorum.
+func (rn *RaftNode) ReadIndex() (int, error) {
+	return rn.state.ReadIndex(rn.transport)
 }
 
 func (rn *RaftNode) GetRaftState() *RaftState {
