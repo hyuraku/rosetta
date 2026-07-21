@@ -16,9 +16,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 5（B1, B2, C1, C2, C4） |
+| ✅ FIXED | 6（B1, B2, C1, C2, C4, D5） |
 | 🟠 PARTIAL | 1（C3） |
-| ❌ UNFIXED | 16 |
+| ❌ UNFIXED | 15 |
 
 **実用上の含意**: ログ圧縮（グループ A）は通常運転で安全性が破れるため、
 `MaxRaftState=0`（圧縮無効）以外で運用してはならない。リース読みは
@@ -63,7 +63,7 @@
 | D2 | リース起点が応答受信時刻（送信時刻でなく）→ 違反窓が拡大 | ❌ UNFIXED | `raft/rpc.go:429-434` |
 | D3 | 当選時 no-op エントリなし（論文 §8 違反、最も再現容易な stale read） | ❌ UNFIXED | `raft/rpc.go:293-306`, `raft/state.go:268-281` |
 | D4 | 重複検出（ClientID/SeqNum）が実 API 経路から未配線 → リトライで二重適用 | ❌ UNFIXED | `kvstore/store.go:457-463` |
-| D5 | 適用成功後に spurious な "leadership lost" エラー → 不要リトライを誘発 | ❌ UNFIXED | `kvstore/store.go:483-489` |
+| D5 | 適用成功後に spurious な "leadership lost" エラー → 不要リトライを誘発 | ✅ FIXED | `16a9b31`（コミット済みは log index で解決し、ロール変化後も結果を返却） |
 
 ## グループ E: data race
 
