@@ -441,6 +441,145 @@ func TestAppendEntriesReplyStructure(t *testing.T) {
 	}
 }
 
+// countingPersister records how many times the log is saved so a test can
+// assert that a pure-duplicate AppendEntries does not touch stable storage.
+type countingPersister struct {
+	saves int
+}
+
+func (p *countingPersister) SaveRaftState(*raft.PersistentState) error {
+	p.saves++
+	return nil
+}
+
+func (p *countingPersister) LoadRaftState() (*raft.PersistentState, error) {
+	return &raft.PersistentState{Log: make([]raft.LogEntry, 0)}, nil
+}
+
+// appendEntriesOK applies an AppendEntries and fails the test if it is rejected.
+func appendEntriesOK(t *testing.T, rs *raft.RaftState, prevIndex, prevTerm int, entries []raft.LogEntry) {
+	t.Helper()
+	reply := &raft.AppendEntriesReply{}
+	rs.AppendEntries(&raft.AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "leader",
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: 0,
+	}, reply)
+	if !reply.Success {
+		t.Fatalf("expected AppendEntries(prevIndex=%d) to succeed", prevIndex)
+	}
+}
+
+// TestAppendEntriesStaleRequestDoesNotTruncate reproduces the reorder/retransmit
+// hazard: after a longer batch is applied, a delayed AppendEntries carrying only
+// a prefix of already-present entries must NOT truncate the (possibly committed)
+// suffix. Raft §5.3 (receiver rule 3) only deletes entries that conflict.
+func TestAppendEntriesStaleRequestDoesNotTruncate(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"follower", "leader"}
+	follower := raft.NewRaftState("follower", peers, applyCh)
+
+	// Seed e1,e2 then apply the newer batch e3,e4,e5 → log is [e1..e5].
+	appendEntriesOK(t, follower, 0, 0, []raft.LogEntry{
+		{Term: 1, Index: 1, Command: "e1", Type: "command"},
+		{Term: 1, Index: 2, Command: "e2", Type: "command"},
+	})
+	appendEntriesOK(t, follower, 2, 1, []raft.LogEntry{
+		{Term: 1, Index: 3, Command: "e3", Type: "command"},
+		{Term: 1, Index: 4, Command: "e4", Type: "command"},
+		{Term: 1, Index: 5, Command: "e5", Type: "command"},
+	})
+
+	if follower.GetLastLogIndex() != 5 {
+		t.Fatalf("setup: expected log length 5, got %d", follower.GetLastLogIndex())
+	}
+
+	// A delayed, older AppendEntries carrying only e3 arrives. e3 already matches,
+	// so the log must be left intact rather than truncated to [e1,e2,e3].
+	appendEntriesOK(t, follower, 2, 1, []raft.LogEntry{
+		{Term: 1, Index: 3, Command: "e3", Type: "command"},
+	})
+
+	if follower.GetLastLogIndex() != 5 {
+		t.Errorf("stale AppendEntries truncated committed suffix: expected log length 5, got %d", follower.GetLastLogIndex())
+	}
+	if e := follower.GetLogEntry(5); e == nil || e.Command != "e5" {
+		t.Errorf("expected entry 5 to still be 'e5', got %+v", e)
+	}
+}
+
+// TestAppendEntriesDuplicateDoesNotPersist verifies that re-receiving an
+// AppendEntries whose entries all match the existing log neither changes the log
+// nor writes to stable storage (avoids redundant disk I/O on retransmits).
+func TestAppendEntriesDuplicateDoesNotPersist(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"follower", "leader"}
+	persister := &countingPersister{}
+	follower, err := raft.NewRaftStateWithPersister("follower", peers, applyCh, persister)
+	if err != nil {
+		t.Fatalf("unexpected setup error: %v", err)
+	}
+
+	entries := []raft.LogEntry{
+		{Term: 1, Index: 1, Command: "e1", Type: "command"},
+		{Term: 1, Index: 2, Command: "e2", Type: "command"},
+	}
+	appendEntriesOK(t, follower, 0, 0, entries)
+
+	savesAfterFirst := persister.saves
+	if savesAfterFirst == 0 {
+		t.Fatal("expected the initial AppendEntries to persist the log at least once")
+	}
+
+	// Identical re-delivery: nothing changes, so nothing should be persisted.
+	appendEntriesOK(t, follower, 0, 0, entries)
+
+	if follower.GetLastLogIndex() != 2 {
+		t.Errorf("duplicate AppendEntries changed log length: expected 2, got %d", follower.GetLastLogIndex())
+	}
+	if persister.saves != savesAfterFirst {
+		t.Errorf("duplicate AppendEntries persisted despite no change: saves went %d -> %d", savesAfterFirst, persister.saves)
+	}
+}
+
+// TestAppendEntriesConflictTruncatesAndReplaces guards the genuine-conflict path
+// (same index, different term): existing entries from the conflict point on must
+// be deleted and replaced by the leader's entries.
+func TestAppendEntriesConflictTruncatesAndReplaces(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 10)
+	peers := []string{"follower", "leader"}
+	follower := raft.NewRaftState("follower", peers, applyCh)
+
+	appendEntriesOK(t, follower, 0, 0, []raft.LogEntry{
+		{Term: 1, Index: 1, Command: "e1", Type: "command"},
+		{Term: 1, Index: 2, Command: "e2", Type: "command"},
+		{Term: 1, Index: 3, Command: "e3", Type: "command"},
+	})
+
+	// Leader overwrites from index 2 with higher-term entries. Index 1 matches, so
+	// only indexes 2..3 are replaced.
+	appendEntriesOK(t, follower, 1, 1, []raft.LogEntry{
+		{Term: 2, Index: 2, Command: "e2b", Type: "command"},
+		{Term: 2, Index: 3, Command: "e3b", Type: "command"},
+	})
+
+	if follower.GetLastLogIndex() != 3 {
+		t.Fatalf("expected log length 3 after conflict replace, got %d", follower.GetLastLogIndex())
+	}
+	if e := follower.GetLogEntry(1); e == nil || e.Term != 1 || e.Command != "e1" {
+		t.Errorf("expected entry 1 unchanged (term 1, 'e1'), got %+v", e)
+	}
+	if e := follower.GetLogEntry(2); e == nil || e.Term != 2 || e.Command != "e2b" {
+		t.Errorf("expected entry 2 replaced (term 2, 'e2b'), got %+v", e)
+	}
+	if e := follower.GetLogEntry(3); e == nil || e.Term != 2 || e.Command != "e3b" {
+		t.Errorf("expected entry 3 replaced (term 2, 'e3b'), got %+v", e)
+	}
+}
+
 // TestCanServeReadOnlyQuery tests the read-only optimization (Raft paper Section 8)
 func TestCanServeReadOnlyQuery(t *testing.T) {
 	applyCh := make(chan raft.ApplyMsg, 10)
