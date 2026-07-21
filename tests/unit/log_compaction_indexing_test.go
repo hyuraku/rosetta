@@ -16,7 +16,7 @@ import (
 //	LastIncludedIndex = boundary, LastIncludedTerm = 1
 //	live log = entries (boundary+1 .. total)
 //	CommitIndex = LastApplied = boundary
-func compactedFollower(t *testing.T, total, boundary int) (*raft.RaftState, chan raft.ApplyMsg) {
+func compactedFollower(t *testing.T, total, boundary int) (state *raft.RaftState, ch chan raft.ApplyMsg) {
 	t.Helper()
 	applyCh := make(chan raft.ApplyMsg, total+16)
 	peers := []string{"follower", "leader"}

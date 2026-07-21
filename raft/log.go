@@ -36,7 +36,7 @@ func (rs *RaftState) slicePos(absIndex int) int {
 }
 
 // logTermAt returns the term of the entry at absolute index absIndex.
-// Boundary behaviour:
+// Boundary behavior:
 //   - absIndex == LastIncludedIndex          -> LastIncludedTerm (snapshot boundary)
 //   - absIndex < LastIncludedIndex           -> 0 (compacted away, term unknown)
 //   - LastIncludedIndex < absIndex <= last   -> the live entry's term
