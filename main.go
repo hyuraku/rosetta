@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -81,7 +83,7 @@ func (hs *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := hs.kvStore.Put(req.Key, req.Value); err != nil {
+	if err := hs.kvStore.PutWithSession(req.Key, req.Value, req.ClientID, req.SeqNum); err != nil {
 		if strings.Contains(err.Error(), "not leader") {
 			leader := hs.raftNode.GetLeader()
 			w.Header().Set("X-Raft-Leader", leader)
@@ -135,7 +137,15 @@ func (hs *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := hs.kvStore.Delete(key); err != nil {
+	// Duplicate-detection fields are carried in the request body when present.
+	// A missing or empty body keeps backward-compatible behavior (no dedup).
+	var req kvstore.DeleteArgs
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := hs.kvStore.DeleteWithSession(key, req.ClientID, req.SeqNum); err != nil {
 		if strings.Contains(err.Error(), "not leader") {
 			leader := hs.raftNode.GetLeader()
 			w.Header().Set("X-Raft-Leader", leader)

@@ -397,7 +397,15 @@ func (kvs *KVStore) updateClientSession(clientID string, seqNum int, result Resu
 }
 
 func (kvs *KVStore) Put(key, value string) error {
-	return kvs.executeOperation(OpPut, key, value)
+	return kvs.executeOperation(OpPut, key, value, "", 0)
+}
+
+// PutWithSession stores a key-value pair on behalf of an identified client.
+// The clientID and seqNum enable at-most-once semantics (Raft paper Section 8):
+// a retry that reuses the same seqNum is deduplicated by the state machine. An
+// empty clientID disables duplicate detection (equivalent to Put).
+func (kvs *KVStore) PutWithSession(key, value, clientID string, seqNum int) error {
+	return kvs.executeOperation(OpPut, key, value, clientID, seqNum)
 }
 
 func (kvs *KVStore) Get(key string) (string, error) {
@@ -416,7 +424,7 @@ func (kvs *KVStore) Get(key string) (string, error) {
 	// This happens when:
 	// 1. This node is not the leader
 	// 2. The leader hasn't received heartbeat confirmations from a majority recently
-	result := kvs.executeOperationWithResult(OpGet, key, "")
+	result := kvs.executeOperationWithResult(OpGet, key, "", "", 0)
 	if result.Err != nil {
 		return "", result.Err
 	}
@@ -437,15 +445,21 @@ func (kvs *KVStore) getLocal(key string) (string, error) {
 }
 
 func (kvs *KVStore) Delete(key string) error {
-	return kvs.executeOperation(OpDelete, key, "")
+	return kvs.executeOperation(OpDelete, key, "", "", 0)
 }
 
-func (kvs *KVStore) executeOperation(op Operation, key, value string) error {
-	result := kvs.executeOperationWithResult(op, key, value)
+// DeleteWithSession deletes a key on behalf of an identified client. See
+// PutWithSession for the duplicate-detection semantics of clientID/seqNum.
+func (kvs *KVStore) DeleteWithSession(key, clientID string, seqNum int) error {
+	return kvs.executeOperation(OpDelete, key, "", clientID, seqNum)
+}
+
+func (kvs *KVStore) executeOperation(op Operation, key, value, clientID string, seqNum int) error {
+	result := kvs.executeOperationWithResult(op, key, value, clientID, seqNum)
 	return result.Err
 }
 
-func (kvs *KVStore) executeOperationWithResult(op Operation, key, value string) Result {
+func (kvs *KVStore) executeOperationWithResult(op Operation, key, value, clientID string, seqNum int) Result {
 	if kvs.raft == nil {
 		return Result{Value: "", Err: fmt.Errorf("raft node not initialized")}
 	}
@@ -456,10 +470,12 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value string) 
 
 	opID := fmt.Sprintf("%s-%d", kvs.raft.GetNodeID(), time.Now().UnixNano())
 	cmd := Command{
-		Op:    op,
-		Key:   key,
-		Value: value,
-		ID:    opID,
+		Op:       op,
+		Key:      key,
+		Value:    value,
+		ID:       opID,
+		ClientID: clientID,
+		SeqNum:   seqNum,
 	}
 
 	cmdBytes, err := json.Marshal(cmd)
