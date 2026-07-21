@@ -1,5 +1,7 @@
 # API Documentation
 
+> Last verified: 2026-07-21 against commit `9383cfe`.
+
 This document provides detailed information about the Rosetta HTTP API.
 
 ## Base URL
@@ -10,13 +12,18 @@ http://<node-address>:<http-port>
 
 Example: `http://localhost:9080`
 
+## Response Formats
+
+- **Success responses** are JSON (`Content-Type: application/json`).
+- **Error responses** are plain text (`Content-Type: text/plain; charset=utf-8`), produced by Go's `http.Error`. They are **not** JSON.
+
 ## Endpoints
 
 ### 1. Store Key-Value Pair
 
 Store or update a key-value pair in the distributed store.
 
-**Endpoint:** `PUT /kv`
+**Endpoint:** `PUT /kv` (POST is also accepted)
 
 **Request Body:**
 ```json
@@ -31,37 +38,23 @@ Store or update a key-value pair in the distributed store.
 - **Content:**
 ```json
 {
-  "status": "success",
-  "key": "string"
+  "success": true
 }
 ```
 
 **Error Responses:**
 
 - **Code:** 400 Bad Request
-  - Invalid JSON or missing required fields
-  ```json
-  {
-    "error": "invalid request body"
-  }
-  ```
+  - Invalid JSON in the request body. Missing fields are **not** validated; an empty body field is stored as an empty string.
+  - Body: plain-text JSON decode error message
 
 - **Code:** 503 Service Unavailable
   - Node is not the leader
-  ```json
-  {
-    "error": "not leader",
-    "leader": "node2:localhost:8081"
-  }
-  ```
+  - Body: `Not leader. Current leader: <leader-id>`
+  - Header: `X-Raft-Leader: <leader-id>` (empty if no leader is known)
 
 - **Code:** 500 Internal Server Error
-  - Consensus timeout or other internal error
-  ```json
-  {
-    "error": "consensus timeout"
-  }
-  ```
+  - Body: plain-text error, e.g. `operation timeout` (commit did not complete within 5s) or `leadership lost`
 
 **Example:**
 ```bash
@@ -81,32 +74,37 @@ Get the value associated with a specific key.
 **URL Parameters:**
 - `key` (string, required) - The key to retrieve
 
+Reads are served by the leader. If the leader's lease-based read optimization applies, the value is returned from local state without going through the Raft log; otherwise the read is submitted through Raft.
+
+> **Warning:** The lease-based read path has known linearizability violations (lease period misuse and missing no-op entry on election), so stale reads are possible. See ../KNOWN_ISSUES.md (D1, D3).
+
 **Success Response:**
 - **Code:** 200 OK
 - **Content:**
 ```json
 {
-  "key": "string",
+  "success": true,
   "value": "string"
 }
 ```
 
 **Error Responses:**
 
+- **Code:** 400 Bad Request
+  - No key in the URL path
+  - Body: `Key required`
+
 - **Code:** 404 Not Found
   - Key does not exist
-  ```json
-  {
-    "error": "key not found"
-  }
-  ```
+  - Body: `Key not found`
+
+- **Code:** 503 Service Unavailable
+  - Node is not the leader (reads on followers are not redirected locally; they fail with the leader hint)
+  - Body: `Not leader. Current leader: <leader-id>`
+  - Header: `X-Raft-Leader: <leader-id>`
 
 - **Code:** 500 Internal Server Error
-  ```json
-  {
-    "error": "internal server error"
-  }
-  ```
+  - Body: plain-text error, e.g. `operation timeout`
 
 **Example:**
 ```bash
@@ -129,36 +127,25 @@ Remove a key-value pair from the store.
 - **Content:**
 ```json
 {
-  "status": "deleted",
-  "key": "string"
+  "success": true
 }
 ```
 
+Deleting a key that does not exist also returns 200; there is no 404 for DELETE.
+
 **Error Responses:**
 
-- **Code:** 404 Not Found
-  - Key does not exist
-  ```json
-  {
-    "error": "key not found"
-  }
-  ```
+- **Code:** 400 Bad Request
+  - No key in the URL path
+  - Body: `Key required`
 
 - **Code:** 503 Service Unavailable
   - Node is not the leader
-  ```json
-  {
-    "error": "not leader",
-    "leader": "node2:localhost:8081"
-  }
-  ```
+  - Body: `Not leader. Current leader: <leader-id>`
+  - Header: `X-Raft-Leader: <leader-id>`
 
 - **Code:** 500 Internal Server Error
-  ```json
-  {
-    "error": "consensus timeout"
-  }
-  ```
+  - Body: plain-text error, e.g. `operation timeout`
 
 **Example:**
 ```bash
@@ -179,23 +166,19 @@ Get the current status of the Raft node.
 ```json
 {
   "node_id": "string",
-  "state": "string",
   "term": 0,
-  "log_length": 0,
-  "commit_index": 0,
   "is_leader": false,
-  "leader_id": "string"
+  "log_size": 0
 }
 ```
 
 **Field Descriptions:**
 - `node_id`: Unique identifier for this node
-- `state`: Current Raft state (Follower, Candidate, or Leader)
 - `term`: Current term number
-- `log_length`: Number of entries in the log
-- `commit_index`: Index of highest log entry known to be committed
 - `is_leader`: Whether this node is currently the leader
-- `leader_id`: ID of the current leader (if known)
+- `log_size`: Index of the last log entry (number of entries in the log)
+
+Fields such as `state`, `commit_index`, or `leader_id` are not exposed by this endpoint.
 
 **Example:**
 ```bash
@@ -206,12 +189,9 @@ curl http://localhost:9080/status
 ```json
 {
   "node_id": "node1",
-  "state": "Leader",
   "term": 5,
-  "log_length": 42,
-  "commit_index": 41,
   "is_leader": true,
-  "leader_id": "node1"
+  "log_size": 42
 }
 ```
 
@@ -219,7 +199,7 @@ curl http://localhost:9080/status
 
 ### 5. Leader Information
 
-Get information about the current cluster leader.
+Get the ID of the current cluster leader.
 
 **Endpoint:** `GET /leader`
 
@@ -228,21 +208,11 @@ Get information about the current cluster leader.
 - **Content:**
 ```json
 {
-  "leader_id": "string",
-  "leader_addr": "string",
-  "term": 0
+  "leader": "string"
 }
 ```
 
-**Error Responses:**
-
-- **Code:** 503 Service Unavailable
-  - No leader currently elected
-  ```json
-  {
-    "error": "no leader elected"
-  }
-  ```
+`leader` is the node ID of the current leader (e.g. `"node2"`), not an address. If no leader is known, `leader` is an empty string — the endpoint still returns 200, never 503.
 
 **Example:**
 ```bash
@@ -252,9 +222,7 @@ curl http://localhost:9080/leader
 **Example Response:**
 ```json
 {
-  "leader_id": "node2",
-  "leader_addr": "localhost:8081",
-  "term": 5
+  "leader": "node2"
 }
 ```
 
@@ -266,23 +234,25 @@ curl http://localhost:9080/leader
 
 | Code | Description | When it occurs |
 |------|-------------|----------------|
-| 400 | Bad Request | Invalid JSON, missing fields, or malformed request |
-| 404 | Not Found | Key doesn't exist in the store |
-| 500 | Internal Server Error | Consensus timeout, internal failure |
-| 503 | Service Unavailable | Node is not leader, operation cannot proceed |
+| 400 | Bad Request | Invalid JSON body (PUT), or missing key in the URL path (GET/DELETE) |
+| 404 | Not Found | Key doesn't exist (GET only) |
+| 405 | Method Not Allowed | Unsupported HTTP method on `/kv` |
+| 500 | Internal Server Error | Operation timeout (5s), leadership lost, internal failure |
+| 503 | Service Unavailable | Node is not leader |
+
+All error bodies are plain text, not JSON.
 
 ### Leader Redirection
 
-When a write operation (PUT/DELETE) is sent to a non-leader node, the server responds with:
+When an operation is sent to a non-leader node, the server responds with status 503, the header `X-Raft-Leader: <leader-id>`, and a plain-text body:
 
-```json
-{
-  "error": "not leader",
-  "leader": "node_id:address"
-}
+```
+Not leader. Current leader: <leader-id>
 ```
 
-Clients should retry the request against the leader node.
+The leader is identified by its node ID only; clients must map node IDs to HTTP addresses themselves. Clients should retry the request against the leader node.
+
+> **Warning:** Retrying a write after a timeout or leader change can apply the same operation twice — the duplicate-detection mechanism exists in the store but is not wired into the HTTP API, and a spurious `leadership lost` error can be returned after a write was in fact committed. See ../KNOWN_ISSUES.md (D4, D5).
 
 ## Client Implementation Pattern
 
@@ -295,9 +265,7 @@ import (
     "bytes"
     "encoding/json"
     "fmt"
-    "io"
     "net/http"
-    "time"
 )
 
 type Client struct {
@@ -334,23 +302,19 @@ func (c *Client) Put(key, value string) error {
 }
 ```
 
+Note: `POST /kv` works because the server accepts both PUT and POST for writes. Be aware of the double-apply caveat above when adding retries.
+
 ## Rate Limiting
 
-Currently, there is no built-in rate limiting. Consider implementing application-level rate limiting or using a reverse proxy with rate limiting capabilities for production deployments.
+There is no built-in rate limiting.
 
 ## Security Considerations
 
-### Current Implementation
 - No authentication or authorization
 - No TLS/SSL support
-- Designed for trusted internal networks
 
-### Production Recommendations
-1. Deploy behind a reverse proxy (nginx, HAProxy) with TLS
-2. Implement authentication at the proxy level
-3. Use network segmentation and firewalls
-4. Consider adding API key authentication for multi-tenant scenarios
+This is a learning-purpose implementation and is not intended for production use. Do not expose the API to untrusted networks.
 
 ## Versioning
 
-The API is currently unversioned. Future versions may include versioning in the URL path (e.g., `/v1/kv`).
+The API is unversioned.
