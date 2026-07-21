@@ -16,8 +16,9 @@ import (
 //	LastIncludedIndex = boundary, LastIncludedTerm = 1
 //	live log = entries (boundary+1 .. total)
 //	CommitIndex = LastApplied = boundary
-func compactedFollower(t *testing.T, total, boundary int) (state *raft.RaftState, ch chan raft.ApplyMsg) {
+func compactedFollower(t *testing.T) (state *raft.RaftState, ch chan raft.ApplyMsg) {
 	t.Helper()
+	const total, boundary = 10, 5
 	applyCh := make(chan raft.ApplyMsg, total+16)
 	peers := []string{"follower", "leader"}
 	follower := raft.NewRaftState("follower", peers, applyCh)
@@ -82,7 +83,7 @@ func TestAppendLogEntryAfterCompaction(t *testing.T) {
 // slice position and reports absolute CommandIndex without panicking
 // (items #3, #4).
 func TestApplyEntriesAfterCompaction(t *testing.T) {
-	follower, applyCh := compactedFollower(t, 10, 5)
+	follower, applyCh := compactedFollower(t)
 
 	// Advance commit to 8; entries 6,7,8 must be applied with absolute indices.
 	follower.UpdateCommitIndex(8)
@@ -105,7 +106,7 @@ func TestApplyEntriesAfterCompaction(t *testing.T) {
 // TestAppendEntriesPrevLogIndexAtBoundary covers PrevLogIndex == LastIncludedIndex
 // (item #2): the term is compared against LastIncludedTerm.
 func TestAppendEntriesPrevLogIndexAtBoundary(t *testing.T) {
-	follower, _ := compactedFollower(t, 10, 5)
+	follower, _ := compactedFollower(t)
 
 	reply := &raft.AppendEntriesReply{}
 	follower.AppendEntries(&raft.AppendEntriesArgs{
@@ -129,7 +130,7 @@ func TestAppendEntriesPrevLogIndexAtBoundary(t *testing.T) {
 // TestAppendEntriesPrevLogIndexAboveBoundary covers PrevLogIndex > LastIncludedIndex
 // for both the matching and conflicting cases (item #2).
 func TestAppendEntriesPrevLogIndexAboveBoundary(t *testing.T) {
-	follower, _ := compactedFollower(t, 10, 5)
+	follower, _ := compactedFollower(t)
 
 	// Matching term at index 8 -> success.
 	okReply := &raft.AppendEntriesReply{}
@@ -171,7 +172,7 @@ func TestAppendEntriesPrevLogIndexAboveBoundary(t *testing.T) {
 // (item #2): entries subsumed by the snapshot are ignored; the suffix past the
 // boundary is merged and the call succeeds.
 func TestAppendEntriesPrevLogIndexBelowBoundary(t *testing.T) {
-	follower, _ := compactedFollower(t, 10, 5)
+	follower, _ := compactedFollower(t)
 
 	entries := make([]raft.LogEntry, 0)
 	for i := 4; i <= 11; i++ { // spans compacted prefix and one new entry
@@ -202,7 +203,7 @@ func TestAppendEntriesPrevLogIndexBelowBoundary(t *testing.T) {
 // (item #1).
 func TestRequestVoteUsesAbsoluteIndex(t *testing.T) {
 	// Candidate that is behind (LastLogIndex 8 < our absolute 10) must be denied.
-	behind, _ := compactedFollower(t, 10, 5)
+	behind, _ := compactedFollower(t)
 	reply := &raft.RequestVoteReply{}
 	behind.RequestVote(&raft.RequestVoteArgs{
 		Term:         2,
@@ -215,7 +216,7 @@ func TestRequestVoteUsesAbsoluteIndex(t *testing.T) {
 	}
 
 	// Candidate that is up to date (LastLogIndex 10) must be granted.
-	upToDate, _ := compactedFollower(t, 10, 5)
+	upToDate, _ := compactedFollower(t)
 	reply2 := &raft.RequestVoteReply{}
 	upToDate.RequestVote(&raft.RequestVoteArgs{
 		Term:         2,
