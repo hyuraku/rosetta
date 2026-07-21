@@ -27,6 +27,16 @@ cd ../simple-cluster
 cd ../benchmark
 ```
 
+Before benchmarking, verify all nodes are up and a leader is elected:
+
+```bash
+for port in 9080 9081 9082; do
+  curl -s http://localhost:$port/status | jq '{node_id, term, is_leader, log_size}'
+done
+
+curl -s http://localhost:9080/leader | jq
+```
+
 ### 2. Run Basic Benchmark
 
 ```bash
@@ -284,6 +294,22 @@ wrk -t4 -c100 -d30s http://localhost:9080/kv/test
 3. Value size
 4. Concurrency level
 
+**Why cluster size matters:**
+
+Every write must be acknowledged by a majority (quorum) before it commits:
+
+```
+3 nodes: leader + 1 follower ack (tolerates 1 failure)
+5 nodes: leader + 2 follower acks (tolerates 2 failures)
+7 nodes: leader + 3 follower acks (tolerates 3 failures)
+```
+
+Write latency is roughly one round trip to the slowest follower in the
+quorum, so adding nodes improves fault tolerance but never speeds up writes.
+Reads are cheaper: when the leader has recently confirmed its leadership via
+heartbeats, GET requests are served directly from its local state without
+going through Raft consensus.
+
 ### Error Rate
 
 - **0% errors**: Healthy cluster
@@ -291,7 +317,9 @@ wrk -t4 -c100 -d30s http://localhost:9080/kv/test
 - **High errors (>5%)**: Investigate cluster health
 
 **Common Errors:**
-- `503 Not Leader`: Redirect to leader or wait for election
+- `503 Not Leader`: Redirect to leader or wait for election. The response
+  includes an `X-Raft-Leader` header, and `GET /leader` returns
+  `{"leader":"<node-id>"}`.
 - `Timeout`: Increase timeout or reduce load
 - `Connection Refused`: Node is down
 
@@ -308,7 +336,8 @@ wrk -t4 -c100 -d30s http://localhost:9080/kv/test
 **If Read Latency is High:**
 1. Enable client-side caching
 2. Use connection pooling
-3. Read from followers (if stale reads acceptable)
+3. Make sure reads go to the leader (followers return `503 Not Leader`;
+   follower reads are not supported yet)
 4. Check node CPU usage
 
 **If Throughput is Low:**
@@ -419,7 +448,7 @@ BENCH_PID=$!
 sleep 5
 
 # Kill leader
-LEADER=$(curl -s http://localhost:9080/leader | jq -r '.leader_id')
+LEADER=$(curl -s http://localhost:9080/leader | jq -r '.leader')
 pkill -f "rosetta.*-id=$LEADER"
 
 # Wait for completion
@@ -428,6 +457,11 @@ wait $BENCH_PID
 # Analyze results (look for error spike during failover)
 cat results.txt
 ```
+
+**Expected behavior:** writes fail for roughly one election timeout
+(150-300ms, randomized per node) until a new leader is elected. Election
+and heartbeat timeouts are currently hardcoded in `raft/state.go`, so they
+cannot be tuned via flags or the config file.
 
 ### Testing Network Partition
 
@@ -446,9 +480,9 @@ sudo iptables -D OUTPUT -d <node2-ip> -j DROP
 
 ## Resources
 
-- [Performance Tuning Guide](../../docs/performance.md)
-- [Troubleshooting](../../docs/troubleshooting.md)
-- [Deployment Guide](../../docs/deployment.md)
+- [API Reference](../../docs/api.md)
+- [Persistence Details](../../docs/persistence.md)
+- [Simple Cluster Example](../simple-cluster/)
 
 ## Sample Benchmark Tool
 

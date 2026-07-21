@@ -245,8 +245,8 @@ lsof -i :8080
 ## Next Steps
 
 - Explore [API Documentation](../../docs/api.md)
-- Learn about [Deployment](../../docs/deployment.md)
-- Read [Performance Tuning](../../docs/performance.md)
+- Check the [Known Issues](../../KNOWN_ISSUES.md) before relying on any behavior
+- Read about [Persistence](../../docs/persistence.md)
 - Try the [Benchmark Example](../benchmark/)
 
 ## Architecture Diagram
