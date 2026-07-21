@@ -2,8 +2,12 @@
 
 This document tracks planned features and enhancements for the Rosetta distributed key-value store.
 
+> **Note:** Bugs and safety violations are NOT tracked here — the authoritative,
+> up-to-date list is [KNOWN_ISSUES.md](KNOWN_ISSUES.md). Fixing the confirmed
+> safety issues there takes priority over every feature on this page.
+
 ## Status Legend
-- 🔴 **High Priority** - Critical for production readiness
+- 🔴 **High Priority** - Critical for correctness or usefulness
 - 🟡 **Medium Priority** - Important for usability and functionality
 - 🟢 **Low Priority** - Nice to have, enhances user experience
 - ✅ **Completed** - Already implemented
@@ -23,28 +27,32 @@ This document tracks planned features and enhancements for the Rosetta distribut
 
 ## High Priority Features 🔴
 
-### 1. Log Compaction / Snapshotting
+### 1. Log Compaction / Snapshotting — Rework
 **Priority:** 🔴 High
 **Estimated Effort:** Large (2-3 weeks)
-**Status:** Not Started
+**Status:** Implemented but broken — needs rework (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md), group A)
 
 **Description:**
-Implement log compaction to prevent unbounded log growth. After a certain number of entries, create a snapshot of the state machine and discard old log entries.
+An initial implementation exists (`raft/snapshot.go`, InstallSnapshot RPC, KVStore
+auto-snapshot), but the safety review confirmed the absolute/relative index
+conversion is only handled on the leader's send path. The receive, vote, commit,
+and apply paths are unaware of `LastIncludedIndex`, and the snapshotter is not
+wired into the Raft node in production. Compaction must stay disabled
+(`MaxRaftState=0`) until this is reworked.
 
 **Requirements:**
-- Automatic snapshot creation when log exceeds threshold
-- Snapshot transfer to followers
-- Truncation of old log entries after snapshot
-- InstallSnapshot RPC implementation
-- Configuration for snapshot interval and retention
+- Unify absolute/relative index handling across ALL paths (receive, vote, commit, apply)
+- Wire `raft.Snapshotter` in production (`main.go`) with a compatible snapshot format
+- Persist follower-side snapshots received via InstallSnapshot
+- Term check for retained log suffix on InstallSnapshot (paper §7)
+- Restore `LastApplied`/`CommitIndex` from snapshot on restart
 
 **Implementation Steps:**
-1. Add snapshot creation logic in KVStore
-2. Implement InstallSnapshot RPC
-3. Add log truncation after snapshot
-4. Update recovery to load from snapshot + remaining log
-5. Add configuration for compaction thresholds
-6. Write tests for snapshot creation and recovery
+1. Fix index handling in AppendEntries receive path and vote paths
+2. Fix commit/apply paths and volatile-state restoration
+3. Wire the snapshotter and fix the snapshot format mismatch
+4. Persist follower-side snapshots
+5. Add the integration tests proposed in `docs/safety-review-2026-07-07.md`
 
 **Related Files:**
 - `raft/snapshot.go` (new)
@@ -255,7 +263,7 @@ Basic backup functionality exists via `FileStorage.CopyTo()` method.
 ### 6. Read Optimization
 **Priority:** 🟡 Medium
 **Estimated Effort:** Medium (1-2 weeks)
-**Status:** Not Started
+**Status:** Partially Implemented — lease-based local reads exist but have confirmed linearizability gaps (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md), group D). ReadIndex is the recommended replacement.
 
 **Description:**
 Optimize read operations to reduce latency and increase throughput.
@@ -459,7 +467,7 @@ Create official client libraries for easy integration.
 
 **Related Files:**
 - `tests/performance/` (enhance)
-- `docs/performance.md` (update)
+- `examples/benchmark/` (benchmarking procedures)
 
 ---
 
@@ -520,13 +528,14 @@ Create official client libraries for easy integration.
 
 ## Project Milestones
 
-### v1.0 (Production Ready)
+### v1.0 (Correct Core)
 - [x] Basic Raft implementation
 - [x] Key-value operations
 - [x] Persistence
-- [ ] Log compaction
+- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed
+- [ ] Log compaction reworked and wired
 - [ ] Monitoring
-- [ ] Documentation complete
+- [x] Documentation verified against code (2026-07 overhaul)
 - [ ] Test coverage 80%+
 
 ### v1.1 (Enhanced Operations)
@@ -570,5 +579,5 @@ If you'd like to contribute to any of these features:
 
 ---
 
-Last Updated: 2025-11-11
+Last Updated: 2026-07-21
 Maintained by: Rosetta Development Team

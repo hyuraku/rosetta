@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a distributed key-value store implementation using the Raft consensus algorithm, written in Go. The system provides strong consistency guarantees across multiple nodes through leader election, log replication, and safety properties defined by the Raft protocol.
+This is a distributed key-value store implementation using the Raft consensus algorithm, written in Go, built as a learning project.
 
-**Current Status**: Beta - Core Raft features implemented with persistence, duplicate detection, and read optimizations. Approaching v1.0 production readiness.
+**Current Status**: Educational implementation — not production-ready. The core happy path (leader election, log replication, HTTP KV API, crash recovery) works, but a safety review (`docs/safety-review-2026-07-07.md`) confirmed real violations of Raft's safety properties, most notably in log compaction. `KNOWN_ISSUES.md` at the repository root is the live, authoritative status of these issues. Never describe this project as production-ready in code or docs.
 
 **Go Version**: 1.23.4 (specified in `.go-version`)
 
@@ -40,12 +40,13 @@ The codebase is organized into several key packages that work together:
   - `simple-cluster/`: Scripts for running a 3-node cluster locally
   - `benchmark/`: Performance benchmarking tool
 
-- **docs/**: Comprehensive documentation
+- **docs/**: Documentation (see `docs/README.md` for the index)
   - `api.md`: HTTP API reference
   - `persistence.md`: Persistence implementation details
-  - `performance.md`: Performance tuning guide
-  - `deployment.md`: Production deployment guide
-  - `troubleshooting.md`: Common issues and solutions
+  - `log-compaction.md`: Log compaction design and current state
+  - `raft-paper-implementation-status.md`: Raft paper compliance status
+  - `safety-review-2026-07-07.md`: Frozen safety review report (details behind `KNOWN_ISSUES.md`)
+  - `textbook.md`: In-depth walkthrough of the codebase
 
 ### Key Architectural Patterns
 
@@ -132,17 +133,12 @@ go test ./tests/unit -run TestRaftStateInitialization -v
 
 ### Performance Commands
 ```bash
-# Performance testing and optimization
-go test -bench=. -benchmem ./...
-
-# CPU profiling
-go test -cpuprofile=cpu.prof -bench=.
-
-# Memory profiling
-go test -memprofile=mem.prof -bench=.
-
 # Race condition detection
 go test -race ./...
+
+# HTTP-level benchmarking (no Go Benchmark* functions exist in this repo;
+# `make bench` / `go test -bench` find nothing — use the benchmark tool instead)
+cd examples/benchmark && go build benchmark.go && ./benchmark -nodes=http://localhost:9080
 ```
 
 ### API Usage
@@ -178,8 +174,8 @@ curl -X DELETE http://localhost:9080/kv/test
 **Mock Transport**: For testing, use `raft.NewMockTransport()` which provides in-memory RPC communication without network overhead.
 
 **Persistence Implementation**:
-- Raft state is persisted to `<data-dir>/raft_state.json` using atomic writes (write to temp file, then rename)
-- KV store snapshots are saved to `<data-dir>/kv_snapshot.json`
+- Raft state is persisted to `<data-dir>/<node-id>/raft_state.json` using atomic writes (write to temp file, then rename)
+- KV store snapshots are saved to `<data-dir>/<node-id>/snapshot.json`
 - On startup, nodes check for persisted state and restore from disk if available
 - The `FileStorage` interface abstracts persistence for testability
 - See `docs/persistence.md` for detailed implementation information
@@ -191,11 +187,9 @@ curl -X DELETE http://localhost:9080/kv/test
 - This optimization is critical for high-frequency snapshot scenarios
 
 **Read Optimization**:
-- Read-only queries (GET operations) can be served directly from the local KV store
-- This bypasses the Raft consensus layer, significantly reducing latency
-- The optimization is safe because GET operations don't modify state
-- For strict linearizability, reads can still go through Raft if needed
-- See PR #5 for the implementation details
+- GET operations on the leader can be served from the local KV store under a leadership lease, bypassing Raft consensus
+- ⚠️ The current lease implementation has confirmed linearizability gaps (stale reads are possible around leadership changes) — see `KNOWN_ISSUES.md` (D1–D3). Do not describe reads as linearizable in docs or code comments
+- When the lease is not valid, reads fall back to going through Raft consensus
 
 ## Code Quality
 
@@ -236,33 +230,35 @@ go build benchmark.go
 
 ## Project Status and Roadmap
 
-### Completed Features ✅
-- [x] Core Raft consensus (leader election, log replication)
-- [x] Distributed key-value store (PUT/GET/DELETE)
-- [x] Persistence and crash recovery
-- [x] Duplicate detection for snapshots
-- [x] Read-only query optimization
-- [x] HTTP API
-- [x] Comprehensive testing suite
-- [x] Development tooling (Makefile, linter, formatter)
+### Working (verified happy path)
+- Core Raft consensus (leader election, log replication) in a stable single-leader cluster
+- Distributed key-value store (PUT/GET/DELETE) over HTTP
+- Persistence and crash recovery with persist-before-reply discipline
+- Duplicate detection for snapshot writes (disk I/O optimization)
+- Development tooling (Makefile, linter, formatter), unit + integration tests
 
-### In Progress 🚧
-- [ ] Log compaction and snapshotting
-- [ ] Monitoring and observability (metrics, health checks)
+### Implemented but broken or unwired ⚠️
+See `KNOWN_ISSUES.md` for the authoritative, up-to-date list. Highlights:
+- Log compaction / InstallSnapshot: index handling is inconsistent across receive/vote/commit/apply paths, and the snapshotter is not wired into the Raft node in production (group A)
+- Lease-based reads: confirmed linearizability gaps (group D)
+- Client-session duplicate detection: implemented but not wired to the real API path (D4)
 
-### Planned for v1.0 📋
-- [ ] Complete log compaction implementation
-- [ ] Add Prometheus metrics endpoint
-- [ ] Enhanced monitoring and logging
-- [ ] Production deployment documentation
-- [ ] Performance tuning guide
+See `TODO.md` for the feature roadmap.
 
-See `TODO.md` for the complete feature roadmap and implementation details.
+## Documentation Discipline
+
+The docs in this repository previously drifted badly out of sync with the code (three contradictory "generations" coexisted until the 2026-07 overhaul). To prevent a recurrence:
+
+- **Same-PR rule**: Any PR that changes behavior in `raft/`, `kvstore/`, `network/`, `persistence/`, or `main.go` MUST update the affected docs and `KNOWN_ISSUES.md` in the same PR (including marking fixed issues as fixed with the commit hash)
+- **Verification headers**: Each file under `docs/` carries a "Last verified: <date> against commit <hash>" line below its title. When you verify or update a doc against the code, update this line
+- **No aspirational docs**: Document what the code does now. Planned or partially wired features must be labeled as such, with a `KNOWN_ISSUES.md` reference where one exists
+- `docs/safety-review-2026-07-07.md` is a frozen point-in-time report — never edit it; record status changes in `KNOWN_ISSUES.md` instead
 
 ## Additional Resources
 
+- **Known Issues**: See `KNOWN_ISSUES.md` for the live status of confirmed safety issues
 - **API Documentation**: See `docs/api.md` for HTTP API reference
-- **Deployment Guide**: See `docs/deployment.md` for production deployment
-- **Performance Tuning**: See `docs/performance.md` for optimization tips
-- **Troubleshooting**: See `docs/troubleshooting.md` for common issues
+- **Persistence**: See `docs/persistence.md` for persistence and crash recovery details
+- **Log Compaction**: See `docs/log-compaction.md` for the design and its current state
 - **Raft Implementation Status**: See `docs/raft-paper-implementation-status.md` for Raft paper compliance
+- **Codebase Walkthrough**: See `docs/textbook.md` for an in-depth guided tour
