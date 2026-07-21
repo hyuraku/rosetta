@@ -162,16 +162,9 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		return
 	}
 
-	if len(args.Entries) > 0 {
-		if args.PrevLogIndex < len(rs.persistent.Log) {
-			rs.persistent.Log = rs.persistent.Log[:args.PrevLogIndex]
-		}
-		rs.persistent.Log = append(rs.persistent.Log, args.Entries...)
-
-		for i := range rs.persistent.Log[args.PrevLogIndex:] {
-			rs.persistent.Log[args.PrevLogIndex+i].Index = args.PrevLogIndex + i + 1
-		}
-
+	// Only persist/acknowledge if the merge actually changed the log; a delayed
+	// or duplicated request whose entries already match is a no-op.
+	if len(args.Entries) > 0 && rs.mergeLogEntries(args) {
 		// The appended entries must be durable before we acknowledge them: a
 		// leader that sees Success advances its commit index, so reporting
 		// success for entries we could lose on a crash would break the log
@@ -189,6 +182,31 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 
 	reply.Success = true
 	reply.Term = rs.persistent.CurrentTerm
+}
+
+// mergeLogEntries merges the leader's entries into the follower's log following
+// Raft §5.3 (receiver rules 3 & 4): an existing entry is deleted only when it
+// conflicts with a new one (same index, different term); matching entries are
+// left in place. This prevents a delayed or reordered AppendEntries from
+// truncating a suffix the leader has already committed. It returns true only
+// when the log was actually modified. Callers must hold rs.mu.
+func (rs *RaftState) mergeLogEntries(args *AppendEntriesArgs) bool {
+	for i, entry := range args.Entries {
+		index := args.PrevLogIndex + i + 1 // 1-based log index of this entry
+		if index <= len(rs.persistent.Log) && rs.persistent.Log[index-1].Term == entry.Term {
+			continue // already present, no conflict
+		}
+		if index <= len(rs.persistent.Log) {
+			// Conflicting term at this index: drop it and everything after.
+			rs.persistent.Log = rs.persistent.Log[:index-1]
+		}
+		rs.persistent.Log = append(rs.persistent.Log, args.Entries[i:]...)
+		for j := index - 1; j < len(rs.persistent.Log); j++ {
+			rs.persistent.Log[j].Index = j + 1
+		}
+		return true
+	}
+	return false
 }
 
 func (rs *RaftState) startElection(transport RPCTransport) {

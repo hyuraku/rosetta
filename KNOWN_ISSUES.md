@@ -16,9 +16,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 5（B1, C1, C2, C4, D5） |
+| ✅ FIXED | 6（B1, B2, C1, C2, C4, D5） |
 | 🟠 PARTIAL | 1（C3） |
-| ❌ UNFIXED | 16 |
+| ❌ UNFIXED | 15 |
 
 **実用上の含意**: ログ圧縮（グループ A）は通常運転で安全性が破れるため、
 `MaxRaftState=0`（圧縮無効）以外で運用してはならない。リース読みは
@@ -43,7 +43,7 @@
 | ID | 概要 | 状態 | 根拠（現コード）/ 修正 commit |
 |---|---|---|---|
 | B1 | applyCh 満杯時にコミット済みコマンドを黙って破棄 | ✅ FIXED | `9a90cf5`（ブロッキング送信化。ただしトレードオフあり — 下記「注記 1」） |
-| B2 | AppendEntries の無条件切り詰めでコミット済み suffix が消える（論文 §5.3 step 3 違反） | ❌ UNFIXED | `raft/rpc.go:165-173, 185-186` |
+| B2 | AppendEntries の無条件切り詰めでコミット済み suffix が消える（論文 §5.3 step 3 違反） | ✅ FIXED | `7151e77`（論文 §5.3 step 3 準拠の conflict ベース切り詰め） |
 | B3 | InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信（PLAUSIBLE） | ❌ UNFIXED | `raft/rpc.go:590-591, 653-662` |
 
 ## グループ C: 永続化規律
