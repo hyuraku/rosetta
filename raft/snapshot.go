@@ -195,18 +195,12 @@ func (rs *RaftState) ShouldTakeSnapshot(maxLogSize int) bool {
 func (rs *RaftState) GetLastLogIndexWithSnapshot() int {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	if len(rs.persistent.Log) == 0 {
-		return rs.persistent.LastIncludedIndex
-	}
-	return rs.persistent.LastIncludedIndex + len(rs.persistent.Log)
+	return rs.lastAbsLogIndex()
 }
 
 // GetLastLogTermWithSnapshot returns the last log term including snapshot
 func (rs *RaftState) GetLastLogTermWithSnapshot() int {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	if len(rs.persistent.Log) == 0 {
-		return rs.persistent.LastIncludedTerm
-	}
-	return rs.persistent.Log[len(rs.persistent.Log)-1].Term
+	return rs.lastAbsLogTerm()
 }

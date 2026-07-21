@@ -16,9 +16,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 7（B1, B2, C1, C2, C4, D4, D5） |
+| ✅ FIXED | 12（A1, A2, A3, A4, A5, B1, B2, C1, C2, C4, D4, D5） |
 | 🟠 PARTIAL | 1（C3） |
-| ❌ UNFIXED | 14 |
+| ❌ UNFIXED | 9 |
 
 **実用上の含意**: ログ圧縮（グループ A）は通常運転で安全性が破れるため、
 `MaxRaftState=0`（圧縮無効）以外で運用してはならない。リース読みは
@@ -29,11 +29,11 @@
 
 | ID | 概要 | 状態 | 根拠（現コード） |
 |---|---|---|---|
-| A1 | AppendEntries 受信側が LastIncludedIndex オフセット未対応 → 圧縮済みフォロワーのログ恒久破壊 | ❌ UNFIXED | `raft/rpc.go:146-172` |
-| A2 | 投票経路が snapshot を無視し「空ログ」を名乗る → Leader Completeness 違反 | ❌ UNFIXED | `raft/rpc.go:81-88, 214-218` |
-| A3 | 圧縮済みノード当選時に NextIndex が相対/絶対混同 → クラスタ書き込み不能 | ❌ UNFIXED | `raft/state.go:274`, `raft/rpc.go:367-376, 482-484` |
-| A4 | updateCommitIndex が相対長と絶対 CommitIndex を比較 → リーダー圧縮後コミット恒久停止 | ❌ UNFIXED | `raft/rpc.go:529-531` |
-| A5 | 再起動時に LastApplied がスナップショットから復元されない → 二重適用・範囲外 panic | ❌ UNFIXED | `raft/state.go:143, 169-181`, `raft/log.go:207-209` |
+| A1 | AppendEntries 受信側が LastIncludedIndex オフセット未対応 → 圧縮済みフォロワーのログ恒久破壊 | ✅ FIXED | `8ad5367`（絶対index一貫性チェック＋境界を越えない衝突探索） |
+| A2 | 投票経路が snapshot を無視し「空ログ」を名乗る → Leader Completeness 違反 | ✅ FIXED | `8ad5367`（RequestVote/startElection を絶対 index で評価、§5.4.1） |
+| A3 | 圧縮済みノード当選時に NextIndex が相対/絶対混同 → クラスタ書き込み不能 | ✅ FIXED | `8ad5367`（initializeLeaderState が NextIndex を絶対 index で seed） |
+| A4 | updateCommitIndex が相対長と絶対 CommitIndex を比較 → リーダー圧縮後コミット恒久停止 | ✅ FIXED | `8ad5367`（絶対 last index でコミットを前進） |
+| A5 | 再起動時に LastApplied がスナップショットから復元されない → 二重適用・範囲外 panic | ✅ FIXED | `8ad5367`（loadPersistentState で CommitIndex/LastApplied を復元＋範囲外ガード） |
 | A6 | production で Snapshotter 未配線（3 層のギャップ）→ InstallSnapshot が発火しない/必ず失敗 | ❌ UNFIXED | `main.go:240-258`, `persistence/kv_snapshotter.go:36-83`, `kvstore/store.go:305-309` |
 | A7 | InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持 → Log Matching 違反 | ❌ UNFIXED | `raft/rpc.go:623-630` |
 | A8 | フォロワー側スナップショットが永続化されない → クラッシュで恒久復元不能 | ❌ UNFIXED | `kvstore/store.go:303-319` |
