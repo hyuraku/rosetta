@@ -1,0 +1,84 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Build artifacts
+rosetta
+/rosetta
+examples/benchmark/benchmark
+examples/simple-cluster/rosetta
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+examples/simple-cluster/logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Test coverage
+coverage.out
+coverage.html
+*.prof
+
+# Benchmark results
+benchmark-results.txt
+results.txt
+
+# Debug files
+debug
+__debug_bin
+
+# OS specific
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Environment variables
+.env
+.env.local
+
+# Documentation build artifacts
+docs/_build/
+docs/.doctrees/
+
+# Project specific
+*.db
+*.sqlite
+*.sqlite3
+data/
+snapshots/
+
+# Serena AI assistant
+.serena/
+
+# Generated documentation
+docs/textbook.html
+
+# Claude Code local config
+.claude/
