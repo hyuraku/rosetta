@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
 type RequestVoteArgs struct {
@@ -263,15 +261,12 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 
 	rs.ResetElectionTimer()
 
-	// If this is a single-node cluster, immediately become leader
+	// If this is a single-node cluster, immediately become leader. becomeLeader
+	// appends the current-term no-op and stops the election timer.
 	if len(rs.peers) == 1 {
 		rs.mu.Lock()
-		rs.state = Leader
-		rs.currentLeader = rs.nodeID // Set self as leader
-		rs.initializeLeaderState()
+		rs.becomeLeader()
 		rs.mu.Unlock()
-		// Stop election timer for leader
-		rs.electionTimer.Stop()
 		return
 	}
 
@@ -336,11 +331,9 @@ func (rs *RaftState) requestVoteFromPeer(
 		voteMu.Unlock()
 
 		if currentVotes >= votesNeeded && rs.state == Candidate {
-			rs.state = Leader
-			rs.currentLeader = rs.nodeID // Set self as leader
-			rs.initializeLeaderState()
-			// Stop election timer for leader
-			rs.electionTimer.Stop()
+			// becomeLeader appends the current-term no-op, initializes leader
+			// state, and stops the election timer. We already hold rs.mu.
+			rs.becomeLeader()
 		}
 	}
 }
@@ -354,31 +347,23 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	currentTerm := rs.persistent.CurrentTerm
 	commitIndex := rs.volatile.CommitIndex
 	isSingleNode := len(rs.peers) == 1
-	totalPeers := len(rs.peers)
 	rs.mu.RUnlock()
 
-	// For single-node cluster, immediately commit any uncommitted entries
-	// and confirm leadership (for read-only optimization)
+	// For a single-node cluster the leader is its own majority, so it can commit
+	// outstanding entries directly.
 	if isSingleNode {
 		rs.mu.Lock()
 		rs.updateCommitIndex()
-		rs.lastLeaderConfirmation = time.Now()
 		rs.mu.Unlock()
 		return
 	}
-
-	// Track successful heartbeat responses for read-only optimization
-	// Count starts at 1 because leader counts itself
-	var successCount int32 = 1
-	majority := totalPeers/quorumDivisor + 1
-	var leaderConfirmed int32 = 0
 
 	for _, peer := range rs.peers {
 		if peer == rs.nodeID {
 			continue
 		}
 
-		go rs.replicateToPeer(transport, peer, currentTerm, commitIndex, majority, &successCount, &leaderConfirmed)
+		go rs.replicateToPeer(transport, peer, currentTerm, commitIndex)
 	}
 }
 
@@ -389,8 +374,7 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 func (rs *RaftState) replicateToPeer(
 	transport RPCTransport,
 	peerID string,
-	currentTerm, commitIndex, majority int,
-	successCount, leaderConfirmed *int32,
+	currentTerm, commitIndex int,
 ) {
 	rs.mu.RLock()
 	nextIndex := rs.leader.NextIndex[peerID]
@@ -464,13 +448,6 @@ func (rs *RaftState) replicateToPeer(
 		rs.leader.MatchIndex[peerID] = prevLogIndex + len(entries)
 		rs.leader.NextIndex[peerID] = rs.leader.MatchIndex[peerID] + 1
 		rs.updateCommitIndex()
-
-		// Track successful response for read-only optimization
-		newCount := atomic.AddInt32(successCount, 1)
-		if int(newCount) >= majority && atomic.CompareAndSwapInt32(leaderConfirmed, 0, 1) {
-			// Majority confirmed - update leader confirmation time
-			rs.lastLeaderConfirmation = time.Now()
-		}
 	} else {
 		rs.handleReplicationConflict(peerID, reply)
 	}

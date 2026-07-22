@@ -1,6 +1,6 @@
 # API Documentation
 
-> Last verified: 2026-07-21 against commit `9383cfe`.
+> Last verified: 2026-07-22 against commit `d1838d5` (+ ReadIndex reads on this branch).
 
 This document provides detailed information about the Rosetta HTTP API.
 
@@ -74,9 +74,9 @@ Get the value associated with a specific key.
 **URL Parameters:**
 - `key` (string, required) - The key to retrieve
 
-Reads are served by the leader. If the leader's lease-based read optimization applies, the value is returned from local state without going through the Raft log; otherwise the read is submitted through Raft.
+Reads are served by the leader through the ReadIndex protocol (Raft dissertation §6.4): the leader confirms it still holds leadership with a fresh heartbeat quorum, waits until its state machine has applied through the captured commit index, then returns the value from local state. A non-leader responds with the same 503 leader redirect used by writes.
 
-> **Warning:** The lease-based read path has known linearizability violations (lease period misuse and missing no-op entry on election), so stale reads are possible. See ../KNOWN_ISSUES.md (D1, D3).
+> **Note:** Reads are linearizable. The earlier lease-based read path (which had confirmed linearizability violations) has been replaced by ReadIndex, so a partitioned ex-leader fails the read instead of returning a stale value. Immediately after an election a read may briefly return an error until the leader's no-op entry commits. See ../KNOWN_ISSUES.md (D1–D3, fixed).
 
 **Success Response:**
 - **Code:** 200 OK

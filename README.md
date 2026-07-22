@@ -15,8 +15,8 @@ A distributed key-value store implementation using the Raft consensus algorithm,
 - **Raft Consensus**: Leader election with randomized timeouts, log replication with consistency checks, and heartbeats
 - **Distributed KV Store**: PUT/GET/DELETE over an HTTP API, with leader-only writes and follower redirects
 - **Persistence**: Crash recovery with atomic file writes; state is persisted before RPC replies
-- **Log Compaction / InstallSnapshot**: Implemented but currently broken and unwired in production paths — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (group A)
-- **Read Optimization**: Lease-based local reads on the leader, with known linearizability gaps (group D)
+- **Log Compaction / InstallSnapshot**: Absolute indexing (A1–A5), production snapshotter wiring (A6), and follower snapshot persistence (A8) are fixed; one Log Matching gap remains (A7) — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (group A)
+- **Read Optimization**: Linearizable reads via the ReadIndex protocol (leader no-op on election + heartbeat-quorum confirmation), replacing the earlier lease-based reads — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (D1–D3, fixed)
 - **Testing Suite**: Unit and integration tests using a deterministic in-memory mock transport
 
 ## Quick Start
