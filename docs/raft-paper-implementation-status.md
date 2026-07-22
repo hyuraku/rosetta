@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-07-21 / 対象 commit `9383cfe`
+> 最終検証: 読み取り専用クエリ / ReadIndex / グループ D の節のみ 2026-07-22・commit `d1838d5`（本ブランチの ReadIndex 化）に更新。他の節（グループ A / B / C / E）は 2026-07-21・commit `9383cfe` 当時の記述で、多くは #13–#17 で既に修正済み。**最新の問題ステータスは KNOWN_ISSUES.md が正典。**
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（および `docs/safety-review-2026-07-07.md`）に集約されています。
 
@@ -8,14 +8,14 @@
 
 | カテゴリ | 状態 | 備考 |
 |---------|------|------|
-| リーダー選挙 (Section 5.2) | ⚠️ 一部問題あり | 基本動作は実装済み。圧縮後の投票判定がスナップショットを無視 (A2)、当選時 no-op なし (D3) |
+| リーダー選挙 (Section 5.2) | ⚠️ 一部問題あり | 基本動作は実装済み。当選時に current-term no-op を追記するようになった（D3 解消）。圧縮後の投票判定がスナップショットを無視 (A2) |
 | ログ複製 (Section 5.3) | ⚠️ 一部問題あり | Fast rollback最適化含む。ただし step 3 の無条件切り詰め (B2)、圧縮後の受信経路未対応 (A1) |
 | 安全性保証 (Section 5.4) | ⚠️ 違反経路あり | 選挙制限は実装済みだが、B2/A2/A7 により Log Matching / Leader Completeness が破れうる |
 | 永続化 (Figure 2) | ✅ 概ね実装済み | RPC 応答前の persist 規律あり（commit `2a35ce9`）。リーダー自身の追記経路に残課題 |
 | ログコンパクション (Section 7) | ❌ 不完全 | 送信側のみインデックス変換対応。受信・投票・コミット・適用経路が未対応 (A1〜A8) |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応 |
 | クライアント相互作用 (Section 8) | ⚠️ 未配線 | 重複検知の実装はあるが実 API 経路から呼ばれない (D4) |
-| 読み取り専用クエリ最適化 | ⚠️ 安全でない | リースベースの読み取りは実装済みだが linearizability 違反経路あり (D1〜D3) |
+| 読み取り専用クエリ最適化 | ✅ 線形化実装 | ReadIndex プロトコル + 当選時 no-op で linearizable read を実装。旧リース方式は撤去（D1〜D3 解消） |
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照）
 
@@ -66,7 +66,7 @@ type RequestVoteArgs struct {
 
 状態遷移・ランダム化タイムアウト・過半数当選・投票と任期の応答前 persist（`raft/rpc.go:101-106`、`startElection` の `raft/rpc.go:200-212`）は実装済みです。ただし以下の未達があります:
 
-- **当選時の no-op エントリがない**: 当選処理（`raft/rpc.go:299-305`）はリーダー状態への遷移のみで、論文 Section 8 が要求する就任時 no-op コミットを行いません。前任 term のコミット済みエントリを advance できず、リース読みと組み合わさると ACK 済み書き込みを読み逃します。see ../KNOWN_ISSUES.md (D3)
+- **当選時の no-op エントリを追記**（✅ 解消）: 当選処理は `becomeLeader`（`raft/noop.go`）に集約され、リーダー遷移時に current-term の no-op エントリ（`NoOpCommand`、`appendNoOpLocked`）を追記します。`startElection` / `requestVoteFromPeer` の当選経路も旧来の手書き遷移から `becomeLeader` 呼び出しに置換されました。これにより論文 Section 8 の就任時 no-op コミットを満たし、(a) 前任 term のコミット済みエントリを Log Matching 経由で安全に advance でき、(b) §6.4 ReadIndex の前提（current term で 1 件コミット済み）を選挙直後に満たします。修正 commit `60fd631`。see ../KNOWN_ISSUES.md (D3)
 - **投票判定がスナップショットを無視**: `RequestVote`（`raft/rpc.go:81-84`）と `startElection`（`raft/rpc.go:214-218`）は `len(rs.persistent.Log)` を lastLogIndex として使い、`LastIncludedIndex/Term` を考慮しません。ログ圧縮後は「空ログ」を名乗って投票してしまい、Leader Completeness が破れます。see ../KNOWN_ISSUES.md (A2)
 - **ロック外の `ResetElectionTimer` 呼び出し**（`raft/rpc.go:210,225`）による data race。see ../KNOWN_ISSUES.md (E1)
 
@@ -155,7 +155,7 @@ if args.LastLogTerm > lastLogTerm ||
 - **選挙安全性**: 投票の応答前 persist（commit `2a35ce9`）により、クラッシュ跨ぎの二重投票は防止されます
 - **リーダー追記のみ**: リーダーの通常経路では満たされます
 - **ログ一致 (Log Matching)**: AppendEntries の無条件切り詰め（B2）と InstallSnapshot の term 検査なし suffix 保持（A7）により破れうる。see ../KNOWN_ISSUES.md (B2, A7)
-- **リーダー完全性 (Leader Completeness)**: 選挙制限がスナップショットメタデータを無視するため（A2）、圧縮後はコミット済みエントリを持たないノードが当選しえます。また no-op 欠落（D3）により前任 term のコミット済みエントリの advance が遅延します。see ../KNOWN_ISSUES.md (A2, D3)
+- **リーダー完全性 (Leader Completeness)**: 選挙制限がスナップショットメタデータを無視するため（A2）、圧縮後はコミット済みエントリを持たないノードが当選しえます。なお当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されるようになりました。see ../KNOWN_ISSUES.md (A2)
 - **状態機械安全性**: 上記が発火しない限り成立
 
 ---
@@ -342,60 +342,44 @@ type KVStore struct {
 
 ---
 
-### 8. 読み取り専用クエリ最適化 ⚠️ 実装済みだが安全でない
+### 8. 読み取り専用クエリ最適化 ✅ ReadIndex で線形化
 
 #### 論文の要件
 - リーダーは読み取りクエリをログ複製なしで処理可能
 - ただし、リーダーシップ確認が必要:
-  - ハートビート確認: クエリ前に過半数からの応答を確認
-  - リース方式: ハートビート成功から一定時間内は安全
+  - **ReadIndex 方式**（採用）: 現在の commit index を readIndex として捕捉し、ハートビート 1 巡で過半数から current-term ACK を集めて「自分がまだ唯一のリーダー」であることを証明してから、readIndex まで適用済みの状態を読む（Raft 学位論文 §6.4）
+  - リース方式（不採用）: ハートビート成功から一定時間内は安全とみなす。クロック前提に依存するため撤去済み
 
 #### 実装状況
-**ファイル**: `raft/state.go`, `raft/node.go`, `kvstore/store.go`
+**ファイル**: `raft/readindex.go`, `raft/noop.go`, `raft/node.go`, `kvstore/store.go`
 
-**リースベースの読み取り最適化を実装**:
-- リーダーが過半数からのハートビート応答を受け取った時刻を追跡
-- その時刻が選挙タイムアウト以内なら、Raftログを経由せずローカルから直接読み取り
+**ReadIndex プロトコルを実装**。以前はリースベースの読み取り最適化（`CanServeReadOnlyQuery` / `lastLeaderConfirmation`）でしたが、linearizability 違反（D1〜D3）のため **commit `b3b21a4` でリース機構を完全撤去し、commit `60fd631` で当選時 no-op + ReadIndex を導入**しました。現在の流れ:
+
+1. 当選したリーダーは `becomeLeader`（`raft/noop.go`）で current-term の no-op を追記し、それがコミットされると §6.4 の前提（current term で 1 件コミット済み）を満たす
+2. `ReadIndex`（`raft/readindex.go`）が次を行い readIndex を返す: ①リーダーかつ current-term コミット済みを確認（未達なら `ErrNoCurrentTermCommit`）②現在の commitIndex を readIndex として捕捉 ③ハートビート 1 巡（`confirmLeadership`）で過半数から current-term ACK を集めてリーダーシップを証明。単一ノードは自分が過半数なので即返す
+3. KV 側 `Get`（`kvstore/store.go`）は `ReadIndex()` → `waitForApplied(readIndex)`（`lastAppliedIndex` が readIndex に追いつくまで 2ms 間隔でポーリング、`operationTimeout=5s`）→ `getLocal(key)` の順で線形化読みを行う
 
 ```go
-// raft/state.go - リーダーシップ確認の追跡
-lastLeaderConfirmation time.Time // For read-only query optimization
-
-// raft/state.go - 読み取り可能かチェック
-func (rs *RaftState) CanServeReadOnlyQuery() bool {
-    if rs.state != Leader {
-        return false
-    }
-    // 選挙タイムアウト以内にリーダーシップが確認されていれば安全
-    return time.Since(rs.lastLeaderConfirmation) < rs.electionTimeout
-}
-
-// kvstore/store.go - GETでの最適化利用
+// kvstore/store.go - Get は ReadIndex 経由で線形化読み
 func (kvs *KVStore) Get(key string) (string, error) {
-    if kvs.raft.CanServeReadOnlyQuery() {
-        return kvs.getLocal(key) // ローカルから直接読み取り
+    readIndex, err := kvs.raft.ReadIndex() // §6.4: 過半数で現リーダーを証明し readIndex を捕捉
+    if err != nil {
+        return "", err // 非リーダーは ErrNotLeader（"not leader"）→ HTTP 503 リダイレクト
     }
-    // フォールバック: Raft経由
-    return kvs.executeOperationWithResult(OpGet, key, "")
+    if err := kvs.waitForApplied(readIndex); err != nil {
+        return "", err
+    }
+    return kvs.getLocal(key) // readIndex まで適用済みのローカル状態から読む
 }
 ```
 
-**ハートビート時の過半数確認** (`replicateToPeer`, `raft/rpc.go:430-434`):
-```go
-// 成功応答をカウントし、過半数到達でリースを更新
-newCount := atomic.AddInt32(successCount, 1)
-if int(newCount) >= majority && atomic.CompareAndSwapInt32(leaderConfirmed, 0, 1) {
-    rs.lastLeaderConfirmation = time.Now()
-}
-```
+no-op エントリは適用ループで実行スキップされますが `lastAppliedIndex` は前進させます（`isNoOpCommand`、`kvstore/store.go`）。これにより `waitForApplied` の追い付き判定と log-compaction の会計が no-op を含めて正しく進みます。
 
-リースベースの読み取り機構自体は実装されていますが、**linearizability を破る経路が確認されています**:
+**安全性（D1〜D3 解消）**:
+- リース方式にあったクロック依存・過半数喪失時の step-down 欠如がなくなりました。孤立した旧リーダーは `confirmLeadership` が過半数 ACK を得られず `ErrLeadershipNotConfirmed` を返し、stale 値を返しません。より高い term を見たら `stepDown` します。D1/D2 解消（commit `b3b21a4`）。see ../KNOWN_ISSUES.md (D1, D2)
+- 当選時 no-op（`becomeLeader`）により、新リーダーは前任 term のコミット済みエントリを advance してから読みを許可します。D3 解消（commit `60fd631`）。see ../KNOWN_ISSUES.md (D3)
 
-- **リース期間の設計不備 (D1)**: リース期間に自ノードのランダムな election timeout（150-300ms、都度再抽選）を流用しており、より短い timeout を引いたフォロワーがリース有効中に当選できます。クロックドリフト余裕も過半数喪失時の step-down もなく、孤立した旧リーダーが最大 ~150ms のステイル窓で古い値を返します。see ../KNOWN_ISSUES.md (D1)
-- **リース起点が応答受信時刻 (D2)**: 正しい起点はハートビート送信時刻であり、応答遅延分リースが不当に延長されます。see ../KNOWN_ISSUES.md (D2)
-- **当選時 no-op の欠落 (D3)**: リース成立は commitIndex と無関係なため、新リーダーが前任 term のコミット済みエントリを適用する前にリース読みが成立し、ACK 済みの書き込みを含まない状態を返します。パーティション不要で再現します。see ../KNOWN_ISSUES.md (D3)
-
-厳密な線形化が必要な場合は、リース方式ではなく readIndex 方式（過半数確認 + 適用待ち）が必要です。
+**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、他グループ（A7・B3・ログ圧縮まわり等）の未修正項目が残る点は変わりません。
 
 ---
 
@@ -406,7 +390,7 @@ if int(newCount) >= majority && atomic.CompareAndSwapInt32(leaderConfirmed, 0, 1
 ### 高優先度（安全性違反の解消）
 1. **AppendEntries step 3 の一致確認** — 既存エントリと index/term が一致する場合は切り詰めない（B2）
 2. **ログコンパクションの全面改修** — 絶対/相対インデックスの統一、投票・コミット・適用経路の対応、`raft.Snapshotter` の実配線、フォロワー側スナップショット永続化（A1〜A8）。暫定策は `MaxRaftState=0` で圧縮無効化
-3. **当選時 no-op の導入とリース設計の見直し** — 確実な線形化が必要なら readIndex 方式へ（D1〜D3）
+3. ✅ **当選時 no-op の導入とリース設計の見直し**（解消済み） — 当選時 no-op（`becomeLeader`、commit `60fd631`）と ReadIndex 方式（`b3b21a4`）を実装し、旧リース機構を撤去（D1〜D3）
 4. **重複検知の実配線** — HTTP API 経路への ClientID/SeqNum の受け渡しと、結果受領時の正しい応答処理（D4/D5）
 
 ### 低優先度

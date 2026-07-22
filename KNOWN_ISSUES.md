@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-07-22 / 対象 commit `33c7a50`
+> 最終検証: 2026-07-22 / 対象 commit `d1838d5`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -16,14 +16,14 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 14（A1, A2, A3, A4, A5, A6, A8, B1, B2, C1, C2, C4, D4, D5） |
+| ✅ FIXED | 17（A1, A2, A3, A4, A5, A6, A8, B1, B2, C1, C2, C4, D1, D2, D3, D4, D5） |
 | 🟠 PARTIAL | 1（C3） |
-| ❌ UNFIXED | 7（A7, B3, D1, D2, D3, E1, E2） |
+| ❌ UNFIXED | 4（A7, B3, E1, E2） |
 
-**実用上の含意**: ログ圧縮（グループ A）は通常運転で安全性が破れるため、
-`MaxRaftState=0`（圧縮無効）以外で運用してはならない。リース読みは
-リーダー交代前後で stale read を返しうる（D1–D3）。クライアントのリトライは
-二重適用になりうる（D4/D5）。
+**実用上の含意**: ログ圧縮（グループ A）は A7（InstallSnapshot 受信側の Log Matching 違反）が
+残るため、`MaxRaftState=0`（圧縮無効）以外で運用してはならない。読み取りは ReadIndex 化により
+線形化された（D1–D3 解消。選挙直後は当選時 no-op がコミットされるまで一時的に読みが待たされる）。
+クライアントのリトライは D4/D5 修正で at-most-once 化済み。
 
 ## グループ A: ログ圧縮のインデックス体系（すべて通常運転で発火しうる）
 
@@ -57,11 +57,11 @@
 
 ## グループ D: 読み取り・クライアント処理の linearizability
 
-| ID | 概要 | 状態 | 根拠（現コード） |
+| ID | 概要 | 状態 | 根拠（現コード）/ 修正 commit |
 |---|---|---|---|
-| D1 | リース期間にランダム electionTimeout を流用 → stale read | ❌ UNFIXED | `raft/state.go:317-333` |
-| D2 | リース起点が応答受信時刻（送信時刻でなく）→ 違反窓が拡大 | ❌ UNFIXED | `raft/rpc.go:429-434` |
-| D3 | 当選時 no-op エントリなし（論文 §8 違反、最も再現容易な stale read） | ❌ UNFIXED | `raft/rpc.go:293-306`, `raft/state.go:268-281` |
+| D1 | リース期間にランダム electionTimeout を流用 → stale read | ✅ FIXED | `b3b21a4`（リース機構を撤去。CanServeReadOnlyQuery/lastLeaderConfirmation を削除し ReadIndex に置換） |
+| D2 | リース起点が応答受信時刻（送信時刻でなく）→ 違反窓が拡大 | ✅ FIXED | `b3b21a4`（リース撤去によりリース起点そのものが消滅） |
+| D3 | 当選時 no-op エントリなし（論文 §8 違反、最も再現容易な stale read） | ✅ FIXED | `60fd631`（becomeLeader が current-term no-op を追加＋ ReadIndex で過半数確認・適用待ち: raft/noop.go, raft/readindex.go） |
 | D4 | 重複検出（ClientID/SeqNum）が実 API 経路から未配線 → リトライで二重適用 | ✅ FIXED | `52afd48`（ClientID/SeqNum を PUT/DELETE 経路に配線し at-most-once 化） |
 | D5 | 適用成功後に spurious な "leadership lost" エラー → 不要リトライを誘発 | ✅ FIXED | `16a9b31`（コミット済みは log index で解決し、ロール変化後も結果を返却） |
 
@@ -89,6 +89,6 @@
 
 ## 修正の推奨順序
 
-報告書の推奨（B1 → C 群 → B2 → A 群 → D3/D1/D2 → D4/D5）のうち B1・B2・C 群の大半・A 群の大半（A1–A6, A8）・D4/D5 は完了。
-残りは **C3 完遂 → A7 → B3 → D3 → D1/D2 → E 群** の順を推奨。
+報告書の推奨（B1 → C 群 → B2 → A 群 → D3/D1/D2 → D4/D5）のうち B1・B2・C 群の大半・A 群の大半（A1–A6, A8）・D1–D5 は完了。
+残りは **C3 完遂 → A7 → B3 → E 群** の順を推奨。
 当面の安全な暫定策は `MaxRaftState=0`（圧縮無効）での運用。

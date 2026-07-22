@@ -62,7 +62,7 @@ The codebase is organized into several key packages that work together:
 
 **Duplicate Detection**: The snapshotter implements duplicate detection to prevent redundant snapshot writes, optimizing disk I/O and storage usage.
 
-**Read Optimization**: Read-only queries bypass the Raft consensus layer when possible, reducing latency for read-heavy workloads while maintaining consistency guarantees.
+**Read Optimization**: Read-only queries use the ReadIndex protocol — the leader confirms it still holds leadership via a fresh heartbeat quorum and serves from local state once the state machine has applied through the captured commit index, giving linearizable reads without appending to the log.
 
 ## Development Commands
 
@@ -187,9 +187,9 @@ curl -X DELETE http://localhost:9080/kv/test
 - This optimization is critical for high-frequency snapshot scenarios
 
 **Read Optimization**:
-- GET operations on the leader can be served from the local KV store under a leadership lease, bypassing Raft consensus
-- ⚠️ The current lease implementation has confirmed linearizability gaps (stale reads are possible around leadership changes) — see `KNOWN_ISSUES.md` (D1–D3). Do not describe reads as linearizable in docs or code comments
-- When the lease is not valid, reads fall back to going through Raft consensus
+- GET operations on the leader are served through the ReadIndex protocol (Raft dissertation §6.4): the leader captures its commit index, confirms it still holds leadership with a fresh heartbeat quorum, waits until the state machine has applied through that index, then serves from local state — no log append
+- A newly elected leader appends a current-term no-op entry so the read index reflects all previously committed entries; reads briefly return `ErrNoCurrentTermCommit` until that no-op commits
+- This replaced the earlier lease-based reads and closes the confirmed linearizability gaps (`KNOWN_ISSUES.md` D1–D3, now fixed): a partitioned ex-leader fails the read instead of returning a stale value
 
 ## Code Quality
 
@@ -238,10 +238,9 @@ go build benchmark.go
 - Development tooling (Makefile, linter, formatter), unit + integration tests
 
 ### Implemented but broken or unwired ⚠️
-See `KNOWN_ISSUES.md` for the authoritative, up-to-date list. Highlights:
-- Log compaction / InstallSnapshot: index handling is inconsistent across receive/vote/commit/apply paths, and the snapshotter is not wired into the Raft node in production (group A)
-- Lease-based reads: confirmed linearizability gaps (group D)
-- Client-session duplicate detection: implemented but not wired to the real API path (D4)
+See `KNOWN_ISSUES.md` for the authoritative, up-to-date list. After the 2026-07 fixes the remaining issues are:
+- Log compaction / InstallSnapshot: absolute-index handling (A1–A5), production snapshotter wiring (A6), and follower snapshot persistence (A8) are fixed, but the InstallSnapshot receiver still retains a divergent suffix without a term check (A7, Log Matching violation) — so `MaxRaftState=0` (compaction disabled) remains the only safe configuration
+- Blocking `applyCh` send under `rs.mu` in `InstallSnapshot` (B3), two data races (E1, E2), and ignored `persist()` errors on the leader's own append path (C3, partial)
 
 See `TODO.md` for the feature roadmap.
 
