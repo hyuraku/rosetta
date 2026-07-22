@@ -250,6 +250,9 @@ func main() {
 	// Create Raft persister and KV snapshotter
 	raftPersister := persistence.NewRaftPersister(storage)
 	kvSnapshotter := persistence.NewKVSnapshotter(storage)
+	// The leader ships InstallSnapshot bytes from the same on-disk snapshot the
+	// kvstore persists, so lagging followers can parse the payload.
+	raftSnapshotter := persistence.NewRaftSnapshotter(storage)
 
 	// Create KV store with snapshotter
 	kvs := kvstore.NewKVStoreWithSnapshotter(cfg.MaxRaftState, kvSnapshotter)
@@ -265,6 +268,9 @@ func main() {
 	}
 
 	kvs.SetRaft(raftNode)
+	// Wire the snapshotter so the leader can send InstallSnapshot to followers
+	// whose required log entries have been compacted away.
+	raftNode.SetSnapshotter(raftSnapshotter)
 	transport.SetRaftNode(raftNode)
 
 	if err := transport.Start(); err != nil {

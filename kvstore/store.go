@@ -263,9 +263,12 @@ func (kvs *KVStore) applyLoop() {
 
 		result := kvs.executeCommand(&cmd)
 
-		// Update last applied index
+		// Update last applied index and term. CommandTerm is the absolute term
+		// of the applied entry; tracking it keeps saveSnapshot's LastIncludedTerm
+		// correct when a snapshot is taken from this loop.
 		kvs.mu.Lock()
 		kvs.lastAppliedIndex = applyMsg.CommandIndex
+		kvs.lastAppliedTerm = applyMsg.CommandTerm
 		kvs.mu.Unlock()
 
 		kvs.opMu.Lock()
@@ -299,23 +302,67 @@ func (kvs *KVStore) applyLoop() {
 	}
 }
 
-// installSnapshotFromApplyMsg installs a snapshot received via apply channel
+// installSnapshotFromApplyMsg installs a snapshot received via apply channel.
+//
+// The bytes originate from the leader's snapshotter (ReadSnapshot) and use the
+// V2 format (SnapshotData with KVData + Sessions); a legacy V1 payload (a bare
+// map[string]string) is still accepted for backward compatibility. Sessions are
+// restored so at-most-once duplicate detection keeps working after this node
+// installs a snapshot (Raft paper Section 8).
+//
+// The installed snapshot is also persisted to disk when a snapshotter is
+// configured. Raft has already discarded its log up to this index and persisted
+// the new snapshot boundary, so failing to persist the state machine here would
+// leave a restarted follower with neither data nor log.
 func (kvs *KVStore) installSnapshotFromApplyMsg(msg *raft.ApplyMsg) {
-	// Deserialize snapshot data
-	var snapshotData map[string]string
-	if err := json.Unmarshal(msg.SnapshotData, &snapshotData); err != nil {
+	snapshotData, err := parseSnapshotBytes(msg.SnapshotData)
+	if err != nil {
 		kvs.logger.Printf("Failed to unmarshal snapshot data: %v", err)
 		return
 	}
 
 	kvs.mu.Lock()
-	kvs.data = snapshotData
+	kvs.data = snapshotData.KVData
 	kvs.lastAppliedIndex = msg.SnapshotIndex
 	kvs.lastAppliedTerm = msg.SnapshotTerm
 	kvs.mu.Unlock()
 
-	kvs.logger.Printf("Installed snapshot: entries=%d, lastIndex=%d, lastTerm=%d",
-		len(snapshotData), msg.SnapshotIndex, msg.SnapshotTerm)
+	if snapshotData.Sessions != nil {
+		kvs.sessionMu.Lock()
+		kvs.sessions = snapshotData.Sessions
+		kvs.sessionMu.Unlock()
+	}
+
+	// Persist the received snapshot so a follower restart recovers this state.
+	// A nil snapshotter keeps the memory-only behavior for tests.
+	if kvs.snapshotter != nil {
+		if err := kvs.saveSnapshot(msg.SnapshotIndex, msg.SnapshotTerm); err != nil {
+			kvs.logger.Printf("Failed to persist installed snapshot: %v", err)
+		}
+	}
+
+	kvs.logger.Printf("Installed snapshot: entries=%d, sessions=%d, lastIndex=%d, lastTerm=%d",
+		len(snapshotData.KVData), len(snapshotData.Sessions), msg.SnapshotIndex, msg.SnapshotTerm)
+}
+
+// parseSnapshotBytes decodes snapshot bytes, preferring the V2 format
+// (SnapshotData with KVData/Sessions) and falling back to the legacy V1 format
+// (a bare map[string]string). V2 is detected by the presence of the kv_data
+// field, mirroring KVSnapshotter.LoadSnapshotV2's discrimination.
+func parseSnapshotBytes(data []byte) (*SnapshotData, error) {
+	var v2 SnapshotData
+	if err := json.Unmarshal(data, &v2); err == nil && v2.KVData != nil {
+		return &v2, nil
+	}
+
+	var v1 map[string]string
+	if err := json.Unmarshal(data, &v1); err != nil {
+		return nil, err
+	}
+	if v1 == nil {
+		v1 = make(map[string]string)
+	}
+	return &SnapshotData{KVData: v1}, nil
 }
 
 func (kvs *KVStore) executeCommand(cmd *Command) Result {

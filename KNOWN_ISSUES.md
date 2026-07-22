@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-07-21 / 対象 commit `9383cfe`
+> 最終検証: 2026-07-22 / 対象 commit `33c7a50`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -16,9 +16,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 12（A1, A2, A3, A4, A5, B1, B2, C1, C2, C4, D4, D5） |
+| ✅ FIXED | 14（A1, A2, A3, A4, A5, A6, A8, B1, B2, C1, C2, C4, D4, D5） |
 | 🟠 PARTIAL | 1（C3） |
-| ❌ UNFIXED | 9 |
+| ❌ UNFIXED | 7（A7, B3, D1, D2, D3, E1, E2） |
 
 **実用上の含意**: ログ圧縮（グループ A）は通常運転で安全性が破れるため、
 `MaxRaftState=0`（圧縮無効）以外で運用してはならない。リース読みは
@@ -27,16 +27,16 @@
 
 ## グループ A: ログ圧縮のインデックス体系（すべて通常運転で発火しうる）
 
-| ID | 概要 | 状態 | 根拠（現コード） |
+| ID | 概要 | 状態 | 根拠（現コード）/ 修正 commit |
 |---|---|---|---|
 | A1 | AppendEntries 受信側が LastIncludedIndex オフセット未対応 → 圧縮済みフォロワーのログ恒久破壊 | ✅ FIXED | `8ad5367`（絶対index一貫性チェック＋境界を越えない衝突探索） |
 | A2 | 投票経路が snapshot を無視し「空ログ」を名乗る → Leader Completeness 違反 | ✅ FIXED | `8ad5367`（RequestVote/startElection を絶対 index で評価、§5.4.1） |
 | A3 | 圧縮済みノード当選時に NextIndex が相対/絶対混同 → クラスタ書き込み不能 | ✅ FIXED | `8ad5367`（initializeLeaderState が NextIndex を絶対 index で seed） |
 | A4 | updateCommitIndex が相対長と絶対 CommitIndex を比較 → リーダー圧縮後コミット恒久停止 | ✅ FIXED | `8ad5367`（絶対 last index でコミットを前進） |
 | A5 | 再起動時に LastApplied がスナップショットから復元されない → 二重適用・範囲外 panic | ✅ FIXED | `8ad5367`（loadPersistentState で CommitIndex/LastApplied を復元＋範囲外ガード） |
-| A6 | production で Snapshotter 未配線（3 層のギャップ）→ InstallSnapshot が発火しない/必ず失敗 | ❌ UNFIXED | `main.go:240-258`, `persistence/kv_snapshotter.go:36-83`, `kvstore/store.go:305-309` |
-| A7 | InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持 → Log Matching 違反 | ❌ UNFIXED | `raft/rpc.go:623-630` |
-| A8 | フォロワー側スナップショットが永続化されない → クラッシュで恒久復元不能 | ❌ UNFIXED | `kvstore/store.go:303-319` |
+| A6 | production で Snapshotter 未配線（3 層のギャップ）→ InstallSnapshot が発火しない/必ず失敗 | ✅ FIXED | `d0cbdc1`（RaftSnapshotter を SetSnapshotter で本番配線＋型アサーションでインターフェース互換を担保）＋ `c516f54`（parseSnapshotBytes で V2 形式をパースし 3 ギャップをすべて解消） |
+| A7 | InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持 → Log Matching 違反 | ❌ UNFIXED | `raft/rpc.go:662-669`（LastIncludedIndex 超の suffix を無条件保持。A6/A8 修正は raft/ を触らず未対応） |
+| A8 | フォロワー側スナップショットが永続化されない → クラッシュで恒久復元不能 | ✅ FIXED | `c516f54`（installSnapshotFromApplyMsg が saveSnapshot でフォロワー側スナップショットを永続化） |
 
 ## グループ B: コミット済みエントリの喪失
 
@@ -82,12 +82,13 @@
    （安全側の挙動）。
 3. **RequestVote の persist 失敗時**: メモリ上の VotedFor は保持したまま `VoteGranted=false`
    のみ返す。同一 term 内の再投票を防ぐ安全方向の意図的設計（`raft/rpc.go:96-105` のコメント参照）。
-4. **A6 が CI で検出されない理由**: 統合テストは `fakeSnapshotter` を使い、
+4. **A6 が CI で検出されなかった理由（解消済み）**: 旧統合テストは `fakeSnapshotter` を使い、
    (i) SetSnapshotter 未配線、(ii) インターフェース非互換、(iii) V2 形式 unmarshal 不整合の
-   3 つのギャップをすべて迂回している。
+   3 つのギャップをすべて迂回していた。`d0cbdc1`/`c516f54` で 3 ギャップを解消し、
+   `tests/integration/snapshot_kvstore_wiring_test.go` が本番配線経路を検証するようになった。
 
 ## 修正の推奨順序
 
-報告書の推奨（B1 → C 群 → B2 → A 群 → D3/D1/D2 → D4/D5）のうち B1 と C 群の大半は完了。
-残りは **C3 完遂 → B2 → A 群 → D3 → D1/D2 → D4/D5 → E 群** の順を推奨。
+報告書の推奨（B1 → C 群 → B2 → A 群 → D3/D1/D2 → D4/D5）のうち B1・B2・C 群の大半・A 群の大半（A1–A6, A8）・D4/D5 は完了。
+残りは **C3 完遂 → A7 → B3 → D3 → D1/D2 → E 群** の順を推奨。
 当面の安全な暫定策は `MaxRaftState=0`（圧縮無効）での運用。
