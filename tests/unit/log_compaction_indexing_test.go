@@ -60,14 +60,19 @@ func TestAppendLogEntryAfterCompaction(t *testing.T) {
 	rs := raft.NewRaftState("node1", []string{"node1"}, applyCh)
 
 	for i := 0; i < 10; i++ {
-		rs.AppendLogEntry("cmd", "command")
+		if _, err := rs.AppendLogEntry("cmd", "command"); err != nil {
+			t.Fatalf("setup AppendLogEntry: %v", err)
+		}
 	}
 	if err := rs.TruncateLogTo(5); err != nil {
 		t.Fatalf("TruncateLogTo(5): %v", err)
 	}
 
 	// Next appended entry must be absolute index 11, not len(log)+1 == 6.
-	got := rs.AppendLogEntry("cmd", "command")
+	got, err := rs.AppendLogEntry("cmd", "command")
+	if err != nil {
+		t.Fatalf("AppendLogEntry after compaction: %v", err)
+	}
 	if got != 11 {
 		t.Errorf("AppendLogEntry after compaction: got index %d, want 11", got)
 	}

@@ -41,9 +41,11 @@ func TestRaftPersistence_CrashRecovery(t *testing.T) {
 	raftNode1.GetRaftState().SetVotedFor(&nodeID)
 
 	// Add some log entries
-	raftNode1.GetRaftState().AppendLogEntry("cmd1", "command")
-	raftNode1.GetRaftState().AppendLogEntry("cmd2", "command")
-	raftNode1.GetRaftState().AppendLogEntry("cmd3", "command")
+	for _, cmd := range []string{"cmd1", "cmd2", "cmd3"} {
+		if _, err := raftNode1.GetRaftState().AppendLogEntry(cmd, "command"); err != nil {
+			t.Fatalf("AppendLogEntry(%s): %v", cmd, err)
+		}
+	}
 
 	// Wait a bit for persistence to complete
 	time.Sleep(100 * time.Millisecond)
@@ -356,7 +358,9 @@ func TestPersistence_MultipleCrashes(t *testing.T) {
 
 		// Make some state changes
 		raftNode.GetRaftState().IncrementTerm()
-		raftNode.GetRaftState().AppendLogEntry("cmd", "command")
+		if _, err := raftNode.GetRaftState().AppendLogEntry("cmd", "command"); err != nil {
+			t.Fatalf("Cycle %d: AppendLogEntry: %v", cycle, err)
+		}
 
 		// Wait for persistence
 		time.Sleep(50 * time.Millisecond)

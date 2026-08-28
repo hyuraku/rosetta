@@ -37,6 +37,14 @@ func (rs *RaftState) becomeLeader() {
 
 // appendNoOpLocked appends a no-op entry for the current term. Callers must hold
 // rs.mu. The entry is persisted like any other log entry so it survives a crash.
+//
+// If the entry cannot be persisted the append is rolled back rather than kept:
+// an in-memory-only no-op could be committed on the strength of this leader's
+// own log and then vanish on restart, and it would let a ReadIndex query serve
+// state that is not durably committed. Losing the no-op is safe — reads keep
+// failing with ErrNoCurrentTermCommit until some current-term entry commits, and
+// leadership itself does not depend on it — so the failure is logged and
+// becomeLeader continues.
 func (rs *RaftState) appendNoOpLocked() {
 	index := rs.lastAbsLogIndex() + 1
 	rs.persistent.Log = append(rs.persistent.Log, LogEntry{
@@ -46,6 +54,8 @@ func (rs *RaftState) appendNoOpLocked() {
 		Type:    entryTypeNoOp,
 	})
 	if err := rs.persist(); err != nil {
-		rs.logger.Printf("appendNoOp: persist failed: %v", err)
+		rs.persistent.Log = rs.persistent.Log[:len(rs.persistent.Log)-1]
+		rs.logger.Printf("appendNoOp: persist failed, rolled back no-op at index %d; "+
+			"reads stay unavailable until a current-term entry commits: %v", index, err)
 	}
 }

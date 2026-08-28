@@ -109,7 +109,10 @@ func TestLogOperations(t *testing.T) {
 		t.Errorf("Expected initial log term to be 0, got %d", state.GetLastLogTerm())
 	}
 
-	index := state.AppendLogEntry("test command", "command")
+	index, err := state.AppendLogEntry("test command", "command")
+	if err != nil {
+		t.Fatalf("AppendLogEntry: %v", err)
+	}
 	if index != 1 {
 		t.Errorf("Expected first log entry index to be 1, got %d", index)
 	}

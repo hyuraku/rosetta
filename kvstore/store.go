@@ -595,9 +595,17 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value, clientI
 		return Result{Value: "", Err: err}
 	}
 
-	_, _, isLeader := kvs.raft.Start(string(cmdBytes))
+	_, _, isLeader, err := kvs.raft.Start(string(cmdBytes))
 	if !isLeader {
 		return Result{Value: "", Err: fmt.Errorf("not leader")}
+	}
+	// The entry could not be made durable and was rolled back, so nothing will
+	// ever be applied for opID. Fail the operation now instead of waiting for
+	// the operation timeout. The message must not contain "not leader": the HTTP
+	// layer keys off that string to send a redirect, and this is a local storage
+	// failure, not a leadership change.
+	if err != nil {
+		return Result{Value: "", Err: fmt.Errorf("failed to append command to raft log: %w", err)}
 	}
 
 	resultCh := make(chan Result, 1)
