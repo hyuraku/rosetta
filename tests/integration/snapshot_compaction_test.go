@@ -103,8 +103,8 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	// 3) Submit enough commands that the leader's log grows.
 	const numCmds = 30
 	for i := 0; i < numCmds; i++ {
-		if _, _, ok := leader.Start(fmt.Sprintf("cmd-%d", i)); !ok {
-			t.Fatalf("leader rejected Start at cmd %d", i)
+		if _, _, ok, err := leader.Start(fmt.Sprintf("cmd-%d", i)); !ok || err != nil {
+			t.Fatalf("leader rejected Start at cmd %d (isLeader=%v, err=%v)", i, ok, err)
 		}
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -168,8 +168,8 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	//    the tail entries 26..30 plus these new ones).
 	const extraCmds = 5
 	for i := 0; i < extraCmds; i++ {
-		if _, _, ok := leader.Start(fmt.Sprintf("post-snap-%d", i)); !ok {
-			t.Fatalf("leader rejected Start of post-snapshot command %d", i)
+		if _, _, ok, err := leader.Start(fmt.Sprintf("post-snap-%d", i)); !ok || err != nil {
+			t.Fatalf("leader rejected Start of post-snapshot command %d (isLeader=%v, err=%v)", i, ok, err)
 		}
 	}
 	targetApplied := numCmds + extraCmds // 35

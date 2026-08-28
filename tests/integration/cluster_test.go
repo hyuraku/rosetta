@@ -40,9 +40,12 @@ func TestThreeNodeCluster(t *testing.T) {
 	}
 
 	if leader != nil {
-		index, term, isLeader := leader.Start("test command")
+		index, term, isLeader, err := leader.Start("test command")
 		if !isLeader {
 			t.Error("Leader should be able to start commands")
+		}
+		if err != nil {
+			t.Errorf("Start returned error: %v", err)
 		}
 		if index <= 0 {
 			t.Errorf("Expected positive index, got %d", index)
@@ -91,9 +94,13 @@ func TestFiveNodeCluster(t *testing.T) {
 	commands := []string{"cmd1", "cmd2", "cmd3", "cmd4", "cmd5"}
 	if leader != nil {
 		for i, cmd := range commands {
-			index, term, isLeader := leader.Start(cmd)
+			index, term, isLeader, err := leader.Start(cmd)
 			if !isLeader {
 				t.Errorf("Leader should be able to start command %d", i)
+				break
+			}
+			if err != nil {
+				t.Errorf("Start of command %d returned error: %v", i, err)
 				break
 			}
 			// Index 1 is the no-op the leader appends on election (§6.4), so the
@@ -165,9 +172,12 @@ func TestLeaderElectionAfterFailure(t *testing.T) {
 	}
 
 	if newLeader != nil {
-		index, term, isLeader := newLeader.Start("recovery command")
+		index, term, isLeader, err := newLeader.Start("recovery command")
 		if !isLeader {
 			t.Error("New leader should be able to start commands")
+		}
+		if err != nil {
+			t.Errorf("Start returned error: %v", err)
 		}
 		if index <= 0 {
 			t.Errorf("Expected positive index, got %d", index)
@@ -214,9 +224,13 @@ func TestLogReplication(t *testing.T) {
 	commands := []string{"command1", "command2", "command3"}
 
 	for _, cmd := range commands {
-		index, term, isLeader := leader.Start(cmd)
+		index, term, isLeader, err := leader.Start(cmd)
 		if !isLeader {
 			t.Error("Leader should be able to start commands")
+			break
+		}
+		if err != nil {
+			t.Errorf("Start of %s returned error: %v", cmd, err)
 			break
 		}
 		if index <= 0 || term <= 0 {
@@ -358,13 +372,9 @@ func TestConcurrentCommands(t *testing.T) {
 	for i := 0; i < numCommands; i++ {
 		go func(cmdNum int) {
 			cmd := fmt.Sprintf("concurrent-cmd-%d", cmdNum)
-			index, term, isLeader := leader.Start(cmd)
+			index, term, isLeader, err := leader.Start(cmd)
 
-			if isLeader && index > 0 && term > 0 {
-				done <- true
-			} else {
-				done <- false
-			}
+			done <- isLeader && err == nil && index > 0 && term > 0
 		}(i)
 	}
 

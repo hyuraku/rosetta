@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 type LogEntry struct {
 	Term    int         `json:"term"`
 	Index   int         `json:"index"`
@@ -52,7 +54,17 @@ func (rs *RaftState) logTermAt(absIndex int) int {
 	return rs.persistent.Log[pos].Term
 }
 
-func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) int {
+// AppendLogEntry appends a new entry for the current term and returns its
+// absolute index once the entry has reached stable storage.
+//
+// A persist failure is reported, never swallowed: the leader counts its own log
+// as one of the replicas when advancing the commit index, so an entry that only
+// ever existed in memory could be committed, acknowledged to the client, and
+// then lost when the leader restarts (Figure 2, "Persistent state ... updated on
+// stable storage before responding to RPCs"). On failure the in-memory append is
+// rolled back so memory and disk stay in agreement, and the returned index is 0
+// — callers must treat the command as never started.
+func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) (int, error) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
@@ -65,9 +77,11 @@ func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) int {
 	}
 	rs.persistent.Log = append(rs.persistent.Log, entry)
 	if err := rs.persist(); err != nil {
-		rs.logger.Printf("AppendLogEntry: persist failed: %v", err)
+		rs.persistent.Log = rs.persistent.Log[:len(rs.persistent.Log)-1]
+		rs.logger.Printf("AppendLogEntry: persist failed, rolled back entry %d: %v", index, err)
+		return 0, fmt.Errorf("persist log entry %d: %w", index, err)
 	}
-	return index
+	return index, nil
 }
 
 // GetLogEntry returns the entry at the given absolute log index, or nil when
@@ -113,11 +127,18 @@ func (rs *RaftState) GetLastLogTerm() int {
 }
 
 // TruncateLogAfter discards every entry whose absolute index is greater than
-// the given absolute index, keeping the snapshot boundary intact.
-func (rs *RaftState) TruncateLogAfter(index int) {
+// the given absolute index, keeping the snapshot boundary intact. The shortened
+// log must reach stable storage before the truncation is reported as done: a
+// truncation that survives only in memory would reappear as the discarded suffix
+// after a restart. On a persist failure the previous log is restored and the
+// error is returned; re-slicing is enough to restore it because truncation only
+// moves the slice header and leaves the discarded entries in the backing array,
+// and rs.mu is held throughout so nothing can overwrite them in between.
+func (rs *RaftState) TruncateLogAfter(index int) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
+	previous := rs.persistent.Log
 	keep := index - rs.persistent.LastIncludedIndex
 	if keep < 0 {
 		rs.persistent.Log = make([]LogEntry, 0)
@@ -125,8 +146,11 @@ func (rs *RaftState) TruncateLogAfter(index int) {
 		rs.persistent.Log = rs.persistent.Log[:keep]
 	}
 	if err := rs.persist(); err != nil {
-		rs.logger.Printf("TruncateLogAfter: persist failed: %v", err)
+		rs.persistent.Log = previous
+		rs.logger.Printf("TruncateLogAfter: persist failed, restored log after index %d: %v", index, err)
+		return fmt.Errorf("persist log truncated after index %d: %w", index, err)
 	}
+	return nil
 }
 
 func (rs *RaftState) UpdateCommitIndex(leaderCommit int) {

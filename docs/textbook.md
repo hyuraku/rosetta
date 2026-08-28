@@ -134,8 +134,8 @@ graph TD
 
 > ⚠️ **2026-07-21 追記: この節の状況は解消された。** 第1世代の 3 doc は削除（有用部分は
 > `examples/benchmark/README.md` へ移植）、第2世代は全記述をコードと突き合わせて修正済み。
-> 既知問題の最新ステータスは `KNOWN_ISSUES.md` が唯一の正（B1 のほか C1/C2/C4 も修正済み、
-> C3 は部分修正）。以下は本書執筆時点（commit 9a90cf5）の記録として残す。
+> 既知問題の最新ステータスは `KNOWN_ISSUES.md` が唯一の正（B1 のほか C1–C4 も修正済み）。
+> 以下は本書執筆時点（commit 9a90cf5）の記録として残す。
 
 | 世代 | ドキュメント | 前提 |
 |---|---|---|
@@ -244,7 +244,7 @@ type LeaderState  struct { NextIndex, MatchIndex map[string]int } // state.go:66
 ## 永続化の実行と、その弱点
 
 - 永続化は `persist()`（`state.go:177-185`）経由。persister が nil なら黙って何もしない
-- **書き込みエラーはログ出力のみで無視**（`state.go:182-184`）— ディスク書き込みに失敗しても選挙・投票は続行してしまう（safety-review C3、未修正）
+- **書き込みエラーはログ出力のみで無視**（`state.go:182-184`）— ディスク書き込みに失敗しても選挙・投票は続行してしまう（safety-review C3。現在は `2a35ce9`／`ffc2926` で解消済み）
 
 > 💡 **やさしく言うと**: 大事なメモをノートに書き写す係がいますが、「書けませんでした」と言われても作業を止めずに進んでしまいます。停電が重なると、書けなかったメモの内容を永久に失います。
 
@@ -1035,11 +1035,11 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
 | A1–A6, A8 | 圧縮の index 体系（受信/投票/NextIndex/commit/apply/復元）・本番配線・フォロワー永続化 | ✅ **修正済み**（A1–A5 `8ad5367` / A6 `d0cbdc1`+`c516f54` / A8 `c516f54`） |
 | A7 | InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持（Log Matching 違反） | ❌ 未修正 |
 | C1/C2/C4 | 投票・term 更新の persist 欠如、ロード失敗時の起動継続 | ✅ **修正済み**（`2a35ce9`） |
-| C3 | persist() のエラー無視 | 🟠 部分修正（RPC 応答経路は `2a35ce9`。リーダー自身の `AppendLogEntry`/`TruncateLogAfter` は依然無視） |
+| C3 | persist() のエラー無視 | ✅ **修正済み**（RPC 応答経路は `2a35ce9`。リーダー自身の `AppendLogEntry`/`TruncateLogAfter`/当選時 no-op は `ffc2926` でロールバック＋エラー通知） |
 | D1–D5 | lease 期間・起点、no-op 不在（D1–D3）、重複検出未配線（D4）、spurious leadership lost（D5） | ✅ **修正済み**（D1/D2 `b3b21a4`、D3 `60fd631`、D4 `52afd48`、D5 `16a9b31`） |
 | E1–E2 | ロック外タイマーリセット、スライス共有 | ❌ 未修正 |
 
-> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです。安全性の指摘の大半（B1・B2・A1–A6/A8・C1/C2/C4・D1–D5）は別 PR で修正済み。残る未修正は A7（圧縮受信側の Log Matching 違反）・B3（applyCh ブロッキング送信の liveness）・E1・E2（data race）と、C3 の部分修正のみです。
+> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです。安全性の指摘の大半（B1・B2・A1–A6/A8・C1–C4・D1–D5）は別 PR で修正済み。残る未修正は A7（圧縮受信側の Log Matching 違反）・B3（applyCh ブロッキング送信の liveness）・E1・E2（data race）のみです。
 
 ---
 
@@ -1150,7 +1150,7 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
   api / persistence / log-compaction / raft-paper-implementation-status）は全記述をコードと
   突き合わせて修正した
 - **KNOWN_ISSUES.md を新設**: safety-review の全項目の「生きたステータス表」。本書執筆後に
-  B1（9a90cf5）と C1/C2/C4（2a35ce9 = PR #11）が修正済み、C3 は部分修正。
+  B1（9a90cf5）と C1/C2/C4（2a35ce9 = PR #11）・C3（ffc2926）が修正済み。
   上の「停電すると投票記録が消える」は**現在は修正済み**である
 - **再発防止**: 各 doc に「最終検証: 日付 / commit」ヘッダを付け、CLAUDE.md に
   「挙動変更と doc 更新は同一 PR」の規約を追加した

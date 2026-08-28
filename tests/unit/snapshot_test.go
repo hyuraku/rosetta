@@ -34,7 +34,9 @@ func TestShouldTakeSnapshot(t *testing.T) {
 
 	// Add enough entries to trigger snapshot
 	for i := 0; i < 100; i++ {
-		rs.AppendLogEntry("command", "test")
+		if _, err := rs.AppendLogEntry("command", "test"); err != nil {
+			t.Fatalf("AppendLogEntry: %v", err)
+		}
 	}
 
 	// Now should need snapshot
@@ -50,9 +52,11 @@ func TestGetLastLogIndexWithSnapshot(t *testing.T) {
 	rs := raft.NewRaftState("node1", peers, applyCh)
 
 	// Add some log entries
-	rs.AppendLogEntry("cmd1", "test")
-	rs.AppendLogEntry("cmd2", "test")
-	rs.AppendLogEntry("cmd3", "test")
+	for _, cmd := range []string{"cmd1", "cmd2", "cmd3"} {
+		if _, err := rs.AppendLogEntry(cmd, "test"); err != nil {
+			t.Fatalf("AppendLogEntry(%s): %v", cmd, err)
+		}
+	}
 
 	lastIndex := rs.GetLastLogIndexWithSnapshot()
 	if lastIndex != 3 {

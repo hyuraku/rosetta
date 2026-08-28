@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-07-22 / 対象 commit `d1838d5`
+> 最終検証: 2026-08-28 / 対象 commit `ffc2926`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -16,8 +16,8 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 17（A1, A2, A3, A4, A5, A6, A8, B1, B2, C1, C2, C4, D1, D2, D3, D4, D5） |
-| 🟠 PARTIAL | 1（C3） |
+| ✅ FIXED | 18（A1, A2, A3, A4, A5, A6, A8, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5） |
+| 🟠 PARTIAL | 0 |
 | ❌ UNFIXED | 4（A7, B3, E1, E2） |
 
 **実用上の含意**: ログ圧縮（グループ A）は A7（InstallSnapshot 受信側の Log Matching 違反）が
@@ -52,7 +52,7 @@
 |---|---|---|---|
 | C1 | RequestVote が term/votedFor を persist しない → 同一 term に 2 リーダー | ✅ FIXED | `2a35ce9`（PR #11、応答前 persist + 失敗時 VoteGranted=false） |
 | C2 | ハートビート経由の term 更新が persist されない | ✅ FIXED | `2a35ce9`（降格パス 3 箇所も対応） |
-| C3 | persist() のエラー無視 | 🟠 PARTIAL | RPC 応答経路は修正済み（`2a35ce9`）。**リーダー自身の `AppendLogEntry`（Start() 経由の本番経路）と `TruncateLogAfter` はエラーを無視して続行**: `raft/log.go:136-139, 190-192` |
+| C3 | persist() のエラー無視 | ✅ FIXED | RPC 応答経路は `2a35ce9`。リーダー自身の追記経路は `ffc2926`（`AppendLogEntry` は `(int, error)`、`TruncateLogAfter` は `error` を返し、persist 失敗時はメモリ上の変更をロールバック。`Start()` もエラーを返し、KV 層は即座に操作を失敗させる。当選時 no-op も同様にロールバック） |
 | C4 | 永続状態ロード失敗で「記憶喪失ノード」として参加 | ✅ FIXED | `2a35ce9`（ロード失敗時は起動拒否 `main.go:252-255`） |
 
 ## グループ D: 読み取り・クライアント処理の linearizability
@@ -89,6 +89,6 @@
 
 ## 修正の推奨順序
 
-報告書の推奨（B1 → C 群 → B2 → A 群 → D3/D1/D2 → D4/D5）のうち B1・B2・C 群の大半・A 群の大半（A1–A6, A8）・D1–D5 は完了。
-残りは **C3 完遂 → A7 → B3 → E 群** の順を推奨。
+報告書の推奨（B1 → C 群 → B2 → A 群 → D3/D1/D2 → D4/D5）のうち B1・B2・C 群（C1–C4）・A 群の大半（A1–A6, A8）・D1–D5 は完了。
+残りは **A7 → B3 → E 群** の順を推奨。
 当面の安全な暫定策は `MaxRaftState=0`（圧縮無効）での運用。

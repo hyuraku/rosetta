@@ -91,19 +91,28 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 	return nil
 }
 
-func (rn *RaftNode) Start(command interface{}) (index, term int, isLeader bool) {
+// Start appends a client command to the leader's log. It returns the index the
+// command was assigned, the leader's term, and whether this node is the leader.
+// A non-nil error means the entry could not be made durable and was rolled back:
+// the command was not started and must not be reported as accepted, even though
+// isLeader is true.
+func (rn *RaftNode) Start(command interface{}) (index, term int, isLeader bool, err error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
 	term, isLeader = rn.state.GetState()
 	if !isLeader {
-		return -1, term, false
+		return -1, term, false, nil
 	}
 
-	index = rn.state.AppendLogEntry(command, "command")
+	index, err = rn.state.AppendLogEntry(command, "command")
+	if err != nil {
+		rn.logger.Printf("Start: failed to append command at term %d: %v", term, err)
+		return -1, term, true, err
+	}
 	rn.logger.Printf("Started command at index %d, term %d", index, term)
 
-	return index, term, true
+	return index, term, true, nil
 }
 
 func (rn *RaftNode) GetState() (int, bool) {
