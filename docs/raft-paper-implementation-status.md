@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-07-22 / 対象 commit `3fe5a84`
+> 最終検証: 2026-08-28 / 対象 commit `ffc2926`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（および `docs/safety-review-2026-07-07.md`）に集約されています。
 
@@ -11,7 +11,7 @@
 | リーダー選挙 (Section 5.2) | ⚠️ ほぼ準拠 | 基本動作は実装済み。当選時に current-term no-op を追記（D3 解消）。圧縮後の投票判定も絶対 index 化済み（A2 解消・commit `8ad5367`）。残る懸念は E1（ロック外 `ResetElectionTimer` の data race） |
 | ログ複製 (Section 5.3) | ✅ 実装済み（fast rollback 含む） | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）も完了 |
 | 安全性保証 (Section 5.4) | ⚠️ A7 が残る | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。残る違反経路は A7（InstallSnapshot 受信側の Log Matching 違反）のみ |
-| 永続化 (Figure 2) | ✅ 概ね実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`AppendLogEntry`/`TruncateLogAfter`）は persist エラーを無視（C3 部分修正） |
+| 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`AppendLogEntry`/`TruncateLogAfter`/当選時 no-op）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`） |
 | ログコンパクション (Section 7) | ⚠️ A7 が残る（他は解消） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化を解消（A1–A6, A8・commit `8ad5367`/`d0cbdc1`/`c516f54`）。残る安全性課題は A7 のみ（`MaxRaftState=0` 推奨は A7 が残る限り維持） |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応 |
 | クライアント相互作用 (Section 8) | ✅ 配線済み（at-most-once） | 重複検知（ClientID/SeqNum）を実 API 経路へ配線し at-most-once 化（D4 解消・commit `52afd48`）。コミット済みは log index で解決（D5 解消・`16a9b31`） |
@@ -19,7 +19,7 @@
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照）
 
-> **現在の未修正（安全性）**: A7（InstallSnapshot 受信側の Log Matching 違反）・B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）。加えて C3 は部分修正（リーダー自身の `AppendLogEntry`/`TruncateLogAfter` が persist エラーを無視）。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正（安全性）**: A7（InstallSnapshot 受信側の Log Matching 違反）・B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -196,7 +196,11 @@ type Persister interface {
 - `startElection`: 立候補（term+1・自己投票）を persist できなければ選挙を中止（`raft/rpc.go:200-212`）
 - 永続状態のロード失敗時は起動を拒否（`raft/state.go:157-161`, `raft/node.go:29-34`）
 
-**残課題（C3 部分修正）**: RPC 応答経路の persist エラーは修正済み（`2a35ce9`）ですが、リーダー自身のログ追記 `AppendLogEntry`（Start() 経由の本番経路）と `TruncateLogAfter`（`raft/log.go`）は persist 失敗をログ出力のみで握り潰すため、未永続のエントリがリーダー自票込みでコミットされうる経路が残っています。see ../KNOWN_ISSUES.md (C3)
+**リーダー自身の追記経路**（commit `ffc2926` で C3 を解消）:
+- `AppendLogEntry` は `(int, error)` を返す。persist に失敗したら追記をロールバックし（メモリとディスクを一致させる）、エラーを返す（`raft/log.go`）
+- `TruncateLogAfter` は `error` を返す。persist に失敗したら切り詰め前のログを復元する（`raft/log.go`）
+- 当選時 no-op（`appendNoOpLocked`）も persist 失敗時はロールバック。no-op を失っても安全側で、current-term のエントリがコミットされるまで読み取りが `ErrNoCurrentTermCommit` を返し続けるだけ（`raft/noop.go`）
+- `RaftNode.Start` はエラーを返し、KV 層はタイムアウトを待たずに操作を失敗させる（`raft/node.go`, `kvstore/store.go`）
 
 ---
 
@@ -340,7 +344,7 @@ type KVStore struct {
 - **重複検知が配線済み (D4・✅ 解消)**: HTTP ハンドラ（PUT/DELETE）が ClientID/SeqNum を読み取り、`executeCommand` の dedup（`cmd.ClientID != ""` で発動）に渡すようになりました。タイムアウト後のリトライは at-most-once 化されています。修正 commit `52afd48`。see ../KNOWN_ISSUES.md (D4)
 - **結果受領後の spurious エラーを解消 (D5・✅ 解消)**: コミット済みの操作は log index で解決し、ロール変化後も結果を返すようになったため、適用成功後に "leadership lost" を返して不要リトライを誘発することはなくなりました。修正 commit `16a9b31`。see ../KNOWN_ISSUES.md (D5)
 
-このため、論文 Section 8 の重複検知（at-most-once）要件は実 API 経路で満たされるようになりました。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。ただし本プロジェクトは教育用途であり、A7・B3・C3（部分）・E1・E2 が残る点は変わりません。
+このため、論文 Section 8 の重複検知（at-most-once）要件は実 API 経路で満たされるようになりました。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。ただし本プロジェクトは教育用途であり、A7・B3・E1・E2 が残る点は変わりません。
 
 ---
 

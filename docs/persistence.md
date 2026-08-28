@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-07-21 against commit `9383cfe`.
+> Last verified: 2026-08-28 against commit `ffc2926`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -101,6 +101,12 @@ Raft state is persisted when:
 5. The log is compacted after a snapshot
 6. Before responding to RequestVote/AppendEntries RPCs that changed
    persistent state (a failed persist causes the RPC to be rejected)
+
+A failed persist never passes silently. On the leader's own append paths
+(`AppendLogEntry`, `TruncateLogAfter`, and the no-op appended on election) the
+in-memory change is rolled back so memory and disk agree, and the error is
+returned to the caller: `RaftNode.Start` reports it, and the KV store fails the
+client operation instead of waiting for it to be applied.
 
 KV store snapshots are saved automatically by the apply loop: after
 `max_raft_state` commands (default 1000) have been applied since the last
