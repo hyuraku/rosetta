@@ -54,6 +54,32 @@ func (rs *RaftState) logTermAt(absIndex int) int {
 	return rs.persistent.Log[pos].Term
 }
 
+// logAfterSnapshot decides which live log entries survive an incoming
+// InstallSnapshot whose last included entry is (lastIncludedIndex,
+// lastIncludedTerm), and returns the new log. Requires rs.mu held. The caller
+// has already rejected stale snapshots, so lastIncludedIndex is strictly above
+// the current LastIncludedIndex and every entry at or below it is subsumed by
+// the snapshot regardless of the outcome.
+//
+// Paper §7 (Figure 13, receiver steps 6 and 7):
+//
+//  6. If an existing log entry has the same index and term as the snapshot's
+//     last included entry, retain the log entries following it.
+//  7. Otherwise, discard the entire log.
+//
+// logTermAt reports 0 for an index beyond the live log, so a follower too far
+// behind to hold the snapshot's last entry takes the discard path through the
+// same comparison. Retaining the suffix unconditionally (the pre-fix behavior,
+// KNOWN_ISSUES.md A7) lets a follower splice a stale leader's entries onto the
+// new leader's snapshot, leaving a log that matches no single history and
+// breaking Log Matching.
+func (rs *RaftState) logAfterSnapshot(lastIncludedIndex, lastIncludedTerm int) []LogEntry {
+	if rs.logTermAt(lastIncludedIndex) != lastIncludedTerm {
+		return nil
+	}
+	return rs.persistent.Log[rs.slicePos(lastIncludedIndex)+1:]
+}
+
 // AppendLogEntry appends a new entry for the current term and returns its
 // absolute index once the entry has reached stable storage.
 //

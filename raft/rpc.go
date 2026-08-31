@@ -636,14 +636,12 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		return
 	}
 
-	//  Discard log entries covered by snapshot
-	newLog := make([]LogEntry, 0)
-	for _, entry := range rs.persistent.Log {
-		if entry.Index > args.LastIncludedIndex {
-			newLog = append(newLog, entry)
-		}
-	}
-	rs.persistent.Log = newLog
+	// Replace the log per the paper's §7 retention rule: entries the snapshot
+	// covers always go, and the suffix above the boundary survives only when
+	// our entry at LastIncludedIndex agrees with the snapshot's term. Must run
+	// before LastIncludedIndex is advanced below — the rule is evaluated
+	// against the log we still hold.
+	rs.persistent.Log = rs.logAfterSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
 
 	// Update snapshot metadata
 	rs.persistent.LastIncludedIndex = args.LastIncludedIndex
