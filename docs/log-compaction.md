@@ -1,10 +1,10 @@
 # Log Compaction and Snapshotting
 
-> Last verified: 2026-07-21 against commit `9383cfe`.
+> Last verified: 2026-08-31 against commit `019d33e`.
 
 This document describes the log compaction and snapshotting features in Rosetta, which are intended to prevent unbounded log growth and enable efficient operation over long periods.
 
-> **Warning**: Log compaction is only partially implemented. Snapshot creation and log truncation are wired up and fire automatically (default threshold: 1000 applied commands), but only the leader's *sending* path translates between absolute (snapshot-inclusive) and relative (post-truncation) log indices. The AppendEntries/RequestVote handlers, commit advancement, and the apply path still use raw slice positions, so once the log is actually truncated, replication, elections, and commits break. InstallSnapshot is also unwired in the production binary. See ../KNOWN_ISSUES.md (A1-A8). Treat this document as a description of the design intent, with per-section notes on what actually works today.
+> **Status**: The safety issues that made compaction unusable are now fixed. Absolute-index handling is unified across the receive, vote, commit, and apply paths (A1-A5, `8ad5367`), the snapshotter is wired in the production binary and the V2 snapshot format parses (A6, `d0cbdc1`/`c516f54`), follower-side snapshots are persisted (A8, `c516f54`), and the InstallSnapshot receiver now applies the paper's §7 retention rule instead of keeping a divergent suffix (A7, `019d33e`). One issue remains on this path and it is a **liveness** one, not a safety one: the InstallSnapshot handler sends to `applyCh` while holding `rs.mu`, so a slow state machine stalls the node's RPCs and election timer (B3). See ../KNOWN_ISSUES.md.
 
 ## Overview
 
@@ -34,7 +34,7 @@ Rosetta automatically creates snapshots when the log grows beyond a configured t
 4. **Compact**: Old log entries are discarded (via `RaftState.TruncateLogTo`)
 5. **Continue**: Normal operation resumes with smaller log
 
-> **Warning**: Steps 1-4 work as described, but step 5 does not: after truncation the receiver-side RPC handlers, vote comparisons, and commit logic still interpret indices as slice positions, so replication and elections misbehave. See ../KNOWN_ISSUES.md (A1-A5).
+> **Note**: Step 5 used to break here — after truncation the receiver-side RPC handlers, vote comparisons, and commit logic interpreted absolute indices as slice positions. `8ad5367` unified all of them on absolute indices via the `slicePos`/`logTermAt` helpers in raft/log.go (A1-A5, now fixed).
 
 ## Configuration
 
@@ -53,13 +53,13 @@ Default values:
 - `maxRaftState`: 1000 commands
 - Automatic snapshots enabled by default
 
-This means log compaction fires automatically during normal operation once 1000 commands have been applied — at which point the known index-handling issues take effect (see ../KNOWN_ISSUES.md, A1-A5).
+This means log compaction fires automatically during normal operation once 1000 commands have been applied. The index-handling defects that this used to expose are fixed (see ../KNOWN_ISSUES.md, A1-A5).
 
 ### Disable Automatic Snapshots
 
 Automatic snapshots **cannot be disabled through configuration**: `Config.Validate()` (config/config.go) rejects `max_raft_state <= 0` with `"max_raft_state must be positive"`, so a config file containing `"max_raft_state": 0` prevents the node from starting. There is also no command-line flag for it, so nodes started with flags always run with the default of 1000.
 
-Snapshotting can only be disabled programmatically, by constructing the store with `kvstore.NewKVStore(0)` (the KV store skips snapshots when `maxRaftState <= 0`). Given the known compaction issues (see ../KNOWN_ISSUES.md, A1-A8), disabling compaction this way is currently the safer mode of operation.
+Snapshotting can only be disabled programmatically, by constructing the store with `kvstore.NewKVStore(0)` (the KV store skips snapshots when `maxRaftState <= 0`). This is mainly useful in tests: group A is fully fixed, so compaction no longer has to be avoided for safety reasons.
 
 ## Architecture
 
@@ -101,12 +101,12 @@ type InstallSnapshotArgs struct {
 }
 ```
 
-> **Warning**: In the production binary this RPC is never sent. The leader-side send path (`sendSnapshotToPeer` in raft/rpc.go) requires a `raft.Snapshotter` wired via `RaftNode.SetSnapshotter`, but main.go never calls it (and `persistence.KVSnapshotter` does not implement the `raft.Snapshotter` interface), so the leader silently skips the send and a follower behind the compaction boundary can never catch up. See ../KNOWN_ISSUES.md (A6).
+> **Note**: This RPC used to be dead code in the production binary — the leader-side send path (`sendSnapshotToPeer` in raft/rpc.go) needs a `raft.Snapshotter` and main.go never registered one. `d0cbdc1` wires `persistence.NewRaftSnapshotter` through `raftNode.SetSnapshotter` (main.go:255, 273), so the send fires in production (A6, fixed).
 
 #### 4. KV Store Integration (kvstore/store.go)
 
 - Automatic snapshot creation after N commands
-- Snapshot installation from apply channel (implemented, but broken: it unmarshals the data as a plain `map[string]string`, which fails for the V2 format `{"kv_data":...,"sessions":...}` that production snapshots are saved in, and it never persists the installed snapshot to disk — see ../KNOWN_ISSUES.md (A6, A8))
+- Snapshot installation from apply channel — `parseSnapshotBytes` (kvstore/store.go) accepts the V2 format `{"kv_data":...,"sessions":...}` and falls back to the legacy bare `map[string]string`, and `installSnapshotFromApplyMsg` persists the installed snapshot when a snapshotter is configured (A6, A8, fixed in `c516f54`)
 - State serialization/deserialization
 
 ## Snapshot Lifecycle
@@ -153,7 +153,7 @@ When a node is far behind or joins the cluster, the design intent is:
 [Follower catches up with recent entries]
 ```
 
-> **Warning**: This flow does not currently work end to end. (a) The leader never sends the RPC in production because no `raft.Snapshotter` is wired (A6). (b) The receiver keeps log entries after `LastIncludedIndex` without checking their terms, so a diverged suffix from an old leader can survive (A7). (c) Even when the RPC is delivered (e.g. in tests), the KV store fails to unmarshal V2-format snapshot data, and the Raft layer has already truncated its log and advanced CommitIndex/LastApplied by then (A6). (d) The installed snapshot is never written to disk on the follower, so a crash right after installation loses the state permanently (A8). See ../KNOWN_ISSUES.md (A6, A7, A8).
+> **Note**: This flow now works end to end. The four defects it used to have are all fixed: the production snapshotter is wired so the leader actually sends (A6), the receiver applies the §7 retention rule instead of keeping a divergent suffix (A7, `019d33e` — see "Follower discards conflicting log entries" above, implemented by `logAfterSnapshot` in raft/log.go), the KV store parses the V2 snapshot format (A6), and the installed snapshot is persisted on the follower (A8). The remaining gap is liveness, not safety: the handler holds `rs.mu` across the `applyCh` send (B3). See ../KNOWN_ISSUES.md.
 
 ### 3. Recovery Process
 
@@ -173,7 +173,7 @@ On node restart:
 [Node fully recovered]
 ```
 
-> **Warning**: The last two steps are not implemented correctly. The KV store does restore its data from `snapshot.json`, and Raft reloads `raft_state.json` (including the snapshot metadata), but the volatile state is reinitialized to `CommitIndex=0, LastApplied=0` instead of `LastIncludedIndex` (raft/state.go), and `applyEntries` indexes the log as `Log[LastApplied-1]` — a slice position, not an absolute index. After a restart with a compacted log this leads to re-application of entries already in the snapshot, mis-indexed applies, or an out-of-range panic. See ../KNOWN_ISSUES.md (A5).
+> **Note**: These last two steps used to be wrong: volatile state was reinitialized to `CommitIndex=0, LastApplied=0` instead of the snapshot boundary, and `applyEntries` indexed the log by slice position. `8ad5367` makes `loadPersistentState` restore both from `LastIncludedIndex` (raft/state.go) and routes `applyEntries` through `slicePos` with a range guard (A5, fixed).
 
 ## File Structure
 
@@ -287,7 +287,7 @@ Log indices: [1001, 1002, ...]
                ↑ Still starts from actual index, not 0!
 ```
 
-> **Warning**: Only the entries' `Index` *fields* keep their absolute values, and only the leader-side replication code (`replicateToPeer` in raft/rpc.go) translates absolute indices into post-truncation slice positions. The AppendEntries/RequestVote handlers, `updateCommitIndex`, and `applyEntries` still treat `len(Log)` and slice offsets as the log index, so every other code path disagrees with this diagram after compaction. See ../KNOWN_ISSUES.md (A1, A2, A4, A5).
+> **Note**: Every path now agrees with this diagram. Absolute indices are the single representation throughout the package, and the conversion to a post-truncation slice position happens only through the `slicePos`/`logTermAt`/`lastAbsLogIndex` helpers in raft/log.go — used by the AppendEntries/RequestVote handlers, `updateCommitIndex`, and `applyEntries` alike (A1, A2, A4, A5, fixed in `8ad5367`).
 
 ### Concurrent Snapshots
 
@@ -302,7 +302,7 @@ InstallSnapshot RPC is intended to be used when:
 - New node joins cluster
 - Node recovers from long partition
 
-> **Warning**: With the default main.go wiring the leader detects these cases but never actually sends the RPC, because no `raft.Snapshotter` is registered (`sendSnapshotToPeer` returns immediately when the snapshotter is nil). A leader that has compacted its log therefore cannot even heartbeat such followers. See ../KNOWN_ISSUES.md (A3, A6).
+> **Note**: `sendSnapshotToPeer` still returns immediately when no snapshotter is registered, but main.go now registers one (`raftNode.SetSnapshotter`, main.go:273), so a leader with a compacted log does send to followers behind the boundary (A3, A6, fixed).
 
 ## Troubleshooting
 
@@ -361,7 +361,7 @@ Tests (tests/unit/snapshot_test.go) cover:
 
 ### Integration Tests
 
-One integration test exists, `TestInstallSnapshotCatchUp` in tests/integration/snapshot_compaction_test.go. It covers leader-side log compaction (`TriggerSnapshot`/`TruncateLogTo`) and snapshot transfer to a late-joining follower — but only with a mock `raft.Snapshotter` wired manually via `SetSnapshotter`, which the production binary does not do (see ../KNOWN_ISSUES.md, A6). Automatic snapshot creation through the KV store and recovery from a snapshot after restart are not covered by integration tests.
+`TestInstallSnapshotCatchUp` (tests/integration/snapshot_compaction_test.go) covers leader-side log compaction (`TriggerSnapshot`/`TruncateLogTo`) and snapshot transfer to a late-joining follower, using a mock `raft.Snapshotter`. `tests/integration/snapshot_kvstore_wiring_test.go` covers the production wiring path that the mock used to bypass, and the receiver's §7 retention rule is covered by `TestInstallSnapshotDiscardsDivergentSuffix` and its siblings in raft/installsnapshot_internal_test.go. Automatic snapshot creation through the KV store and recovery from a snapshot after restart are still not covered by integration tests.
 
 ## Monitoring Metrics
 
@@ -378,4 +378,4 @@ Key metrics to track:
 
 ## Conclusion
 
-Log compaction through snapshotting is essential for long-term operation of a Raft system, and the building blocks (snapshot persistence, log truncation, InstallSnapshot RPC) exist in Rosetta. However, the implementation is currently incomplete: index handling after truncation, InstallSnapshot wiring, follower-side installation, and post-restart recovery all have known defects that break Raft's safety guarantees once compaction fires (see ../KNOWN_ISSUES.md, A1-A8). Rosetta is a learning-oriented implementation; until these are fixed, compaction should be considered unsafe to rely on.
+Log compaction through snapshotting is essential for long-term operation of a Raft system, and Rosetta implements it: snapshot persistence, log truncation, the InstallSnapshot RPC, unified absolute indexing, production wiring, follower-side persistence, and the §7 retention rule on the receiver (A1-A8, all fixed). What remains on this path is a liveness defect rather than a safety one — the InstallSnapshot handler holds `rs.mu` across its `applyCh` send, so a slow state machine stalls the node (B3, see ../KNOWN_ISSUES.md). Rosetta is a learning-oriented implementation and is not production-ready.

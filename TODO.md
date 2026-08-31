@@ -27,32 +27,31 @@ This document tracks planned features and enhancements for the Rosetta distribut
 
 ## High Priority Features 🔴
 
-### 1. Log Compaction / Snapshotting — Rework
+### 1. Log Compaction / Snapshotting — Rework ✅ Complete
 **Priority:** 🔴 High
 **Estimated Effort:** Large (2-3 weeks)
-**Status:** Implemented but broken — needs rework (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md), group A)
+**Status:** Done — group A in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) has no open safety issue
 
 **Description:**
-An initial implementation exists (`raft/snapshot.go`, InstallSnapshot RPC, KVStore
-auto-snapshot), but the safety review confirmed the absolute/relative index
-conversion is only handled on the leader's send path. The receive, vote, commit,
-and apply paths are unaware of `LastIncludedIndex`, and the snapshotter is not
-wired into the Raft node in production. Compaction must stay disabled
-(`MaxRaftState=0`) until this is reworked.
+The rework is finished. The safety review had found that absolute/relative index
+conversion was handled only on the leader's send path, that the snapshotter was
+never wired in production, and that the InstallSnapshot receiver kept a divergent
+suffix. All of that is fixed; compaction no longer has to be avoided for safety.
 
-**Requirements:**
-- Unify absolute/relative index handling across ALL paths (receive, vote, commit, apply)
-- Wire `raft.Snapshotter` in production (`main.go`) with a compatible snapshot format
-- Persist follower-side snapshots received via InstallSnapshot
-- Term check for retained log suffix on InstallSnapshot (paper §7)
-- Restore `LastApplied`/`CommitIndex` from snapshot on restart
+**Requirements:** (all met)
+- [x] Unify absolute/relative index handling across ALL paths (receive, vote, commit, apply) — `8ad5367`
+- [x] Wire `raft.Snapshotter` in production (`main.go`) with a compatible snapshot format — `d0cbdc1`, `c516f54`
+- [x] Persist follower-side snapshots received via InstallSnapshot — `c516f54`
+- [x] Term check for retained log suffix on InstallSnapshot (paper §7) — `019d33e`
+- [x] Restore `LastApplied`/`CommitIndex` from snapshot on restart — `8ad5367`
 
-**Implementation Steps:**
-1. Fix index handling in AppendEntries receive path and vote paths
-2. Fix commit/apply paths and volatile-state restoration
-3. Wire the snapshotter and fix the snapshot format mismatch
-4. Persist follower-side snapshots
-5. Add the integration tests proposed in `docs/safety-review-2026-07-07.md`
+**Follow-up (not part of this item):**
+- B3 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): the InstallSnapshot receiver sends to
+  `applyCh` while holding `rs.mu`, so a slow state machine stalls the node. Same
+  root cause as item 2.5 below and best fixed together.
+- Integration coverage for automatic snapshot creation through the KV store and
+  for recovery from a snapshot after restart is still missing
+  (`docs/log-compaction.md`, Testing section).
 
 **Related Files:**
 - `raft/snapshot.go` (new)
@@ -263,7 +262,7 @@ Basic backup functionality exists via `FileStorage.CopyTo()` method.
 ### 6. Read Optimization
 **Priority:** 🟡 Medium
 **Estimated Effort:** Medium (1-2 weeks)
-**Status:** Partially Implemented — lease-based local reads exist but have confirmed linearizability gaps (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md), group D). ReadIndex is the recommended replacement.
+**Status:** Partially Implemented — ReadIndex gives linearizable leader reads and the old lease-based path was removed (group D closed, `b3b21a4`/`60fd631`). Follower reads with bounded staleness and a per-request consistency level are still open.
 
 **Description:**
 Optimize read operations to reduce latency and increase throughput.
@@ -532,8 +531,8 @@ Create official client libraries for easy integration.
 - [x] Basic Raft implementation
 - [x] Key-value operations
 - [x] Persistence
-- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed
-- [ ] Log compaction reworked and wired
+- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (group A/B1/B2/C/D done; B3, E1, E2 remain)
+- [x] Log compaction reworked and wired
 - [ ] Monitoring
 - [x] Documentation verified against code (2026-07 overhaul)
 - [ ] Test coverage 80%+
@@ -579,5 +578,5 @@ If you'd like to contribute to any of these features:
 
 ---
 
-Last Updated: 2026-07-21
+Last Updated: 2026-08-31
 Maintained by: Rosetta Development Team
