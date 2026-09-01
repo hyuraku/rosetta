@@ -13,7 +13,7 @@ Distributed key-value store implementing the Raft consensus algorithm in Go — 
 Things that will waste your time if you don't know them:
 
 - **`make bench` and `go test -bench` find nothing.** There are no Go `Benchmark*` functions in this repo. Benchmarking is an external HTTP-level tool: `cd examples/benchmark && go build benchmark.go && ./benchmark -nodes=http://localhost:9080`.
-- **`MaxRaftState=0` (compaction disabled) is the only safe configuration.** The InstallSnapshot receiver retains a divergent suffix without a term check (`KNOWN_ISSUES.md` A7 — a Log Matching violation). Don't enable compaction to "try something out".
+- **Compaction no longer has an open safety issue, but it can stall a node.** A7 (the InstallSnapshot receiver keeping a divergent suffix) is fixed in `019d33e`, so group A is clear. `KNOWN_ISSUES.md` B3 remains on the same receive path: the handler sends to `applyCh` while holding `rs.mu`, so a slow state machine freezes RPCs and the election timer. Also note `MaxRaftState=0` is not settable — `Validate` rejects it (`config/config.go:123-125`), despite older docs suggesting it as a workaround.
 - **Reads fail immediately after an election, on purpose.** A newly elected leader appends a current-term no-op; until that commits, reads return `ErrNoCurrentTermCommit`. This is correct ReadIndex behavior, not a bug to fix.
 - **Writes only go to the leader.** PUT/DELETE against a follower return HTTP 503 with redirect information. Tests that hit an arbitrary node will flake.
 - **`RaftState.ResetElectionTimer()` must be called on every valid AppendEntries.** Missing it produces spurious elections that look like network problems.

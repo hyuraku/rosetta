@@ -1033,13 +1033,13 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
 | B2 | AppendEntries の無条件切り詰め | ✅ **修正済み**（`7151e77`、§5.3 step 3 準拠の conflict ベース切り詰め） |
 | B3 | rs.mu 保持のまま applyCh 送信 | ❌ 未修正（現仕様。安全だが liveness 課題） |
 | A1–A6, A8 | 圧縮の index 体系（受信/投票/NextIndex/commit/apply/復元）・本番配線・フォロワー永続化 | ✅ **修正済み**（A1–A5 `8ad5367` / A6 `d0cbdc1`+`c516f54` / A8 `c516f54`） |
-| A7 | InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持（Log Matching 違反） | ❌ 未修正 |
+| A7 | InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持（Log Matching 違反） | ✅ **修正済み**（`019d33e`、論文 §7 Figure 13 の受信ルール 6/7 を実装） |
 | C1/C2/C4 | 投票・term 更新の persist 欠如、ロード失敗時の起動継続 | ✅ **修正済み**（`2a35ce9`） |
 | C3 | persist() のエラー無視 | ✅ **修正済み**（RPC 応答経路は `2a35ce9`。リーダー自身の `AppendLogEntry`/`TruncateLogAfter`/当選時 no-op は `ffc2926` でロールバック＋エラー通知） |
 | D1–D5 | lease 期間・起点、no-op 不在（D1–D3）、重複検出未配線（D4）、spurious leadership lost（D5） | ✅ **修正済み**（D1/D2 `b3b21a4`、D3 `60fd631`、D4 `52afd48`、D5 `16a9b31`） |
 | E1–E2 | ロック外タイマーリセット、スライス共有 | ❌ 未修正 |
 
-> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです。安全性の指摘の大半（B1・B2・A1–A6/A8・C1–C4・D1–D5）は別 PR で修正済み。残る未修正は A7（圧縮受信側の Log Matching 違反）・B3（applyCh ブロッキング送信の liveness）・E1・E2（data race）のみです。
+> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです。安全性の指摘（B1・B2・A1–A8・C1–C4・D1–D5）はすべて別 PR で修正済みで、Raft の安全性そのものを破る既知の経路は残っていません。残る未修正は B3（applyCh ブロッキング送信の liveness）・E1・E2（data race）のみです。**本文の第 12 章「InstallSnapshot RPC 受信側」にある A7 の指摘は 9a90cf5 当時の記述であり、現在は解消済み**です。
 
 ---
 
@@ -1150,7 +1150,7 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
   api / persistence / log-compaction / raft-paper-implementation-status）は全記述をコードと
   突き合わせて修正した
 - **KNOWN_ISSUES.md を新設**: safety-review の全項目の「生きたステータス表」。本書執筆後に
-  B1（9a90cf5）と C1/C2/C4（2a35ce9 = PR #11）・C3（ffc2926）が修正済み。
+  B1（9a90cf5）と C1/C2/C4（2a35ce9 = PR #11）・C3（ffc2926）・A 群全体（A7 は `019d33e`）が修正済み。
   上の「停電すると投票記録が消える」は**現在は修正済み**である
 - **再発防止**: 各 doc に「最終検証: 日付 / commit」ヘッダを付け、CLAUDE.md に
   「挙動変更と doc 更新は同一 PR」の規約を追加した

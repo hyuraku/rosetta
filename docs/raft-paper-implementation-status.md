@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-08-28 / 対象 commit `ffc2926`
+> 最終検証: 2026-08-31 / 対象 commit `019d33e`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（および `docs/safety-review-2026-07-07.md`）に集約されています。
 
@@ -10,16 +10,16 @@
 |---------|------|------|
 | リーダー選挙 (Section 5.2) | ⚠️ ほぼ準拠 | 基本動作は実装済み。当選時に current-term no-op を追記（D3 解消）。圧縮後の投票判定も絶対 index 化済み（A2 解消・commit `8ad5367`）。残る懸念は E1（ロック外 `ResetElectionTimer` の data race） |
 | ログ複製 (Section 5.3) | ✅ 実装済み（fast rollback 含む） | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）も完了 |
-| 安全性保証 (Section 5.4) | ⚠️ A7 が残る | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。残る違反経路は A7（InstallSnapshot 受信側の Log Matching 違反）のみ |
+| 安全性保証 (Section 5.4) | ✅ 既知の違反経路なし | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。最後に残っていた A7（InstallSnapshot 受信側の Log Matching 違反）も解消（`019d33e`） |
 | 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`AppendLogEntry`/`TruncateLogAfter`/当選時 no-op）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`） |
-| ログコンパクション (Section 7) | ⚠️ A7 が残る（他は解消） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化を解消（A1–A6, A8・commit `8ad5367`/`d0cbdc1`/`c516f54`）。残る安全性課題は A7 のみ（`MaxRaftState=0` 推奨は A7 が残る限り維持） |
+| ログコンパクション (Section 7) | ✅ 安全性課題は解消（liveness は B3） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。残るは B3（受信ハンドラが `rs.mu` 保持のまま `applyCh` へ送信）の liveness のみ |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応 |
 | クライアント相互作用 (Section 8) | ✅ 配線済み（at-most-once） | 重複検知（ClientID/SeqNum）を実 API 経路へ配線し at-most-once 化（D4 解消・commit `52afd48`）。コミット済みは log index で解決（D5 解消・`16a9b31`） |
 | 読み取り専用クエリ最適化 | ✅ 線形化実装 | ReadIndex プロトコル + 当選時 no-op で linearizable read を実装。旧リース方式は撤去（D1〜D3 解消） |
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照）
 
-> **現在の未修正（安全性）**: A7（InstallSnapshot 受信側の Log Matching 違反）・B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信 = liveness）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）。論文の安全性性質そのものを破る既知の経路は残っていないが、本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -130,7 +130,7 @@ type AppendEntriesReply struct {
 
 ---
 
-### 3. 安全性保証 (Section 5.4) ⚠️ A7 が残る
+### 3. 安全性保証 (Section 5.4) ✅ 既知の違反経路なし
 
 #### 論文の要件
 - **選挙安全性**: 各任期で最大1人のリーダー
@@ -156,7 +156,7 @@ if args.LastLogTerm > lastLogTerm ||
 
 - **選挙安全性**: 投票の応答前 persist（commit `2a35ce9`）により、クラッシュ跨ぎの二重投票は防止されます
 - **リーダー追記のみ**: リーダーの通常経路では満たされます
-- **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。残る違反経路は InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持する A7 のみ。see ../KNOWN_ISSUES.md (A7)
+- **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。最後に残っていた InstallSnapshot 受信側の分岐 suffix 保持も §7 の保持ルール実装で解消（A7・`019d33e`）。既知の違反経路はありません
 - **リーダー完全性 (Leader Completeness)**: 選挙制限が絶対 index でスナップショットメタデータを考慮するようになり（A2 解消・commit `8ad5367`）、圧縮後もコミット済みエントリを持たないノードは当選しません。加えて当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されます。
 - **状態機械安全性**: 上記が発火しない限り成立
 
@@ -204,7 +204,7 @@ type Persister interface {
 
 ---
 
-### 5. ログコンパクション / スナップショット (Section 7) ⚠️ A7 が残る（他は解消）
+### 5. ログコンパクション / スナップショット (Section 7) ✅ 安全性課題は解消（残るは B3 の liveness）
 
 #### 論文の要件
 - スナップショットで状態機械の状態をキャプチャ
@@ -244,7 +244,7 @@ type ApplyMsg struct {
 }
 ```
 
-RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`）・リーダー送信側のインデックス変換に加え、受信・投票・コミット・適用の各経路と本番配線・フォロワー側永続化も解消されました。**残る安全性課題は A7（InstallSnapshot 受信側の Log Matching 違反）のみ**です:
+RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`）・リーダー送信側のインデックス変換に加え、受信・投票・コミット・適用の各経路、本番配線、フォロワー側永続化、受信側の §7 保持ルールがすべて解消されました。**グループ A に未修正の安全性課題はありません**:
 
 - **受信ハンドラの圧縮後 index 対応 (A1・✅ 解消)**: `AppendEntries` ハンドラは `PrevLogIndex` を `LastIncludedIndex` オフセットに合わせて絶対 index として扱うようになりました。修正 commit `8ad5367`
 - **投票経路の絶対 index 化 (A2・✅ 解消)**: `RequestVote`/`startElection` が `LastIncludedIndex/Term` を含む絶対 index で候補者ログの新しさを評価します。修正 commit `8ad5367`
@@ -252,10 +252,10 @@ RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`�
 - **コミット判定の絶対 index 化 (A4・✅ 解消)**: `updateCommitIndex` が絶対 last index でコミットを前進させ、リーダー圧縮後もコミットが停止しません。修正 commit `8ad5367`
 - **再起動時の LastApplied 復元 (A5・✅ 解消)**: `loadPersistentState` が CommitIndex/LastApplied をスナップショットから復元し、範囲外ガードも入りました。二重適用・範囲外 panic は解消されています。修正 commit `8ad5367`
 - **本番構成で InstallSnapshot が配線済み (A6・✅ 解消)**: `RaftSnapshotter` を `SetSnapshotter` で本番配線し、型アサーションでインターフェース互換を担保、V2 形式もパースします。修正 commit `d0cbdc1` + `c516f54`
-- **受信側が分岐 suffix を term 検査なしで保持 (A7・❌ 未修正)**: `InstallSnapshot` ハンドラは `LastIncludedIndex` 超のエントリを無条件保持し、論文 §7 の「最終エントリと index/term 両方一致なら以降を保持、さもなくば全破棄」に違反します（`raft/rpc.go` の InstallSnapshot ハンドラ）。see ../KNOWN_ISSUES.md (A7)
+- **受信側の §7 保持ルール (A7・✅ 解消)**: `InstallSnapshot` ハンドラは `logAfterSnapshot`（`raft/log.go`）を通し、自ログの `LastIncludedIndex` が index/term ともにスナップショットと一致するときだけ以降を保持し、不一致（および照合対象を持たないほど遅れている場合）はログを全破棄します。論文 §7 Figure 13 の受信ルール 6/7 準拠。修正 commit `019d33e`
 - **フォロワー側スナップショットの永続化 (A8・✅ 解消)**: `installSnapshotFromApplyMsg` が `saveSnapshot` でフォロワー側スナップショットをディスクに永続化します。修正 commit `c516f54`
 
-see ../KNOWN_ISSUES.md (A1〜A8)。A7 が残る限り、当面の安全な運用は `MaxRaftState=0`（圧縮無効）です。
+see ../KNOWN_ISSUES.md (A1〜A8)。残るのは B3（受信ハンドラが `rs.mu` 保持のまま `applyCh` へブロッキング送信）で、これは安全性ではなく liveness の課題です。なお `MaxRaftState=0`（圧縮無効）は設定として指定できません（`Config.Validate` が正数を強制）。
 
 ---
 
@@ -344,7 +344,7 @@ type KVStore struct {
 - **重複検知が配線済み (D4・✅ 解消)**: HTTP ハンドラ（PUT/DELETE）が ClientID/SeqNum を読み取り、`executeCommand` の dedup（`cmd.ClientID != ""` で発動）に渡すようになりました。タイムアウト後のリトライは at-most-once 化されています。修正 commit `52afd48`。see ../KNOWN_ISSUES.md (D4)
 - **結果受領後の spurious エラーを解消 (D5・✅ 解消)**: コミット済みの操作は log index で解決し、ロール変化後も結果を返すようになったため、適用成功後に "leadership lost" を返して不要リトライを誘発することはなくなりました。修正 commit `16a9b31`。see ../KNOWN_ISSUES.md (D5)
 
-このため、論文 Section 8 の重複検知（at-most-once）要件は実 API 経路で満たされるようになりました。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。ただし本プロジェクトは教育用途であり、A7・B3・E1・E2 が残る点は変わりません。
+このため、論文 Section 8 の重複検知（at-most-once）要件は実 API 経路で満たされるようになりました。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。ただし本プロジェクトは教育用途であり、B3・E1・E2 が残る点は変わりません。
 
 ---
 
@@ -385,7 +385,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 - リース方式にあったクロック依存・過半数喪失時の step-down 欠如がなくなりました。孤立した旧リーダーは `confirmLeadership` が過半数 ACK を得られず `ErrLeadershipNotConfirmed` を返し、stale 値を返しません。より高い term を見たら `stepDown` します。D1/D2 解消（commit `b3b21a4`）。see ../KNOWN_ISSUES.md (D1, D2)
 - 当選時 no-op（`becomeLeader`）により、新リーダーは前任 term のコミット済みエントリを advance してから読みを許可します。D3 解消（commit `60fd631`）。see ../KNOWN_ISSUES.md (D3)
 
-**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、他グループ（A7・B3・ログ圧縮まわり等）の未修正項目が残る点は変わりません。
+**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、B3（liveness）・E1・E2（data race）の未修正項目が残る点は変わりません。
 
 ---
 
@@ -395,7 +395,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 
 ### 高優先度（安全性違反の解消）
 1. ✅ **AppendEntries step 3 の一致確認**（解消済み） — 既存エントリと index/term が一致する場合は切り詰めない conflict ベース切り詰めを実装（B2・commit `7151e77`）
-2. **ログコンパクションの残課題** — 絶対/相対インデックスの統一・投票/コミット/適用経路・`raft.Snapshotter` の本番配線・フォロワー側スナップショット永続化は解消済み（A1–A6, A8・commit `8ad5367`/`d0cbdc1`/`c516f54`）。**残るは A7（InstallSnapshot 受信側の Log Matching 違反）のみ**。A7 が残る限り暫定策は `MaxRaftState=0` で圧縮無効化
+2. **ログコンパクション** — 絶対/相対インデックスの統一・投票/コミット/適用経路・`raft.Snapshotter` の本番配線・フォロワー側スナップショット永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。**グループ A に未修正項目なし**。残るのは B3（受信ハンドラの `rs.mu` 保持下ブロッキング送信）で、TODO.md の「2.5. Decouple Log Application into a Dedicated Applier Goroutine」と同じ根
 3. ✅ **当選時 no-op の導入とリース設計の見直し**（解消済み） — 当選時 no-op（`becomeLeader`、commit `60fd631`）と ReadIndex 方式（`b3b21a4`）を実装し、旧リース機構を撤去（D1〜D3）
 4. ✅ **重複検知の実配線**（解消済み） — HTTP API 経路への ClientID/SeqNum の受け渡し（D4・commit `52afd48`）と、結果受領時の正しい応答処理（D5・commit `16a9b31`）を実装
 
