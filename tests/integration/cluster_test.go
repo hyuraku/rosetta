@@ -382,6 +382,7 @@ func TestConcurrentCommands(t *testing.T) {
 	timeout := time.NewTimer(2 * time.Second)
 	defer timeout.Stop()
 
+waitLoop:
 	for i := 0; i < numCommands; i++ {
 		select {
 		case success := <-done:
@@ -390,7 +391,7 @@ func TestConcurrentCommands(t *testing.T) {
 			}
 		case <-timeout.C:
 			t.Error("Timeout waiting for concurrent commands")
-			break
+			break waitLoop
 		}
 	}
 
