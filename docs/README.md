@@ -1,6 +1,6 @@
 # Documentation Index
 
-> Last verified: 2026-07-21 against commit `9383cfe`.
+> Last verified: 2026-09-06 against commit `d370c72`.
 
 Rosetta is an educational Raft implementation. Every document listed here is
 verified against the code at the commit noted in its "Last verified" header —
@@ -23,6 +23,7 @@ Documentation Discipline section in [CLAUDE.md](../CLAUDE.md)).
 ## Analysis & Learning
 
 - **[Safety Review (2026-07-07)](safety-review-2026-07-07.md)** — frozen point-in-time safety review report; the detailed evidence behind KNOWN_ISSUES. Do not edit — status changes go to KNOWN_ISSUES.md
+- **[Raft Re-Audit (2026-09-06)](raft-audit-2026-09-06.md)** — frozen re-audit report against commit `d370c72`; found 16 additional problems (Group R in KNOWN_ISSUES.md). Do not edit — status changes go to KNOWN_ISSUES.md
 - **[Codebase Textbook](textbook.md)** — in-depth guided walkthrough of the implementation
 
 ## Development

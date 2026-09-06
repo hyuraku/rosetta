@@ -1,25 +1,25 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-08-31 / 対象 commit `019d33e`
+> 最終検証: 2026-09-06 / 対象 commit `d370c72`
 
-本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（および `docs/safety-review-2026-07-07.md`）に集約されています。
+本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
 ## 概要サマリー
 
 | カテゴリ | 状態 | 備考 |
 |---------|------|------|
-| リーダー選挙 (Section 5.2) | ⚠️ ほぼ準拠 | 基本動作は実装済み。当選時に current-term no-op を追記（D3 解消）。圧縮後の投票判定も絶対 index 化済み（A2 解消・commit `8ad5367`）。残る懸念は E1（ロック外 `ResetElectionTimer` の data race） |
-| ログ複製 (Section 5.3) | ✅ 実装済み（fast rollback 含む） | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）も完了 |
-| 安全性保証 (Section 5.4) | ✅ 既知の違反経路なし | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。最後に残っていた A7（InstallSnapshot 受信側の Log Matching 違反）も解消（`019d33e`） |
-| 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`AppendLogEntry`/`TruncateLogAfter`/当選時 no-op）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`） |
-| ログコンパクション (Section 7) | ✅ 安全性課題は解消（liveness は B3） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。残るは B3（受信ハンドラが `rs.mu` 保持のまま `applyCh` へ送信）の liveness のみ |
-| クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応 |
-| クライアント相互作用 (Section 8) | ✅ 配線済み（at-most-once） | 重複検知（ClientID/SeqNum）を実 API 経路へ配線し at-most-once 化（D4 解消・commit `52afd48`）。コミット済みは log index で解決（D5 解消・`16a9b31`） |
+| リーダー選挙 (Section 5.2) | ⚠️ 要修正あり | 基本動作は実装済み。当選時に current-term no-op を追記（D3 解消）。圧縮後の投票判定も絶対 index 化済み（A2 解消・commit `8ad5367`）。残る懸念は E1（ロック外 `ResetElectionTimer` の data race）と R6（降格経路が `ResetElectionTimer` を呼ばず選挙タイマーが再始動しない） |
+| ログ複製 (Section 5.3) | ⚠️ 要修正あり | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）は完了。ただし境界 term 検査・commit 上限の一部分岐が未検証（R13、`raft/rpc.go:153-163,191-194`） |
+| 安全性保証 (Section 5.4) | ❌ 要修正あり | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。しかし 2026-09-06 再監査で Log Matching（R1: `Start` の leader 確認と append が別臨界区間）・Leader Completeness（R2: 未永続エントリの duplicate ACK）・State Machine Safety（R1 に加え R3–R5 の snapshot 世代不整合）に確認済みの問題がある |
+| 永続化 (Figure 2) | ⚠️ 要修正あり | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`AppendLogEntry`/`TruncateLogAfter`/当選時 no-op）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。ただし AppendEntries の受信経路には C3 の範囲外の問題が残る（R2: 未永続の merge 結果を再送時に `Success=true` で ACK しうる） |
+| ログコンパクション (Section 7) | ❌ 要修正あり | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。ただし 2026-09-06 再監査で新たに: Raft state と KV snapshot の世代整合性がない（R3）、snapshot のメタデータと実データが別世代になりうる（R4）、古い snapshot による KV 状態の後退を防ぐガードがない（R5）ことを確認。B3（`rs.mu` 保持下の `applyCh` 送信、liveness）も残る |
+| クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応（R14）。`-join` は失敗してもログのみで起動を続ける fail-open（R12） |
+| クライアント相互作用 (Section 8) | ⚠️ 条件付きで配線済み | 重複検知（ClientID/SeqNum）を実 API 経路へ配線（D4 解消・commit `52afd48`）。ただし dedup は `ClientID` を指定した場合のみ発動する条件付きで（`kvstore/store.go:386`）、無条件の at-most-once ではない。committed 済みの結果解決は log index ではなく opID ベースで、pending 登録のタイミング競合（R9）がある。batch API は実装されておらず空 PUT として黙って成功する（R11） |
 | 読み取り専用クエリ最適化 | ✅ 線形化実装 | ReadIndex プロトコル + 当選時 no-op で linearizable read を実装。旧リース方式は撤去（D1〜D3 解消） |
 
-（A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照）
+（A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信 = liveness）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）。論文の安全性性質そのものを破る既知の経路は残っていないが、本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信 = liveness）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）に加え、2026-09-06 再監査で確認されたグループ R（R1–R6, R9–R18、計 16 件）。R1（Log Matching）・R2（Leader Completeness/永続化）・R3–R5（State Machine Safety・snapshot 世代整合）は Raft の安全性そのものに関わる確認済みの問題であり、「論文の安全性性質を破る既知の経路は残っていない」とは言えない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -130,7 +130,7 @@ type AppendEntriesReply struct {
 
 ---
 
-### 3. 安全性保証 (Section 5.4) ✅ 既知の違反経路なし
+### 3. 安全性保証 (Section 5.4) ❌ 要修正あり（R1, R2, R3–R5）
 
 #### 論文の要件
 - **選挙安全性**: 各任期で最大1人のリーダー
@@ -152,17 +152,17 @@ if args.LastLogTerm > lastLogTerm ||
 }
 ```
 
-選挙制限そのものと、現 term のエントリのみをコミットカウントする §5.4.2 規則（`updateCommitIndex`, `raft/rpc.go:529-531`）は実装済みです。ただし各安全性特性の実際の成立状況は以下の通りです:
+選挙制限そのものと、現 term のエントリのみをコミットカウントする §5.4.2 規則（`updateCommitIndex`, `raft/rpc.go:540-548`）は実装済みです。ただし各安全性特性の実際の成立状況は以下の通りです:
 
 - **選挙安全性**: 投票の応答前 persist（commit `2a35ce9`）により、クラッシュ跨ぎの二重投票は防止されます
 - **リーダー追記のみ**: リーダーの通常経路では満たされます
-- **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。最後に残っていた InstallSnapshot 受信側の分岐 suffix 保持も §7 の保持ルール実装で解消（A7・`019d33e`）。既知の違反経路はありません
-- **リーダー完全性 (Leader Completeness)**: 選挙制限が絶対 index でスナップショットメタデータを考慮するようになり（A2 解消・commit `8ad5367`）、圧縮後もコミット済みエントリを持たないノードは当選しません。加えて当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されます。
-- **状態機械安全性**: 上記が発火しない限り成立
+- **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。InstallSnapshot 受信側の分岐 suffix 保持も §7 の保持ルール実装で解消（A7・`019d33e`）。ただし 2026-09-06 再監査（R1）により、`RaftNode.Start`（`raft/node.go:99-116`）が leader/term の確認と `AppendLogEntry`（`raft/log.go:93-111`）の durable append を別の `rs.mu` 臨界区間で行っていることが確認された。両者の間に降格・高 term 化が挟まると、非 leader になった後でも command が append されうる。既知の違反経路が残っている
+- **リーダー完全性 (Leader Completeness)**: 選挙制限が絶対 index でスナップショットメタデータを考慮するようになり（A2 解消・commit `8ad5367`）、圧縮後もコミット済みエントリを持たないノードは当選しません。加えて当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されます。一方 R2（`raft/rpc.go:180-196,447-450`）により、persist に失敗した AppendEntries の再送が `mergeLogEntries` の「既に一致」判定で persist をスキップし `Success=true` を返すため、未永続のエントリが `MatchIndex` に反映されうる
+- **状態機械安全性**: 上記（R1, R2）に加え、R3–R5（Raft state と KV snapshot の世代不整合、snapshot メタデータ/ペイロードの別世代化、古い snapshot による KV 状態の後退）が発火しない限り成立
 
 ---
 
-### 4. 永続化 (Figure 2) ✅ 概ね実装済み
+### 4. 永続化 (Figure 2) ⚠️ 要修正あり（R2）
 
 #### 論文の要件
 - `currentTerm`, `votedFor`, `log[]` は永続化必須
@@ -191,20 +191,20 @@ type Persister interface {
 ```
 
 **応答前 persist 規律**（commit `2a35ce9` で確立）:
-- `RequestVote`: term/投票の変更を persist してから応答。persist 失敗時は投票を取り消す（`raft/rpc.go:101-106`）
-- `AppendEntries`: term 変更・追記エントリを persist してから `Success=true` を返す。失敗時は `Success=false`（`raft/rpc.go:136-142`, `:179-182`）
-- `startElection`: 立候補（term+1・自己投票）を persist できなければ選挙を中止（`raft/rpc.go:200-212`）
+- `RequestVote`: term/投票の変更を persist してから応答。**persist 失敗時にメモリ上の VotedFor を「取り消す」ことはしない** — VotedFor はセットされたまま `VoteGranted=false` のみ返す。これは同一 term 内の再投票を防ぐ意図的な安全側の設計（`raft/rpc.go:94-104`。KNOWN_ISSUES.md 注記 3 も参照）
+- `AppendEntries`: term 変更を persist してから応答する。失敗時は `Success=false`（`raft/rpc.go:134-140`）。追記エントリの persist も応答前に行われ、失敗時は `Success=false` のまま return する（`raft/rpc.go:185-188`）。ただし `mergeLogEntries` 自体はメモリ上の追記を先に行ってから persist するため、persist 失敗時にメモリの追記がロールバックされない。再送された同一要求はこの未永続の追記と一致するため `mergeLogEntries` が `false` を返し、persist を経ずに `Success=true` で応答してしまう（R2、`raft/rpc.go:180-196`）
+- `startElection`: 立候補（term+1・自己投票）を persist できなければ選挙を中止（`raft/rpc.go:232-250`）
 - 永続状態のロード失敗時は起動を拒否（`raft/state.go:157-161`, `raft/node.go:29-34`）
 
 **リーダー自身の追記経路**（commit `ffc2926` で C3 を解消）:
-- `AppendLogEntry` は `(int, error)` を返す。persist に失敗したら追記をロールバックし（メモリとディスクを一致させる）、エラーを返す（`raft/log.go`）
-- `TruncateLogAfter` は `error` を返す。persist に失敗したら切り詰め前のログを復元する（`raft/log.go`）
-- 当選時 no-op（`appendNoOpLocked`）も persist 失敗時はロールバック。no-op を失っても安全側で、current-term のエントリがコミットされるまで読み取りが `ErrNoCurrentTermCommit` を返し続けるだけ（`raft/noop.go`）
-- `RaftNode.Start` はエラーを返し、KV 層はタイムアウトを待たずに操作を失敗させる（`raft/node.go`, `kvstore/store.go`）
+- `AppendLogEntry` は `(int, error)` を返す。persist に失敗したら追記をロールバックし（メモリとディスクを一致させる）、エラーを返す（`raft/log.go:93-111`）
+- `TruncateLogAfter` は `error` を返す。persist に失敗したら切り詰め前のログを復元する（`raft/log.go:163-180`）
+- 当選時 no-op（`appendNoOpLocked`）も persist 失敗時はロールバック。no-op を失っても安全側で、current-term のエントリがコミットされるまで読み取りが `ErrNoCurrentTermCommit` を返し続けるだけ（`raft/noop.go:48-61`）
+- `RaftNode.Start` はエラーを返し、KV 層はタイムアウトを待たずに操作を失敗させる（`raft/node.go:99-116`, `kvstore/store.go:598-609`）。ただし R1（`raft/node.go:99-116`）: leader/term の確認と `AppendLogEntry` は別の `rs.mu` 臨界区間であり、両者の間に降格が挟まると非 leader が append しうる
 
 ---
 
-### 5. ログコンパクション / スナップショット (Section 7) ✅ 安全性課題は解消（残るは B3 の liveness）
+### 5. ログコンパクション / スナップショット (Section 7) ❌ 要修正あり（R3–R5 の safety、B3 の liveness）
 
 #### 論文の要件
 - スナップショットで状態機械の状態をキャプチャ
@@ -244,7 +244,7 @@ type ApplyMsg struct {
 }
 ```
 
-RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`）・リーダー送信側のインデックス変換に加え、受信・投票・コミット・適用の各経路、本番配線、フォロワー側永続化、受信側の §7 保持ルールがすべて解消されました。**グループ A に未修正の安全性課題はありません**:
+RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`）・リーダー送信側のインデックス変換に加え、受信・投票・コミット・適用の各経路、本番配線、フォロワー側永続化、受信側の §7 保持ルールがすべて解消されました。**グループ A に未修正の安全性課題はありません**が、2026-09-06 の再監査でこの経路に新たな安全性課題（R3–R5）が見つかっています:
 
 - **受信ハンドラの圧縮後 index 対応 (A1・✅ 解消)**: `AppendEntries` ハンドラは `PrevLogIndex` を `LastIncludedIndex` オフセットに合わせて絶対 index として扱うようになりました。修正 commit `8ad5367`
 - **投票経路の絶対 index 化 (A2・✅ 解消)**: `RequestVote`/`startElection` が `LastIncludedIndex/Term` を含む絶対 index で候補者ログの新しさを評価します。修正 commit `8ad5367`
@@ -255,7 +255,14 @@ RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`�
 - **受信側の §7 保持ルール (A7・✅ 解消)**: `InstallSnapshot` ハンドラは `logAfterSnapshot`（`raft/log.go`）を通し、自ログの `LastIncludedIndex` が index/term ともにスナップショットと一致するときだけ以降を保持し、不一致（および照合対象を持たないほど遅れている場合）はログを全破棄します。論文 §7 Figure 13 の受信ルール 6/7 準拠。修正 commit `019d33e`
 - **フォロワー側スナップショットの永続化 (A8・✅ 解消)**: `installSnapshotFromApplyMsg` が `saveSnapshot` でフォロワー側スナップショットをディスクに永続化します。修正 commit `c516f54`
 
-see ../KNOWN_ISSUES.md (A1〜A8)。残るのは B3（受信ハンドラが `rs.mu` 保持のまま `applyCh` へブロッキング送信）で、これは安全性ではなく liveness の課題です。なお `MaxRaftState=0`（圧縮無効）は設定として指定できません（`Config.Validate` が正数を強制）。
+see ../KNOWN_ISSUES.md (A1〜A8)。ただし残る問題として:
+
+- **R3（未修正）Raft state と KV snapshot の世代不整合**: Raft 側の境界 persist（`raft/rpc.go:658-665`）と KV 側の `saveSnapshot`（`kvstore/store.go:352-357`）は別段階で行われ、2 ファイル間の世代整合性（atomicity）がありません。片方だけ保存できた状態で crash すると不整合が残ります
+- **R4（未修正）snapshot メタデータとペイロードの別世代化**: leader 送信側で `LastIncludedIndex`/`LastIncludedTerm`（`raft/rpc.go:379-406`、ロック内）と実データ（`:502-512` の `snapshotter.ReadSnapshot()`、ロック外）を別々のタイミングで読むため、両者が別世代になりえます
+- **R5（未修正）古い snapshot による KV 状態の後退**: Raft 側は新旧を `LastIncludedIndex` としか比較せず（`raft/rpc.go:635-637`）、KV 側 `installSnapshotFromApplyMsg` は適用済みインデックスとの比較なしに無条件で state を置換します（`kvstore/store.go:340-344`）。遅延・重複配送された古い snapshot が KV 状態を後退させうるガードの欠如です
+- B3（受信ハンドラが `rs.mu` 保持のまま `applyCh` へブロッキング送信）は安全性ではなく liveness の課題として残ります
+
+なお `MaxRaftState=0`（圧縮無効）は設定として指定できません（`Config.Validate` が正数を強制）。詳細は KNOWN_ISSUES.md グループ R（R3, R4, R5）を参照。
 
 ---
 
@@ -280,11 +287,13 @@ func (cm *ClusterManager) LeaveCluster()
 - Joint Consensus未実装
 - メンバーシップ変更中の安全性保証なし
 
-❌ **実装が必要**
+さらに、`-join` フラグ（`main.go:285-289`）は失敗してもログ出力のみで起動を継続する fail-open であり、`ClusterManager` に登録されたノードは Raft の quorum には反映されません（R12）。`StartDiscovery`（`network/discovery.go:99`）は通常起動経路から呼ばれず、実用的な参加経路は存在しません。
+
+❌ **実装が必要（R14: joint consensus、R12: join の fail-open）**
 
 ---
 
-### 7. クライアント相互作用 (Section 8) ✅ 配線済み
+### 7. クライアント相互作用 (Section 8) ⚠️ 条件付きで配線済み
 
 #### 論文の要件
 - クライアントはリーダーにコマンドを送信
@@ -324,8 +333,8 @@ type KVStore struct {
 }
 ```
 
-**重複検知ロジック** (`kvstore/store.go:executeCommand`):
-- ClientIDが設定されている場合、重複チェックを実行
+**重複検知ロジック** (`kvstore/store.go:executeCommand`, `:384-400`):
+- `cmd.ClientID != ""` の場合のみ重複チェックを実行（`:386`）。**ClientID が空のリクエストは dedup 対象外**で、そのまま実行されます
 - `SeqNum < LastSeqNum`: 古いリクエスト → エラー返却
 - `SeqNum == LastSeqNum`: 重複リクエスト → キャッシュから結果返却
 - `SeqNum > LastSeqNum`: 新しいリクエスト → 実行してセッション更新
@@ -341,10 +350,12 @@ type KVStore struct {
 
 上記の重複検知機構は kvstore 内に実装され、**実際の HTTP API 経路にも配線されました**:
 
-- **重複検知が配線済み (D4・✅ 解消)**: HTTP ハンドラ（PUT/DELETE）が ClientID/SeqNum を読み取り、`executeCommand` の dedup（`cmd.ClientID != ""` で発動）に渡すようになりました。タイムアウト後のリトライは at-most-once 化されています。修正 commit `52afd48`。see ../KNOWN_ISSUES.md (D4)
-- **結果受領後の spurious エラーを解消 (D5・✅ 解消)**: コミット済みの操作は log index で解決し、ロール変化後も結果を返すようになったため、適用成功後に "leadership lost" を返して不要リトライを誘発することはなくなりました。修正 commit `16a9b31`。see ../KNOWN_ISSUES.md (D5)
+- **重複検知が配線済み (D4・✅ 解消)**: HTTP ハンドラ（PUT/DELETE）が ClientID/SeqNum を読み取り、`executeCommand` の dedup（`cmd.ClientID != ""` で発動）に渡すようになりました。修正 commit `52afd48`。see ../KNOWN_ISSUES.md (D4)。ただし dedup が効くのは **ClientID を指定したリクエストに限られる**条件付きの at-most-once であり、無条件の保証ではありません
+- **結果受領後の spurious エラーを解消 (D5・✅ 解消)**: 適用成功後に "leadership lost" を返して不要リトライを誘発する経路はなくなりました。修正 commit `16a9b31`。see ../KNOWN_ISSUES.md (D5)。ただし結果の解決は log index ではなく `opID`（`kvstore/store.go:583`、`<nodeID>-<UnixNano>`）ベースで、`raft.Start` 呼び出し（`:598`）と `pendingOps` への登録（`:611-614`）の間に committed→applied が完了すると結果が握りつぶされ、実際には成功した操作が client 側で timeout 扱いになりえます（R9）
+- クライアント側（`kvstore/client.go`）は `seqNum` を採番した後に送信 mutex を解放するため（`:80-91`）、並行呼び出しの到着順を保証しません。また timeout やネットワークエラー時に操作が実際に適用されたかどうかを呼び出し元に伝える契約がありません（R10）
+- `Client.Batch`（`kvstore/client.go:216-240`）が送る `POST /kv/batch` に対応するサーバー側ルートは存在せず、`/kv/` prefix ハンドラで空 PUT として処理され `success:true` を返します。batch は実装されていません（R11）
 
-このため、論文 Section 8 の重複検知（at-most-once）要件は実 API 経路で満たされるようになりました。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。ただし本プロジェクトは教育用途であり、B3・E1・E2 が残る点は変わりません。
+このため、論文 Section 8 の重複検知要件は「ClientID を指定した場合の at-most-once」という条件付きで実 API 経路に配線されています。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。本プロジェクトは教育用途であり、B3・E1・E2 に加え R9〜R11 が残る点は変わりません。
 
 ---
 
@@ -391,18 +402,28 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 
 ## 実装優先度の推奨
 
-修正の詳細な推奨順序は `docs/safety-review-2026-07-07.md` を参照。概要:
+2026-07-07 報告書に基づく修正はすべて完了した（下記 1–4）。現在の推奨順は
+2026-09-06 再監査（`docs/raft-audit-2026-09-06.md` §6）のロードマップに従う。詳細な優先度・行番号は
+`KNOWN_ISSUES.md` の「グループ R」および「修正の推奨順序」を参照。
 
-### 高優先度（安全性違反の解消）
+### 2026-07-07 報告書分（解消済み）
 1. ✅ **AppendEntries step 3 の一致確認**（解消済み） — 既存エントリと index/term が一致する場合は切り詰めない conflict ベース切り詰めを実装（B2・commit `7151e77`）
-2. **ログコンパクション** — 絶対/相対インデックスの統一・投票/コミット/適用経路・`raft.Snapshotter` の本番配線・フォロワー側スナップショット永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。**グループ A に未修正項目なし**。残るのは B3（受信ハンドラの `rs.mu` 保持下ブロッキング送信）で、TODO.md の「2.5. Decouple Log Application into a Dedicated Applier Goroutine」と同じ根
+2. ✅ **ログコンパクション（グループ A）** — 絶対/相対インデックスの統一・投票/コミット/適用経路・`raft.Snapshotter` の本番配線・フォロワー側スナップショット永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。**グループ A に未修正項目なし**（ただし 2026-09-06 再監査で同じ経路に R3–R5 の新規安全性課題が見つかっている）
 3. ✅ **当選時 no-op の導入とリース設計の見直し**（解消済み） — 当選時 no-op（`becomeLeader`、commit `60fd631`）と ReadIndex 方式（`b3b21a4`）を実装し、旧リース機構を撤去（D1〜D3）
-4. ✅ **重複検知の実配線**（解消済み） — HTTP API 経路への ClientID/SeqNum の受け渡し（D4・commit `52afd48`）と、結果受領時の正しい応答処理（D5・commit `16a9b31`）を実装
+4. ✅ **重複検知の実配線**（解消済み・条件付き） — HTTP API 経路への ClientID/SeqNum の受け渡し（D4・commit `52afd48`）と、"leadership lost" spurious エラーの解消（D5・commit `16a9b31`）を実装。ただし dedup は ClientID 指定時のみで、opID ベースの結果解決には R9 が残る
 
-### 低優先度
-5. **クラスタメンバーシップ変更**
-   - Joint Consensus実装
-   - 運用中のクラスタ拡張/縮小が必要な場合のみ
+### 2026-09-06 再監査分（未修正、`docs/raft-audit-2026-09-06.md` §6 のロードマップ順）
+1. 現状訂正のみ（本 PR）
+2. CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go:393` の
+   timeout `break` を修正（R17）
+3. R1、R2 — P0
+4. R3–R5（snapshot の世代整合・復旧・適用順序） — P0
+5. R6、E1/E2、peer replication worker（タイマー・リーダー参照の統一） — P1
+6. B3（受信ハンドラの `rs.mu` 保持下ブロッキング送信）の ordered applier と shutdown lifecycle
+7. R9–R13（KV/client/API/RPC 細部） — P1
+8. R15（chunk transfer） — P2
+9. R14（joint consensus: state → quorum → 管理 API → snapshot の順） — P2
+10. R16–R18（設定、CI 監視、examples/benchmark） — P3
 
 ---
 

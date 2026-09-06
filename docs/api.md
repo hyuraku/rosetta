@@ -1,6 +1,6 @@
 # API Documentation
 
-> Last verified: 2026-07-22 against commit `d1838d5` (+ ReadIndex reads on this branch).
+> Last verified: 2026-09-06 against commit `d370c72`.
 
 This document provides detailed information about the Rosetta HTTP API.
 
@@ -176,7 +176,10 @@ Get the current status of the Raft node.
 - `node_id`: Unique identifier for this node
 - `term`: Current term number
 - `is_leader`: Whether this node is currently the leader
-- `log_size`: Index of the last log entry (number of entries in the log)
+- `log_size`: The absolute index of the last log entry (`raft/node.go:142-144`), **not**
+  a count of entries currently held in memory. After log compaction, entries below
+  the snapshot boundary are gone but `log_size` still reports the absolute index,
+  so it is not "the number of entries in the log."
 
 Fields such as `state`, `commit_index`, or `leader_id` are not exposed by this endpoint.
 
@@ -228,6 +231,18 @@ curl http://localhost:9080/leader
 
 ---
 
+### No Batch Endpoint
+
+`kvstore/client.go`'s `Client.Batch`/`PutBatch`/`GetBatch` send `POST /kv/batch`,
+but the server registers no route for it. The request matches the `/kv/` prefix
+handler instead and is treated as a plain PUT: the batch's `operations` field is
+not a field of `PutArgs{Key,Value}`, so it decodes to an empty key/value and is
+stored as an empty-string PUT, returning `{"success":true}`. Batch operations are
+**not implemented** and silently do the wrong thing rather than failing loudly.
+See ../KNOWN_ISSUES.md (R11).
+
+---
+
 ## Error Handling
 
 ### Common Error Codes
@@ -252,7 +267,18 @@ Not leader. Current leader: <leader-id>
 
 The leader is identified by its node ID only; clients must map node IDs to HTTP addresses themselves. Clients should retry the request against the leader node.
 
-> **Warning:** Retrying a write after a timeout or leader change can apply the same operation twice — the duplicate-detection mechanism exists in the store but is not wired into the HTTP API, and a spurious `leadership lost` error can be returned after a write was in fact committed. See ../KNOWN_ISSUES.md (D4, D5).
+> **Warning:** The duplicate-detection mechanism (`client_id`/`seq_num`) is wired
+> into the HTTP API (D4, fixed) and a write no longer returns a spurious
+> `leadership lost` after it was in fact committed (D5, fixed). But two caveats
+> remain: dedup only applies when the request carries a non-empty `client_id`
+> (`kvstore/store.go:386`) — a request without one gets no duplicate protection,
+> so retrying it after a timeout can still apply the operation twice. And the
+> committed result is matched against a per-request `opID`
+> (`kvstore/store.go:583`, `<nodeID>-<UnixNano>`) registered in `pendingOps`
+> *after* the entry is appended to the Raft log (`kvstore/store.go:598-614`); if
+> the entry is committed and applied before that registration completes, the
+> result is dropped and the client sees a timeout for an operation that in fact
+> succeeded. See ../KNOWN_ISSUES.md (D4, D5, R9).
 
 ## Client Implementation Pattern
 

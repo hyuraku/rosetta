@@ -107,7 +107,7 @@ echo ""
 
 for port in 9080 9081 9082; do
     if [ "$HAS_JQ" = true ]; then
-        demo_cmd "curl -s http://localhost:$port/status | jq '{node_id, state, term, is_leader, log_length}'"
+        demo_cmd "curl -s http://localhost:$port/status | jq '{node_id, term, is_leader, log_size}'"
     else
         demo_cmd "curl -s http://localhost:$port/status"
     fi
@@ -121,17 +121,18 @@ echo ""
 
 demo_cmd "curl -s http://localhost:9080/leader"
 
+# /leader only returns {"leader": "<node-id>"} — there is no address field.
+# Clients must map the node ID to an HTTP address themselves (here, via the
+# fixed port list this script started the cluster with).
 LEADER_INFO=$(curl -s http://localhost:9080/leader)
 if [ "$HAS_JQ" = true ]; then
-    LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader_id')
-    LEADER_ADDR=$(echo $LEADER_INFO | jq -r '.leader_addr')
+    LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader')
 else
     # Simple extraction without jq
-    LEADER_ID=$(echo $LEADER_INFO | grep -o '"leader_id":"[^"]*"' | cut -d'"' -f4)
-    LEADER_ADDR=$(echo $LEADER_INFO | grep -o '"leader_addr":"[^"]*"' | cut -d'"' -f4)
+    LEADER_ID=$(echo $LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
 fi
 
-echo -e "${GREEN}Current leader is: $LEADER_ID at $LEADER_ADDR${NC}"
+echo -e "${GREEN}Current leader is: $LEADER_ID${NC}"
 pause
 
 # Step 5: Fault Tolerance - Kill a Follower
@@ -214,9 +215,9 @@ echo ""
 
 LEADER_INFO=$(curl -s http://localhost:9080/leader)
 if [ "$HAS_JQ" = true ]; then
-    LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader_id')
+    LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader')
 else
-    LEADER_ID=$(echo $LEADER_INFO | grep -o '"leader_id":"[^"]*"' | cut -d'"' -f4)
+    LEADER_ID=$(echo $LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
 fi
 
 # Find leader port
@@ -243,9 +244,9 @@ for port in 9080 9081 9082; do
     if curl -s http://localhost:$port/status > /dev/null 2>&1; then
         NEW_LEADER_INFO=$(curl -s http://localhost:$port/leader 2>/dev/null || echo '{}')
         if [ "$HAS_JQ" = true ]; then
-            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | jq -r '.leader_id // "unknown"')
+            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | jq -r '.leader // "unknown"')
         else
-            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | grep -o '"leader_id":"[^"]*"' | cut -d'"' -f4)
+            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
             [ -z "$NEW_LEADER_ID" ] && NEW_LEADER_ID="unknown"
         fi
         if [ "$NEW_LEADER_ID" != "unknown" ] && [ "$NEW_LEADER_ID" != "null" ]; then
@@ -306,18 +307,16 @@ for port in 9080 9081 9082; do
         STATUS=$(curl -s http://localhost:$port/status)
         if [ "$HAS_JQ" = true ]; then
             NODE_ID=$(echo $STATUS | jq -r '.node_id')
-            STATE=$(echo $STATUS | jq -r '.state')
             IS_LEADER=$(echo $STATUS | jq -r '.is_leader')
         else
             NODE_ID=$(echo $STATUS | grep -o '"node_id":"[^"]*"' | cut -d'"' -f4)
-            STATE=$(echo $STATUS | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
             IS_LEADER=$(echo $STATUS | grep -o '"is_leader":[^,}]*' | cut -d':' -f2)
         fi
 
         if [ "$IS_LEADER" = "true" ]; then
-            echo -e "  ${GREEN}$NODE_ID: $STATE (Leader)${NC}"
+            echo -e "  ${GREEN}$NODE_ID: Leader${NC}"
         else
-            echo -e "  $NODE_ID: $STATE"
+            echo -e "  $NODE_ID: Follower"
         fi
     else
         echo -e "  ${RED}Node on port $port: DOWN${NC}"
