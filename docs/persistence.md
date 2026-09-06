@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-08-28 against commit `ffc2926`.
+> Last verified: 2026-09-06 against commit `d370c72`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -9,12 +9,15 @@ This document describes the persistence feature implemented in Rosetta, which pr
 The persistence layer ensures that:
 - Raft state (term, votedFor, log, snapshot metadata) survives node crashes
 - KV store snapshots are preserved across restarts
-- All persisted writes are atomic (temp file + rename) and fsynced
+- All persisted writes are atomic (temp file + rename) and fsynced, **per file** — see
+  the current-constraints warning below for what this does not cover
 
-> **Warning**: Snapshots received by a follower via InstallSnapshot are applied
-> in memory only and are not persisted to disk, so a crash after log compaction
-> can make part of the state unrecoverable on that node.
-> See ../KNOWN_ISSUES.md (A8).
+> **Current constraint**: Raft state (`raft_state.json`) and the KV snapshot
+> (`snapshot.json`) are two separate files, saved in separate steps
+> (`raft/rpc.go:658-665` persists the Raft snapshot boundary; `kvstore/store.go:352-357`
+> saves the KV snapshot). Each file is atomically written on its own, but there is
+> **no atomicity across the two files** — a crash between the two saves can leave
+> them at different generations. See ../KNOWN_ISSUES.md (R3).
 
 ## Architecture
 
@@ -220,9 +223,9 @@ contain a plain `{"key": "value", ...}` map.
    - KVStore restores key-value data (and sessions, for V2 snapshots)
 4. **Resume Operation**: Node continues from recovered state
 
-> **Warning**: Raft's volatile `LastApplied` is not restored from the snapshot
-> metadata on restart. After the log has been compacted, recovery can re-apply
-> or misindex entries. See ../KNOWN_ISSUES.md (A5).
+Raft's volatile `CommitIndex`/`LastApplied` are restored from the snapshot boundary
+on restart (`raft/state.go:182-183`, `loadPersistentState`), so recovery does not
+re-apply or misindex entries below the snapshot (A5, fixed).
 
 ### Recovery Guarantees
 
@@ -232,9 +235,12 @@ contain a plain `{"key": "value", ...}` map.
 - **Ordering**: Log entries maintain correct order
 - **Idempotency**: Safe to restart multiple times
 
-> **Warning**: These guarantees do not cover snapshots a follower receives via
-> InstallSnapshot — those are not written to disk, so state covered only by
-> such a snapshot is lost on crash. See ../KNOWN_ISSUES.md (A8).
+A snapshot a follower receives via InstallSnapshot is now persisted to disk too:
+`installSnapshotFromApplyMsg` (`kvstore/store.go:354-357`) calls `saveSnapshot`
+whenever a snapshotter is configured, so a follower restart recovers state that
+arrived only via InstallSnapshot (A8, fixed). This still shares the cross-file
+caveat above (R3): the Raft-side boundary and the KV-side snapshot are saved in
+separate steps with no atomicity between them.
 
 ### Testing Recovery
 
@@ -331,9 +337,11 @@ chmod 600 ./data/node1/*
 
 - **Log Compaction**: Implemented. After a snapshot is saved, the Raft log is
   truncated up to the snapshot boundary and the compacted state is persisted.
-- **Snapshot Transfer (InstallSnapshot)**: The RPC exists in the Raft layer,
-  but the production binary never wires a `raft.Snapshotter`, so leaders never
-  send snapshots to lagging followers. See ../KNOWN_ISSUES.md (A6).
+- **Snapshot Transfer (InstallSnapshot)**: The production binary wires a
+  `raft.Snapshotter` (`persistence.NewRaftSnapshotter`, `main.go:273`), so a
+  leader with a compacted log does send InstallSnapshot to lagging followers
+  (A6, fixed). See `docs/log-compaction.md` for the current constraints on this
+  path (R3–R5).
 
 ## Future Enhancements
 
@@ -374,6 +382,10 @@ automatically by the apply loop.
 
 The persistence feature provides durability for Rosetta's Raft state and KV
 snapshots, allowing nodes to recover from crashes along the normal log path.
-Known gaps remain around follower-side snapshot durability and snapshot
-transfer wiring — see ../KNOWN_ISSUES.md (A8, A6) before relying on recovery
-in compaction scenarios.
+Follower-side snapshot durability (A8) and snapshot-transfer wiring (A6) are
+fixed. What remains is that the Raft-state file and the KV-snapshot file are
+written in separate steps with no cross-file atomicity (R3), snapshot metadata
+and payload can be read from different generations on the send path (R4), and
+there is no guard against an older snapshot rolling back committed KV state
+(R5) — see ../KNOWN_ISSUES.md before relying on recovery in compaction
+scenarios.

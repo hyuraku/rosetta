@@ -1,10 +1,10 @@
 # Log Compaction and Snapshotting
 
-> Last verified: 2026-08-31 against commit `019d33e`.
+> Last verified: 2026-09-06 against commit `d370c72`.
 
 This document describes the log compaction and snapshotting features in Rosetta, which are intended to prevent unbounded log growth and enable efficient operation over long periods.
 
-> **Status**: The safety issues that made compaction unusable are now fixed. Absolute-index handling is unified across the receive, vote, commit, and apply paths (A1-A5, `8ad5367`), the snapshotter is wired in the production binary and the V2 snapshot format parses (A6, `d0cbdc1`/`c516f54`), follower-side snapshots are persisted (A8, `c516f54`), and the InstallSnapshot receiver now applies the paper's §7 retention rule instead of keeping a divergent suffix (A7, `019d33e`). One issue remains on this path and it is a **liveness** one, not a safety one: the InstallSnapshot handler sends to `applyCh` while holding `rs.mu`, so a slow state machine stalls the node's RPCs and election timer (B3). See ../KNOWN_ISSUES.md.
+> **Status**: The index/wiring defects that made compaction unusable are fixed. Absolute-index handling is unified across the receive, vote, commit, and apply paths (A1-A5, `8ad5367`), the snapshotter is wired in the production binary and the V2 snapshot format parses (A6, `d0cbdc1`/`c516f54`), follower-side snapshots are persisted (A8, `c516f54`), and the InstallSnapshot receiver applies the paper's §7 retention rule instead of keeping a divergent suffix (A7, `019d33e`). A 2026-09-06 re-audit (`docs/raft-audit-2026-09-06.md`, frozen) found new **safety** gaps on this same path: the Raft-state boundary persist and the KV snapshot save are separate, non-atomic steps (R3, `raft/rpc.go:658-665` / `kvstore/store.go:352-357`); the leader can read snapshot metadata and payload from different generations (R4, `raft/rpc.go:379-406,502-512`); and nothing stops an older snapshot from rolling back committed KV state (R5, `raft/rpc.go:635-637` / `kvstore/store.go:340-344`). B3 (the InstallSnapshot handler sends to `applyCh` while holding `rs.mu`, stalling RPCs and the election timer under a slow state machine) remains a separate **liveness** issue. See ../KNOWN_ISSUES.md.
 
 ## Overview
 
@@ -59,7 +59,7 @@ This means log compaction fires automatically during normal operation once 1000 
 
 Automatic snapshots **cannot be disabled through configuration**: `Config.Validate()` (config/config.go) rejects `max_raft_state <= 0` with `"max_raft_state must be positive"`, so a config file containing `"max_raft_state": 0` prevents the node from starting. There is also no command-line flag for it, so nodes started with flags always run with the default of 1000.
 
-Snapshotting can only be disabled programmatically, by constructing the store with `kvstore.NewKVStore(0)` (the KV store skips snapshots when `maxRaftState <= 0`). This is mainly useful in tests: group A is fully fixed, so compaction no longer has to be avoided for safety reasons.
+Snapshotting can only be disabled programmatically, by constructing the store with `kvstore.NewKVStore(0)` (the KV store skips snapshots when `maxRaftState <= 0`). This is mainly useful in tests: group A's index/wiring defects are fully fixed, but the 2026-09-06 re-audit found new safety gaps in the compaction path itself (R3–R5, see ../KNOWN_ISSUES.md), so disabling snapshots for a test that must avoid those specific issues is still a reasonable choice.
 
 ## Architecture
 
@@ -153,7 +153,7 @@ When a node is far behind or joins the cluster, the design intent is:
 [Follower catches up with recent entries]
 ```
 
-> **Note**: This flow now works end to end. The four defects it used to have are all fixed: the production snapshotter is wired so the leader actually sends (A6), the receiver applies the §7 retention rule instead of keeping a divergent suffix (A7, `019d33e` — see "Follower discards conflicting log entries" above, implemented by `logAfterSnapshot` in raft/log.go), the KV store parses the V2 snapshot format (A6), and the installed snapshot is persisted on the follower (A8). The remaining gap is liveness, not safety: the handler holds `rs.mu` across the `applyCh` send (B3). See ../KNOWN_ISSUES.md.
+> **Note**: This flow works end to end for the four defects it used to have: the production snapshotter is wired so the leader actually sends (A6), the receiver applies the §7 retention rule instead of keeping a divergent suffix (A7, `019d33e` — see "Follower discards conflicting log entries" above, implemented by `logAfterSnapshot` in raft/log.go), the KV store parses the V2 snapshot format (A6), and the installed snapshot is persisted on the follower (A8). Two kinds of gaps remain: a liveness one (B3 — the handler holds `rs.mu` across the `applyCh` send), and safety ones found by the 2026-09-06 re-audit — the leader can read the snapshot's metadata and its payload from different generations (R4), and neither side guards against installing a snapshot older than what has already been applied (R5). See ../KNOWN_ISSUES.md.
 
 ### 3. Recovery Process
 
@@ -302,7 +302,7 @@ InstallSnapshot RPC is intended to be used when:
 - New node joins cluster
 - Node recovers from long partition
 
-> **Note**: `sendSnapshotToPeer` still returns immediately when no snapshotter is registered, but main.go now registers one (`raftNode.SetSnapshotter`, main.go:273), so a leader with a compacted log does send to followers behind the boundary (A3, A6, fixed).
+> **Note**: `sendSnapshotToPeer` still returns immediately when no snapshotter is registered, but main.go now registers one (`raftNode.SetSnapshotter`, main.go:273), so a leader with a compacted log does send to followers behind the boundary (A3, A6, fixed). The metadata (`LastIncludedIndex`/`LastIncludedTerm`) is captured under `rs.mu.RLock` in `replicateToPeer` (`raft/rpc.go:379-406`) before the RPC is dispatched, while the actual snapshot bytes are read later via `snapshotter.ReadSnapshot()` outside that lock (`raft/rpc.go:502-512`) — if a new snapshot is taken in between, the metadata and payload sent to the follower can belong to different generations (R4, see ../KNOWN_ISSUES.md).
 
 ## Troubleshooting
 
@@ -334,7 +334,10 @@ Planned improvements:
 
 1. **Compression**: Compress snapshot data
 2. **Incremental Snapshots**: Only save changed data
-3. **Streaming**: Stream large snapshots in chunks
+3. **Streaming**: Stream large snapshots in chunks. `InstallSnapshotArgs` currently
+   carries the whole snapshot in one `Data []byte` field with no offset/done
+   fields for chunking, resumption, or bounding memory use on large snapshots —
+   see ../KNOWN_ISSUES.md (R15)
 4. **Background Creation**: Async snapshot without blocking
 5. **Configurable Triggers**: Time-based or size-based
 6. **Snapshot Verification**: Checksum validation
@@ -378,4 +381,4 @@ Key metrics to track:
 
 ## Conclusion
 
-Log compaction through snapshotting is essential for long-term operation of a Raft system, and Rosetta implements it: snapshot persistence, log truncation, the InstallSnapshot RPC, unified absolute indexing, production wiring, follower-side persistence, and the §7 retention rule on the receiver (A1-A8, all fixed). What remains on this path is a liveness defect rather than a safety one — the InstallSnapshot handler holds `rs.mu` across its `applyCh` send, so a slow state machine stalls the node (B3, see ../KNOWN_ISSUES.md). Rosetta is a learning-oriented implementation and is not production-ready.
+Log compaction through snapshotting is essential for long-term operation of a Raft system, and Rosetta implements it: snapshot persistence, log truncation, the InstallSnapshot RPC, unified absolute indexing, production wiring, follower-side persistence, and the §7 retention rule on the receiver (A1-A8, all fixed). What remains on this path is a mix of a liveness defect and confirmed safety gaps: the InstallSnapshot handler holds `rs.mu` across its `applyCh` send, so a slow state machine stalls the node (B3); and a 2026-09-06 re-audit found that the Raft-state and KV-snapshot files are saved with no cross-file atomicity (R3), that snapshot metadata and payload can be sent from different generations (R4), and that neither side guards against an older snapshot rolling back committed state (R5) — see ../KNOWN_ISSUES.md. Rosetta is a learning-oriented implementation and is not production-ready.
