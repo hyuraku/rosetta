@@ -65,19 +65,24 @@ chmod +x start.sh
 ### 1. Check Cluster Status
 
 ```bash
-# Check each node's status
+# Check each node's status (fields: node_id, term, is_leader, log_size)
 curl http://localhost:9080/status | jq
 curl http://localhost:9081/status | jq
 curl http://localhost:9082/status | jq
 
-# Find the current leader
+# Find the current leader (field: leader — a node ID, e.g. "node2")
 curl http://localhost:9080/leader | jq
 ```
 
 ### 2. Store Data
 
+Writes only succeed against the leader; a follower returns HTTP 503 with an
+`X-Raft-Leader` header naming the leader instead. These examples assume
+node1 (`:9080`) happens to be the leader — check `/leader` first (step 1) and
+substitute the right port if it isn't.
+
 ```bash
-# Write to the cluster
+# Write to the cluster (must be the leader)
 curl -X PUT http://localhost:9080/kv \
   -H "Content-Type: application/json" \
   -d '{"key":"hello","value":"world"}'
@@ -89,17 +94,20 @@ curl -X PUT http://localhost:9080/kv \
 
 ### 3. Read Data
 
+Reads also only succeed against the leader (they go through the ReadIndex
+protocol); a follower returns the same 503 leader redirect as a write. Read
+from the same leader port used above, not from an arbitrary node:
+
 ```bash
-# Read from any node
+# Read from the leader (see step 1 to confirm which port that is)
 curl http://localhost:9080/kv/hello
-curl http://localhost:9081/kv/name
-curl http://localhost:9082/kv/hello
+curl http://localhost:9080/kv/name
 ```
 
 ### 4. Delete Data
 
 ```bash
-# Delete a key
+# Delete a key (leader only, same 503-on-follower caveat as PUT)
 curl -X DELETE http://localhost:9080/kv/hello
 
 # Verify deletion
@@ -138,8 +146,10 @@ curl http://localhost:9080/kv/hello
 
 4. **Verify node catches up:**
    ```bash
-   # Check that node2 has the data
-   curl http://localhost:9081/kv/test
+   # node2 is a follower, so GET against it returns 503 (X-Raft-Leader header),
+   # not the value — there is no read-from-follower path. Verify by reading
+   # through the leader instead (find it with /leader, step 1):
+   curl http://localhost:9080/kv/test
    ```
 
 ### Simulate Leader Failure
@@ -147,7 +157,7 @@ curl http://localhost:9080/kv/hello
 1. **Find and kill the leader:**
    ```bash
    # Find leader
-   LEADER=$(curl -s http://localhost:9080/leader | jq -r '.leader_id')
+   LEADER=$(curl -s http://localhost:9080/leader | jq -r '.leader')
    echo "Leader is: $LEADER"
 
    # Kill the leader node

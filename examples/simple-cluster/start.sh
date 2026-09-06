@@ -81,14 +81,13 @@ for port in 9080 9081 9082; do
     if curl -s http://localhost:$port/status > /dev/null 2>&1; then
         STATUS=$(curl -s http://localhost:$port/status)
         NODE_ID=$(echo $STATUS | jq -r '.node_id')
-        STATE=$(echo $STATUS | jq -r '.state')
         TERM=$(echo $STATUS | jq -r '.term')
         IS_LEADER=$(echo $STATUS | jq -r '.is_leader')
 
         if [ "$IS_LEADER" = "true" ]; then
-            echo -e "${GREEN}✓ $NODE_ID${NC} - State: ${GREEN}$STATE${NC} (Term: $TERM) - HTTP: :$port"
+            echo -e "${GREEN}✓ $NODE_ID${NC} - ${GREEN}Leader${NC} (Term: $TERM) - HTTP: :$port"
         else
-            echo -e "${GREEN}✓ $NODE_ID${NC} - State: $STATE (Term: $TERM) - HTTP: :$port"
+            echo -e "${GREEN}✓ $NODE_ID${NC} - Follower (Term: $TERM) - HTTP: :$port"
         fi
     else
         echo -e "${RED}✗ Node on port $port is not responding${NC}"
@@ -99,7 +98,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 # Get leader info
 LEADER_INFO=$(curl -s http://localhost:9080/leader 2>/dev/null || echo '{}')
-LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader_id // "unknown"')
+LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader // "unknown"')
 
 if [ "$LEADER_ID" != "unknown" ] && [ "$LEADER_ID" != "null" ]; then
     echo ""
