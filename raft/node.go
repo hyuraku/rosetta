@@ -18,6 +18,12 @@ type RaftNode struct {
 	// caller still waits for the goroutines through RaftState.Stop.
 	killOnce sync.Once
 
+	// peerAddrSink receives the cluster configuration's peer addresses when they
+	// change; publishedAddrs is the last set handed to it. Both are guarded by
+	// rn.mu and only touched from the event loop and the setter.
+	peerAddrSink   func(map[string]string)
+	publishedAddrs map[string]string
+
 	logger *log.Logger
 }
 
@@ -95,9 +101,87 @@ func (rn *RaftNode) handleElectionTimeout() {
 }
 
 func (rn *RaftNode) handleTick() {
+	rn.publishPeerAddresses()
 	if rn.state.GetNodeState() == Leader {
 		rn.state.sendHeartbeats(rn.transport)
 	}
+}
+
+// publishPeerAddresses hands the current configuration's peer addresses to the
+// registered sink whenever they have changed, so the transport's address book
+// follows the cluster configuration instead of the -peers flag the process
+// started with (KNOWN_ISSUES.md R14).
+//
+// It runs on the event loop rather than at the point the configuration changes,
+// which keeps it off every lock-holding path: a configuration entry can land in
+// an RPC handler under rs.mu, and calling out to the transport from there would
+// invert the lock order between the Raft state and the transport's own mutex.
+// The cost is that the address book lags a configuration change by at most one
+// tick — harmless, since a peer that cannot be resolved yet is simply retried by
+// the next replication round.
+func (rn *RaftNode) publishPeerAddresses() {
+	rn.mu.Lock()
+	sink := rn.peerAddrSink
+	rn.mu.Unlock()
+	if sink == nil {
+		return
+	}
+
+	addrs := rn.state.PeerAddresses()
+
+	rn.mu.Lock()
+	if samePeerAddresses(rn.publishedAddrs, addrs) {
+		rn.mu.Unlock()
+		return
+	}
+	rn.publishedAddrs = addrs
+	rn.mu.Unlock()
+
+	sink(addrs)
+}
+
+func samePeerAddresses(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if other, ok := b[k]; !ok || other != v {
+			return false
+		}
+	}
+	return true
+}
+
+// SetPeerAddressSink registers a callback that receives the addresses of the
+// other servers in the cluster configuration whenever they change. main.go wires
+// it to the transport's address book. The callback runs on the Raft event loop
+// and must not block or call back into the node.
+func (rn *RaftNode) SetPeerAddressSink(sink func(map[string]string)) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.peerAddrSink = sink
+	rn.publishedAddrs = nil
+}
+
+// SetPeerAddresses records the addresses of servers already in the cluster
+// configuration whose address is not yet known — the fixed -peers startup path.
+func (rn *RaftNode) SetPeerAddresses(addrs map[string]string) {
+	rn.state.SetPeerAddresses(addrs)
+}
+
+// ProposeConfigChange starts a cluster configuration change (paper §6). It must
+// be called on the leader; every other node returns ErrNotLeader so the HTTP
+// layer can redirect. The returned configuration is the joint one that has just
+// been appended — the change is complete only once C_new commits, which the
+// leader drives on its own.
+func (rn *RaftNode) ProposeConfigChange(add bool, nodeID, addr string) (*ClusterConfig, error) {
+	return rn.state.ProposeConfigChange(add, nodeID, addr)
+}
+
+// GetClusterConfig returns the cluster configuration currently in effect on this
+// node.
+func (rn *RaftNode) GetClusterConfig() *ClusterConfig {
+	return rn.state.GetClusterConfig()
 }
 
 func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {

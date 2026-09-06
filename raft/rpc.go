@@ -956,7 +956,8 @@ func (rs *RaftState) stepDownIfHigherTerm(replyTerm int, where string) bool {
 }
 
 // updateCommitIndex advances the leader's commit index over every entry of its
-// own term that a quorum has stored. Callers must hold rs.mu.
+// own term that a quorum has stored, then lets the configuration change (if any)
+// make its next move. Callers must hold rs.mu.
 func (rs *RaftState) updateCommitIndex() {
 	if rs.state != Leader {
 		return
@@ -985,6 +986,12 @@ func (rs *RaftState) updateCommitIndex() {
 			rs.notifyApplierLocked()
 		}
 	}
+
+	// A committed joint configuration is what lets C_new be appended, and a
+	// committed C_new is what lets a removed leader step down. Both are decided
+	// by the commit index, so this is the one place that has to look
+	// (raft/membership.go).
+	rs.advanceConfigChangeLocked()
 }
 
 func SerializeRequestVote(args *RequestVoteArgs) ([]byte, error) {

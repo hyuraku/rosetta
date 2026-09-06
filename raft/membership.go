@@ -15,6 +15,26 @@ import (
 // decode (ApplyMsg.ConfigChange).
 const entryTypeConfig = "config"
 
+// Errors returned by ProposeConfigChange.
+var (
+	// ErrConfigChangeInProgress is returned when a configuration change is
+	// already under way. The paper (§6) allows only one at a time: two
+	// overlapping changes can produce two disjoint majorities and therefore two
+	// leaders in the same term. "Under way" covers both a joint configuration
+	// that has not reached C_new yet and a configuration entry that has been
+	// appended but not yet committed.
+	ErrConfigChangeInProgress = errors.New("a cluster configuration change is already in progress")
+	// ErrNodeAlreadyVoter is returned when adding a node that is already a voter
+	// with the same address.
+	ErrNodeAlreadyVoter = errors.New("node is already a voter in the current configuration")
+	// ErrNodeNotVoter is returned when removing a node that is not in the current
+	// configuration.
+	ErrNodeNotVoter = errors.New("node is not a voter in the current configuration")
+	// ErrLastVoter is returned when removing the last voter, which would leave a
+	// configuration no quorum can ever be formed in.
+	ErrLastVoter = errors.New("refusing to remove the last voter from the configuration")
+)
+
 // ClusterConfig is a Raft cluster configuration (paper §6): the set of servers
 // that vote and whose acknowledgements count towards a commit, together with the
 // address each one is reachable at.
@@ -107,6 +127,19 @@ func (c *ClusterConfig) MemberIDs() []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// Contains reports whether nodeID takes part in this configuration at all
+// (either group).
+func (c *ClusterConfig) Contains(nodeID string) bool {
+	if c == nil {
+		return false
+	}
+	if _, ok := c.Voters[nodeID]; ok {
+		return true
+	}
+	_, ok := c.OldVoters[nodeID]
+	return ok
 }
 
 // IsVoter reports whether nodeID votes in the *new* configuration. It is what
@@ -234,6 +267,18 @@ func (rs *RaftState) configAtIndexLocked(idx int) *ClusterConfig {
 	return rs.persistent.SnapshotConfig.Clone()
 }
 
+// currentConfigLocked returns the configuration in effect and the index of the
+// entry that installed it — LastIncludedIndex when it came from the snapshot
+// boundary, which is committed by construction. Callers must hold rs.mu.
+func (rs *RaftState) currentConfigLocked() (cfg *ClusterConfig, at int) {
+	for i := len(rs.persistent.Log) - 1; i >= 0; i-- {
+		if rs.persistent.Log[i].Type == entryTypeConfig {
+			return rs.persistent.Config, rs.persistent.LastIncludedIndex + i + 1
+		}
+	}
+	return rs.persistent.Config, rs.persistent.LastIncludedIndex
+}
+
 // recomputeConfigLocked re-derives persistent.Config from the log after the log
 // changed (an append, a merge that truncated a conflicting suffix, a
 // truncation, or a snapshot install). Callers must hold rs.mu, and must persist
@@ -282,4 +327,242 @@ func (rs *RaftState) GetClusterConfig() *ClusterConfig {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 	return rs.persistent.Config.Clone()
+}
+
+// PeerAddresses returns the address of every other server in the current
+// configuration. Entries whose address is unknown (a configuration seeded from
+// a bare peer-ID list) are omitted, so a caller can merge the result into an
+// address book without erasing what it already knows.
+func (rs *RaftState) PeerAddresses() map[string]string {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
+	out := make(map[string]string)
+	for id, addr := range rs.persistent.Config.Members() {
+		if id == rs.nodeID || addr == "" {
+			continue
+		}
+		out[id] = addr
+	}
+	return out
+}
+
+// SetPeerAddresses fills in the addresses of servers that are already in the
+// configuration but whose address is not known yet, and persists the result.
+//
+// It exists for the fixed -peers startup path: the Raft layer is handed a list
+// of node IDs, while the addresses live in the process configuration. Attaching
+// them to the cluster configuration is what lets a *newly added* server learn
+// where its peers are from the configuration entry alone. Servers that are not
+// in the configuration are ignored, and an address that is already recorded is
+// never overwritten — the configuration entry the cluster agreed on wins over a
+// local flag.
+func (rs *RaftState) SetPeerAddresses(addrs map[string]string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	changed := rs.fillAddrsLocked(rs.persistent.Config, addrs)
+	// The snapshot boundary's configuration is the fallback the log reverts to,
+	// so it needs the same addresses.
+	changed = rs.fillAddrsLocked(rs.persistent.SnapshotConfig, addrs) || changed
+	if !changed {
+		return
+	}
+	if err := rs.persist(); err != nil {
+		rs.logger.Printf("SetPeerAddresses: persist failed: %v", err)
+	}
+}
+
+// fillAddrsLocked writes addrs into the groups of cfg wherever a member's
+// address is still unknown, and reports whether anything changed. Callers must
+// hold rs.mu.
+func (rs *RaftState) fillAddrsLocked(cfg *ClusterConfig, addrs map[string]string) bool {
+	if cfg == nil {
+		return false
+	}
+	changed := false
+	for _, group := range []map[string]string{cfg.Voters, cfg.OldVoters} {
+		for id, addr := range addrs {
+			if addr == "" || id == rs.nodeID {
+				continue
+			}
+			if existing, ok := group[id]; ok && existing == "" {
+				group[id] = addr
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// ---------------------------------------------------------------------------
+// RaftState: driving a configuration change
+// ---------------------------------------------------------------------------
+
+// appendConfigEntryLocked appends a configuration entry and puts the new
+// configuration into effect in the same critical section, because §6 requires a
+// server to use a configuration "as soon as it is added to its log", not when it
+// commits. Callers must hold rs.mu and must have established that appending is
+// legal (leadership, for the leader-side callers).
+//
+// Both halves are rolled back together when the write fails, so the invariant
+// "persistent.Config is the last configuration entry in the durable log" holds
+// on every return path (the same discipline as appendEntryLocked, R2/C3).
+func (rs *RaftState) appendConfigEntryLocked(cfg *ClusterConfig) (int, error) {
+	encoded, err := cfg.encode()
+	if err != nil {
+		return 0, err
+	}
+
+	prevConfig := rs.persistent.Config
+	rs.persistent.Config = cfg.Clone()
+
+	index, err := rs.appendEntryLocked(encoded, entryTypeConfig)
+	if err != nil {
+		rs.persistent.Config = prevConfig
+		return 0, err
+	}
+	return index, nil
+}
+
+// ProposeConfigChange starts a cluster configuration change on the leader: it
+// appends the joint configuration C_old,new, which takes effect immediately. The
+// rest of the transition is driven by commit progress (see
+// advanceConfigChangeLocked).
+//
+// Removing this node itself is allowed. Per §6 the leader keeps serving until
+// C_new commits and only then steps down, which is what advanceConfigChangeLocked
+// does; refusing self-removal would make a cluster unable to retire its leader.
+//
+// A learner / non-voting catch-up phase is deliberately not implemented
+// (KNOWN_ISSUES.md R20): a server added here counts towards the quorum from the
+// moment C_old,new reaches a log, so adding a server whose log is far behind
+// makes the cluster slower to commit until it catches up.
+func (rs *RaftState) ProposeConfigChange(add bool, nodeID, addr string) (*ClusterConfig, error) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	if rs.state != Leader {
+		return nil, ErrNotLeader
+	}
+	if nodeID == "" {
+		return nil, errors.New("node_id is required")
+	}
+	// §6 relies on the leader knowing which configuration is committed before it
+	// starts the next change, and a leader only knows its own commit index is
+	// current once it has committed an entry of its own term (§5.4.2). The
+	// election no-op makes this true within a heartbeat of every election.
+	if !rs.hasCurrentTermCommittedLocked() {
+		return nil, ErrNoCurrentTermCommit
+	}
+
+	current, at := rs.currentConfigLocked()
+	if current.IsJoint() || at > rs.volatile.CommitIndex {
+		return nil, ErrConfigChangeInProgress
+	}
+
+	newVoters := cloneAddrs(current.Voters)
+	if add {
+		if existing, ok := newVoters[nodeID]; ok && existing == addr {
+			return nil, ErrNodeAlreadyVoter
+		}
+		newVoters[nodeID] = addr
+	} else {
+		if _, ok := newVoters[nodeID]; !ok {
+			return nil, ErrNodeNotVoter
+		}
+		if len(newVoters) == 1 {
+			return nil, ErrLastVoter
+		}
+		delete(newVoters, nodeID)
+	}
+
+	joint := &ClusterConfig{Voters: newVoters, OldVoters: cloneAddrs(current.Voters)}
+	index, err := rs.appendConfigEntryLocked(joint)
+	if err != nil {
+		return nil, err
+	}
+	rs.syncLeaderPeersLocked()
+	rs.logger.Printf("Configuration change started at index %d: joint configuration old=%v new=%v",
+		index, joint.OldVoters, joint.Voters)
+	return joint.Clone(), nil
+}
+
+// advanceConfigChangeLocked drives the two-phase transition of §6 from commit
+// progress. Callers must hold rs.mu and must be on a path that has just moved
+// the commit index (updateCommitIndex).
+//
+//   - once C_old,new is committed, the leader appends C_new. Only from that point
+//     may decisions be made by a majority of the new configuration alone, which
+//     is exactly what appending C_new does (it takes effect on append);
+//   - once C_new is committed, a leader that is not in it steps down. It could
+//     not have stepped down earlier: until C_new commits it is the only server
+//     that can get it committed.
+//
+// Doing this here rather than on the applier means the transition is driven
+// under the same rs.mu that advanced the commit index, so the append of C_new
+// cannot interleave with a demotion; nothing here touches applyCh, and the only
+// lock involved is the one the caller already holds.
+func (rs *RaftState) advanceConfigChangeLocked() {
+	if rs.state != Leader {
+		return
+	}
+	current, at := rs.currentConfigLocked()
+	if current == nil || at > rs.volatile.CommitIndex {
+		return // not committed yet; nothing to do
+	}
+
+	if current.IsJoint() {
+		final := &ClusterConfig{Voters: cloneAddrs(current.Voters)}
+		index, err := rs.appendConfigEntryLocked(final)
+		if err != nil {
+			// The joint configuration stays in effect and the next commit
+			// advance retries. Joint is a safe place to sit: agreement still
+			// needs both majorities.
+			rs.logger.Printf("advanceConfigChange: could not append the final configuration, "+
+				"staying joint and retrying: %v", err)
+			return
+		}
+		rs.syncLeaderPeersLocked()
+		rs.logger.Printf("Joint configuration committed; appended final configuration %v at index %d",
+			final.Voters, index)
+		return
+	}
+
+	if !current.IsVoter(rs.nodeID) {
+		rs.logger.Printf("Final configuration %v committed and no longer contains this node; stepping down",
+			current.Voters)
+		if err := rs.becomeFollowerLocked(rs.persistent.CurrentTerm, ""); err != nil {
+			rs.logger.Printf("advanceConfigChange: step down persist failed: %v", err)
+		}
+	}
+}
+
+// syncLeaderPeersLocked brings the per-peer replication state in line with the
+// configuration currently in effect: servers the configuration added get a
+// NextIndex/MatchIndex pair, servers it dropped lose theirs. Callers must hold
+// rs.mu; a no-op when this node is not the leader.
+//
+// A newly added server starts at NextIndex = one past our log and MatchIndex 0,
+// the same seed becomeLeader uses, so the ordinary conflict back-off (or an
+// InstallSnapshot) finds the right place to start replicating from.
+func (rs *RaftState) syncLeaderPeersLocked() {
+	if rs.leader == nil {
+		return
+	}
+	wanted := make(map[string]bool)
+	for _, peer := range rs.peerIDsLocked() {
+		wanted[peer] = true
+		if _, ok := rs.leader.NextIndex[peer]; !ok {
+			rs.leader.NextIndex[peer] = rs.lastAbsLogIndex() + 1
+			rs.leader.MatchIndex[peer] = 0
+		}
+	}
+	for peer := range rs.leader.NextIndex {
+		if !wanted[peer] {
+			delete(rs.leader.NextIndex, peer)
+			delete(rs.leader.MatchIndex, peer)
+			delete(rs.leader.inFlight, peer)
+		}
+	}
 }
