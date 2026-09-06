@@ -32,8 +32,16 @@ const (
 	requestVoteTimeout = 100 * time.Millisecond
 	// appendEntriesTimeout bounds a single AppendEntries RPC.
 	appendEntriesTimeout = 50 * time.Millisecond
-	// installSnapshotTimeout bounds a single InstallSnapshot RPC.
+	// installSnapshotTimeout bounds a single InstallSnapshot RPC — that is, one
+	// chunk, not a whole snapshot transfer.
 	installSnapshotTimeout = 5 * time.Second
+	// defaultSnapshotChunkSize is how many payload bytes one InstallSnapshot RPC
+	// carries. It bounds the size and the duration of a single RPC, which is what
+	// decides how long that peer's replication slot is occupied by one message
+	// (KNOWN_ISSUES.md R15); it does not bound how much either side holds in
+	// memory, since the leader reads the whole envelope and the receiver buffers
+	// the whole payload before installing it.
+	defaultSnapshotChunkSize = 64 * 1024
 )
 
 func (s NodeState) String() string {
@@ -140,6 +148,27 @@ type RaftState struct {
 	// snapshotter is consulted by the leader when a follower needs InstallSnapshot.
 	// May be nil if log compaction is not configured (snapshot RPCs will be skipped).
 	snapshotter Snapshotter
+
+	// snapshotChunkSize is how many payload bytes one InstallSnapshot RPC carries
+	// on the send path. Guarded by rs.mu so a test can shrink it without racing
+	// the replication goroutines that read it.
+	snapshotChunkSize int
+}
+
+// getSnapshotChunkSize returns the size of one outgoing snapshot chunk.
+func (rs *RaftState) getSnapshotChunkSize() int {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.snapshotChunkSize
+}
+
+// setSnapshotChunkSize changes the size of one outgoing snapshot chunk. It
+// exists for tests, which need a snapshot to span several chunks without
+// building a 64 KiB payload; production always runs at the default.
+func (rs *RaftState) setSnapshotChunkSize(size int) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.snapshotChunkSize = size
 }
 
 // snapshotAssembly is a snapshot being received in chunks: the generation it
@@ -275,19 +304,20 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 	randomTimeout := electionTimeoutBaseMs + rand.Intn(electionTimeoutJitterMs)
 
 	rs := &RaftState{
-		nodeID:           nodeID,
-		state:            Follower,
-		peers:            peers,
-		persistent:       PersistentState{CurrentTerm: 0, VotedFor: nil, Log: make([]LogEntry, 0)},
-		volatile:         VolatileState{CommitIndex: 0, LastApplied: 0},
-		electionTimeout:  time.Duration(randomTimeout) * time.Millisecond,
-		heartbeatTimeout: heartbeatInterval,
-		lastHeartbeat:    time.Now(),
-		applyCh:          applyCh,
-		applyNotify:      make(chan struct{}, 1),
-		stopCh:           make(chan struct{}),
-		persister:        persister,
-		logger:           log.New(log.Writer(), "[RAFT-STATE-"+nodeID+"] ", log.LstdFlags),
+		nodeID:            nodeID,
+		state:             Follower,
+		peers:             peers,
+		persistent:        PersistentState{CurrentTerm: 0, VotedFor: nil, Log: make([]LogEntry, 0)},
+		volatile:          VolatileState{CommitIndex: 0, LastApplied: 0},
+		electionTimeout:   time.Duration(randomTimeout) * time.Millisecond,
+		heartbeatTimeout:  heartbeatInterval,
+		lastHeartbeat:     time.Now(),
+		applyCh:           applyCh,
+		applyNotify:       make(chan struct{}, 1),
+		snapshotChunkSize: defaultSnapshotChunkSize,
+		stopCh:            make(chan struct{}),
+		persister:         persister,
+		logger:            log.New(log.Writer(), "[RAFT-STATE-"+nodeID+"] ", log.LstdFlags),
 	}
 
 	// Load persistent state if a persister is configured. A missing state file

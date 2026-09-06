@@ -742,6 +742,11 @@ func (rs *RaftState) handleReplicationConflict(peerID string, reply *AppendEntri
 // in between, so the follower could be told that generation B's bytes belonged
 // at generation A's (index, term) — a state machine silently installed under
 // the wrong log position (KNOWN_ISSUES.md R4).
+//
+// The envelope goes out as a sequence of chunks (KNOWN_ISSUES.md R15); all of
+// them describe that one envelope, so the R4 property is unaffected by the
+// split. The match/next index only moves once the follower has acknowledged the
+// final chunk, because only then has it installed anything.
 func (rs *RaftState) sendSnapshotToPeer(
 	transport RPCTransport,
 	peerID string,
@@ -765,33 +770,13 @@ func (rs *RaftState) sendSnapshotToPeer(
 			snapshot.LastIncludedIndex, peerID, nextIndex)
 		return
 	}
-	snapArgs := &InstallSnapshotArgs{
-		Term:              currentTerm,
-		LeaderID:          rs.nodeID,
-		LastIncludedIndex: snapshot.LastIncludedIndex,
-		LastIncludedTerm:  snapshot.LastIncludedTerm,
-		Offset:            0,
-		Data:              snapshot.Data,
-		Done:              true,
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), installSnapshotTimeout)
-	defer cancel()
-	reply, err := transport.SendInstallSnapshot(ctx, peerID, snapArgs)
-	if err != nil {
+	if !rs.streamSnapshotToPeer(transport, peerID, currentTerm, snapshot) {
 		return
 	}
 
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
-	if reply.Term > rs.persistent.CurrentTerm {
-		// Step down through the common transition, which also re-arms the election
-		// timer becomeLeader stopped (KNOWN_ISSUES.md R6).
-		if err := rs.becomeFollowerLocked(reply.Term, ""); err != nil {
-			rs.logger.Printf("sendSnapshotToPeer: persist of higher term failed: %v", err)
-		}
-		return
-	}
 	if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
 		return
 	}
@@ -806,6 +791,137 @@ func (rs *RaftState) sendSnapshotToPeer(
 	if next := rs.leader.MatchIndex[peerID] + 1; next > rs.leader.NextIndex[peerID] {
 		rs.leader.NextIndex[peerID] = next
 	}
+}
+
+// streamSnapshotToPeer sends one snapshot envelope to peerID as a sequence of
+// chunks and reports whether the follower acknowledged all of them — i.e.
+// whether it has installed the snapshot. Every chunk names the same envelope, so
+// the follower can only assemble one generation (KNOWN_ISSUES.md R4/R15).
+//
+// The whole transfer runs inside this peer's single in-flight replication slot,
+// so a snapshot still blocks heartbeats to that follower for its duration. What
+// chunking changes is that the slot is now held by a series of short RPCs rather
+// than one long one, and the checks between them let the transfer be abandoned
+// promptly instead of after a five-second timeout. Freeing the slot entirely
+// during a snapshot is a separate change (PR #26 follow-up) and out of scope
+// here.
+//
+// Between chunks, and never in the middle of one, the transfer is abandoned when
+// shutdown has begun or this node is no longer the leader of currentTerm.
+// Abandoning costs nothing on the receiver: it has written nothing.
+//
+// There is no resume. A failed chunk ends the round, and the next tick's
+// replicateToPeer starts again from offset 0 — with a *freshly read* envelope,
+// which by then may be a newer generation than the one abandoned. Resuming
+// mid-payload would mean the leader remembering, per peer, both an offset and
+// the generation that offset belongs to, and re-reading the same generation
+// later even after a compaction has replaced it. Restarting is what keeps "one
+// transfer, one envelope" true without any of that state, and the receiver's
+// offset check is what makes it safe: a stray chunk from the abandoned round
+// cannot continue the new one, because its offset will not match.
+func (rs *RaftState) streamSnapshotToPeer(
+	transport RPCTransport,
+	peerID string,
+	currentTerm int,
+	snapshot *SnapshotData,
+) bool {
+	chunkSize := rs.getSnapshotChunkSize()
+
+	for offset := 0; ; {
+		end := min(offset+chunkSize, len(snapshot.Data))
+		// A zero-length payload still describes a boundary the follower must
+		// install, so it travels as one empty chunk with Done set rather than as
+		// no RPC at all.
+		done := end == len(snapshot.Data)
+
+		select {
+		case <-rs.stopCh:
+			return false
+		default:
+		}
+		if !rs.isLeaderInTerm(currentTerm) {
+			return false
+		}
+
+		reply, err := rs.sendSnapshotChunk(transport, peerID, currentTerm, snapshot, offset, end, done)
+		if err != nil {
+			rs.logger.Printf("sendSnapshotToPeer: chunk at offset %d of the snapshot at index %d "+
+				"failed for %s, abandoning this round: %v",
+				offset, snapshot.LastIncludedIndex, peerID, err)
+			return false
+		}
+
+		if rs.stepDownIfHigherTerm(reply.Term, "sendSnapshotToPeer") {
+			return false
+		}
+		if !rs.isLeaderInTerm(currentTerm) {
+			return false
+		}
+
+		if done {
+			return true
+		}
+
+		if reply.Offset != end {
+			// The follower did not take this chunk (it refused the offset, or the
+			// snapshot is no longer newer than what it has applied). Stop rather
+			// than push the rest of a payload it is not assembling.
+			rs.logger.Printf("sendSnapshotToPeer: %s expects offset %d after our chunk ending at %d; "+
+				"abandoning this round", peerID, reply.Offset, end)
+			return false
+		}
+		offset = end
+	}
+}
+
+// sendSnapshotChunk sends the payload bytes [offset, end) as one RPC.
+func (rs *RaftState) sendSnapshotChunk(
+	transport RPCTransport,
+	peerID string,
+	currentTerm int,
+	snapshot *SnapshotData,
+	offset, end int,
+	done bool,
+) (*InstallSnapshotReply, error) {
+	args := &InstallSnapshotArgs{
+		Term:              currentTerm,
+		LeaderID:          rs.nodeID,
+		LastIncludedIndex: snapshot.LastIncludedIndex,
+		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		Offset:            offset,
+		Data:              snapshot.Data[offset:end],
+		Done:              done,
+	}
+
+	// The timeout bounds one chunk, which is the point of chunking: a slow link
+	// no longer has to move a whole snapshot within a single RPC deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), installSnapshotTimeout)
+	defer cancel()
+	return transport.SendInstallSnapshot(ctx, peerID, args)
+}
+
+// isLeaderInTerm reports whether this node is still the leader of term.
+func (rs *RaftState) isLeaderInTerm(term int) bool {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.state == Leader && rs.persistent.CurrentTerm == term
+}
+
+// stepDownIfHigherTerm demotes this node when a reply carries a newer term, and
+// reports whether it did. The demotion goes through the common transition, which
+// also re-arms the election timer becomeLeader stopped (KNOWN_ISSUES.md R6). A
+// failed persist is only logged: no RPC response rides on it, and the next
+// election timeout retries.
+func (rs *RaftState) stepDownIfHigherTerm(replyTerm int, where string) bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if replyTerm <= rs.persistent.CurrentTerm {
+		return false
+	}
+	if err := rs.becomeFollowerLocked(replyTerm, ""); err != nil {
+		rs.logger.Printf("%s: persist of higher term failed: %v", where, err)
+	}
+	return true
 }
 
 func (rs *RaftState) updateCommitIndex() {
