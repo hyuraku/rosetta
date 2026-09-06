@@ -233,6 +233,23 @@ func (hs *HTTPServer) handleLeader(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// validateJoinFlag rejects a non-empty -join value. Dynamic membership is not
+// implemented (KNOWN_ISSUES.md R12/R14): ClusterManager's node bookkeeping
+// (network/discovery.go) is HTTP-level only and is never reflected in the Raft
+// quorum, so honoring -join would let an operator believe a node had safely
+// joined the cluster when it had not. The flag is kept -- reserved, not
+// removed -- so that a caller who still passes it gets this explicit rejection
+// instead of "flag provided but not defined", and can retire the flag from
+// their tooling deliberately. Until real membership changes exist, every node
+// must be started with the same fixed -peers list.
+func validateJoinFlag(join string) error {
+	if join == "" {
+		return nil
+	}
+	return fmt.Errorf("dynamic membership is not implemented (KNOWN_ISSUES.md R12/R14); " +
+		"run every node with the same fixed -peers list instead of -join")
+}
+
 func parsePeers(peers string) map[string]string {
 	result := make(map[string]string)
 	for _, peer := range strings.Split(peers, ",") {
@@ -343,9 +360,14 @@ func main() {
 		listenAddr = flag.String("listen", "localhost:8080", "Listen address for Raft")
 		httpAddr   = flag.String("http", "localhost:9080", "HTTP server address")
 		peers      = flag.String("peers", "", "Comma-separated list of peer addresses (format: id:addr,id:addr)")
-		join       = flag.String("join", "", "Join existing cluster by connecting to this address")
+		join       = flag.String("join", "", "Reserved: dynamic membership is not implemented "+
+			"(KNOWN_ISSUES.md R12/R14); a non-empty value refuses to start")
 	)
 	flag.Parse()
+
+	if err := validateJoinFlag(*join); err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	cfg := resolveConfig(*configFile, *nodeID, *listenAddr, *httpAddr, *peers)
 
@@ -389,15 +411,13 @@ func main() {
 		log.Fatalf("Failed to start transport: %v", err)
 	}
 
+	// validateJoinFlag above already refuses to start when -join is set, so
+	// there is no HTTP join attempt here (KNOWN_ISSUES.md R12): ClusterManager
+	// is used only for the fixed -peers bookkeeping and for LeaveCluster on
+	// shutdown, not for joining a running cluster.
 	clusterManager := network.NewClusterManager(cfg.NodeID, cfg.ListenAddr)
 	for id, addr := range cfg.Peers {
 		clusterManager.AddNode(id, addr)
-	}
-
-	if *join != "" {
-		if err := clusterManager.JoinCluster(*join); err != nil {
-			log.Printf("Failed to join cluster: %v", err)
-		}
 	}
 
 	httpServer := NewHTTPServer(kvs, raftNode, cfg)

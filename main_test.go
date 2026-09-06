@@ -114,3 +114,17 @@ func TestHandlePutAcceptsNonEmptyKey(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestValidateJoinFlag verifies the R12 fix: -join is kept as a reserved flag
+// (an unset/empty value starts normally) but a non-empty value is rejected,
+// since dynamic membership isn't implemented and honoring it would silently
+// leave the joined node out of the Raft quorum (KNOWN_ISSUES.md R12/R14).
+func TestValidateJoinFlag(t *testing.T) {
+	if err := validateJoinFlag(""); err != nil {
+		t.Errorf("expected no error for an unset -join, got %v", err)
+	}
+
+	if err := validateJoinFlag("localhost:8080"); err == nil {
+		t.Error("expected an error for a non-empty -join")
+	}
+}

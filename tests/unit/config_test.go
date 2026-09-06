@@ -101,6 +101,46 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
+// TestConfigValidationRejectsSelfInPeers guards R12's fixed-peers fallback:
+// with -join rejected (KNOWN_ISSUES.md R12), a node that lists its own NodeID
+// in Peers would double-count itself once via GetPeerIDs' explicit self entry
+// and once via the Peers map, so it must be rejected at config time.
+func TestConfigValidationRejectsSelfInPeers(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.NodeID = nodeID1
+	cfg.AddPeer(nodeID1, "localhost:9999")
+
+	if err := cfg.Validate(); err == nil {
+		t.Error("Expected validation to fail when Peers contains this node's own NodeID")
+	}
+}
+
+// TestConfigValidationRejectsDuplicatePeerAddresses guards against a
+// copy-pasted -peers list where two different peer IDs resolve to the same
+// address -- a configuration that can never form a correct quorum.
+func TestConfigValidationRejectsDuplicatePeerAddresses(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.AddPeer("node2", addrNode2)
+	cfg.AddPeer("node3", addrNode2)
+
+	if err := cfg.Validate(); err == nil {
+		t.Error("Expected validation to fail when two peers share the same address")
+	}
+}
+
+// TestConfigValidationRejectsPeerAddrEqualsListenAddr guards against a peer
+// entry that is actually this node's own listen address under a different ID
+// -- silently wrong and equally unable to form a correct quorum.
+func TestConfigValidationRejectsPeerAddrEqualsListenAddr(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.ListenAddr = addrSelf
+	cfg.AddPeer("node2", addrSelf)
+
+	if err := cfg.Validate(); err == nil {
+		t.Error("Expected validation to fail when a peer's address equals listen_addr")
+	}
+}
+
 func TestPeerManagement(t *testing.T) {
 	cfg := config.DefaultConfig()
 
