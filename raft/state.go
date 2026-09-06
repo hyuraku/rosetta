@@ -121,6 +121,14 @@ type RaftState struct {
 	// successor.
 	pendingSnapshot *ApplyMsg
 
+	// pendingChunks is the snapshot currently being received chunk by chunk, or
+	// nil when no transfer is in progress. Written and read under rs.mu by the
+	// InstallSnapshot receive path only. It is deliberately invisible to every
+	// other part of the node: until the final chunk arrives nothing about the
+	// Raft state, the state machine or the disk reflects it, so an interrupted
+	// transfer leaves no trace to clean up beyond dropping this field.
+	pendingChunks *snapshotAssembly
+
 	// Goroutine lifecycle. lifecycleMu guards the stopped flag so that spawn can
 	// never call wg.Add after Stop has begun waiting; stopCh is the broadcast
 	// every spawned goroutine (and the applier's channel sends) selects on.
@@ -132,6 +140,46 @@ type RaftState struct {
 	// snapshotter is consulted by the leader when a follower needs InstallSnapshot.
 	// May be nil if log compaction is not configured (snapshot RPCs will be skipped).
 	snapshotter Snapshotter
+}
+
+// snapshotAssembly is a snapshot being received in chunks: the generation it
+// belongs to, who is sending it, and the bytes accumulated so far. It lives only
+// in memory — nothing is written to snapshot.json until the transfer completes,
+// so a transfer that is abandoned half way (the leader died, our term moved on,
+// the node is shutting down) is discarded by dropping this value.
+//
+// leaderID and term are what the assembly is scoped to: a chunk from anyone else,
+// or from an older term, does not belong to it. lastIncludedIndex and
+// lastIncludedTerm pin the generation, so a leader that starts shipping a newer
+// snapshot mid-transfer cannot have its bytes spliced onto the older one's
+// (the same "one envelope, one generation" rule the send path follows,
+// KNOWN_ISSUES.md R4).
+type snapshotAssembly struct {
+	leaderID          string
+	term              int
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	buf               []byte
+}
+
+// matches reports whether args continues this assembly: same sender, same term,
+// same snapshot generation. Callers must hold rs.mu.
+func (a *snapshotAssembly) matches(args *InstallSnapshotArgs, currentTerm int) bool {
+	return a.leaderID == args.LeaderID &&
+		a.term == currentTerm &&
+		a.lastIncludedIndex == args.LastIncludedIndex &&
+		a.lastIncludedTerm == args.LastIncludedTerm
+}
+
+// discardSnapshotAssemblyLocked drops any partially received snapshot. Callers
+// must hold rs.mu. Safe to call when there is none.
+func (rs *RaftState) discardSnapshotAssemblyLocked(reason string) {
+	if rs.pendingChunks == nil {
+		return
+	}
+	rs.logger.Printf("InstallSnapshot: discarding %d buffered bytes of the snapshot at index %d from %s (%s)",
+		len(rs.pendingChunks.buf), rs.pendingChunks.lastIncludedIndex, rs.pendingChunks.leaderID, reason)
+	rs.pendingChunks = nil
 }
 
 // spawn starts fn in a goroutine that Stop will wait for, and reports whether it
@@ -175,6 +223,13 @@ func (rs *RaftState) Stop() {
 	rs.lifecycleMu.Unlock()
 
 	rs.wg.Wait()
+
+	// Drop any half-received snapshot. Nothing outside this field reflects it,
+	// so this is only about not holding the buffer past shutdown; a leader that
+	// comes back to a restarted node starts the transfer again from offset 0.
+	rs.mu.Lock()
+	rs.discardSnapshotAssemblyLocked("node is stopping")
+	rs.mu.Unlock()
 }
 
 // SetSnapshotter wires the state machine snapshotter so the leader can serve
@@ -387,6 +442,18 @@ func (rs *RaftState) becomeFollowerLocked(term int, leaderID string) error {
 
 	rs.state = Follower
 	rs.currentLeader = leaderID
+
+	// A snapshot being received in chunks belongs to one leader in one term. Any
+	// transition that changes either of those abandons it: the remaining chunks
+	// will never arrive (a new leader restarts from offset 0), and buffering them
+	// under a stale (term, leader) is how a half-installed snapshot from a
+	// deposed leader could otherwise be completed. Same-term chunks from the same
+	// leader survive, so an interleaved heartbeat does not restart the transfer.
+	if rs.pendingChunks != nil &&
+		(rs.pendingChunks.term != rs.persistent.CurrentTerm || rs.pendingChunks.leaderID != leaderID) {
+		rs.discardSnapshotAssemblyLocked("term or leader changed")
+	}
+
 	// Per-peer replication state belongs to one leader term. Dropping it stops a
 	// demoted leader from advancing MatchIndex on a reply that arrives late, and
 	// makes "rs.leader != nil" mean "we are the leader" everywhere.

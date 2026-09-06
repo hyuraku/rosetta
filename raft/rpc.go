@@ -896,11 +896,23 @@ func DeserializeAppendEntriesReply(data []byte) (*AppendEntriesReply, error) {
 // order, inside this handler, and only then is the snapshot queued for the
 // applier. What step 3 becomes is "queue the in-memory update"; it is no longer
 // this goroutine that waits for the state machine to take it.
+//
+// Chunked transfer (KNOWN_ISSUES.md R15) leaves that invariant alone by keeping
+// a partial transfer entirely private. A snapshot arrives as a sequence of
+// chunks (Figure 13 receiver rules 2-4) and everything before the final one only
+// appends to an in-memory buffer: no Raft state, no state machine, no file on
+// disk reflects a snapshot that has not finished arriving. So the three steps
+// above still run exactly once per snapshot, in one critical section, with the
+// assembled payload standing in for args.Data. What every chunk does do is the
+// term handling and the election-timer reset above them — a multi-chunk transfer
+// is a live leader talking to us, and must not look like silence.
 func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
-	// Reply immediately if term is stale
+	// Receiver rule 1: reply immediately if term is stale. Note this leaves any
+	// transfer in progress untouched — a straggling chunk from a deposed leader
+	// cannot disturb the one we are assembling for the current one.
 	if args.Term < rs.persistent.CurrentTerm {
 		reply.Term = rs.persistent.CurrentTerm
 		return
@@ -928,10 +940,27 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	// (KNOWN_ISSUES.md R5). LastApplied is never below LastIncludedIndex on the
 	// normal paths, but both are checked because TruncateLogTo can advance the
 	// boundary independently.
+	//
+	// Checked on every chunk, not just the first. LastApplied only grows, so a
+	// transfer that was worth starting can become pointless while it is still
+	// arriving (the missing entries reached us as ordinary AppendEntries, say);
+	// refusing here ends it at the next chunk instead of at the last one, and
+	// drops the buffer with it.
 	if args.LastIncludedIndex <= rs.volatile.LastApplied ||
 		args.LastIncludedIndex <= rs.persistent.LastIncludedIndex {
 		rs.logger.Printf("InstallSnapshot: ignoring snapshot at index %d (lastApplied=%d, lastIncluded=%d)",
 			args.LastIncludedIndex, rs.volatile.LastApplied, rs.persistent.LastIncludedIndex)
+		if rs.pendingChunks != nil && rs.pendingChunks.lastIncludedIndex == args.LastIncludedIndex {
+			rs.discardSnapshotAssemblyLocked("snapshot no longer newer than our applied state")
+		}
+		return
+	}
+
+	// Receiver rules 2-4: buffer this chunk. Until the transfer is complete this
+	// is the whole of the handler's effect — the durability ordering below runs
+	// once, for the assembled payload.
+	payload, complete := rs.acceptSnapshotChunkLocked(args, reply)
+	if !complete {
 		return
 	}
 
@@ -943,7 +972,7 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	snapshotPersisted := false
 	if rs.snapshotter != nil {
 		if err := rs.snapshotter.InstallSnapshot(
-			args.Data, args.LastIncludedIndex, args.LastIncludedTerm,
+			payload, args.LastIncludedIndex, args.LastIncludedTerm,
 		); err != nil {
 			rs.logger.Printf("InstallSnapshot: persisting the snapshot payload failed, "+
 				"leaving raft state untouched: %v", err)
@@ -1008,15 +1037,100 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	// the snapshot reaches the state machine before all of them.
 	rs.pendingSnapshot = &ApplyMsg{
 		CommandValid:      false,
-		Command:           args.Data,
+		Command:           payload,
 		CommandIndex:      args.LastIncludedIndex,
 		SnapshotValid:     true,
 		SnapshotIndex:     args.LastIncludedIndex,
 		SnapshotTerm:      args.LastIncludedTerm,
-		SnapshotData:      args.Data,
+		SnapshotData:      payload,
 		SnapshotPersisted: snapshotPersisted,
 	}
 	rs.notifyApplierLocked()
+}
+
+// acceptSnapshotChunkLocked implements Figure 13's receiver rules 2-4 against
+// rs.pendingChunks and returns the complete payload once the final chunk has
+// arrived. Callers must hold rs.mu.
+//
+//  2. If offset is 0, create a new snapshot file
+//  3. Write data into the snapshot file at the given offset
+//  4. Reply and wait for more data chunks if done is false
+//
+// The "snapshot file" here is a buffer in memory, not a file: the payload is
+// written to disk in one atomic write by Snapshotter.InstallSnapshot when the
+// transfer completes, which is what lets the durability ordering invariant on
+// InstallSnapshot hold as a single step. The cost is that the receiver still
+// holds a whole snapshot in memory; what chunking bounds is the size of one RPC
+// (and so how long a single RPC occupies the leader's per-peer slot), not the
+// receiver's peak memory.
+//
+// A chunk that does not continue what we hold is refused rather than merged.
+// reply.Offset then names the offset that would be accepted — the length
+// buffered so far when this is simply a chunk out of order, or 0 when there is
+// nothing here to continue and the leader should start again. Refusing keeps
+// rule 3's "at the given offset" honest without needing to track holes: the
+// buffer is always exactly the payload's first len(buf) bytes.
+func (rs *RaftState) acceptSnapshotChunkLocked(
+	args *InstallSnapshotArgs, reply *InstallSnapshotReply,
+) (payload []byte, complete bool) {
+	if args.Offset == 0 {
+		// Rule 2. Any earlier attempt is superseded: a leader that starts over
+		// does so from the beginning, and its new chunks may well belong to a
+		// newer snapshot generation than the bytes we were collecting.
+		rs.discardSnapshotAssemblyLocked("leader restarted the transfer at offset 0")
+
+		if args.Done {
+			// The single-chunk form — the whole snapshot in one RPC, which is
+			// what every sender produced before chunking existed. Nothing needs
+			// buffering, so this path behaves exactly as it always did.
+			return args.Data, true
+		}
+
+		// Copy the chunk out: the mock transport hands the sender's own slice
+		// straight to this handler, and the sender re-slices it from the snapshot
+		// envelope it is walking through.
+		rs.pendingChunks = &snapshotAssembly{
+			leaderID:          args.LeaderID,
+			term:              rs.persistent.CurrentTerm,
+			lastIncludedIndex: args.LastIncludedIndex,
+			lastIncludedTerm:  args.LastIncludedTerm,
+			buf:               append([]byte(nil), args.Data...),
+		}
+		reply.Offset = len(rs.pendingChunks.buf) // rule 4
+		return nil, false
+	}
+
+	assembly := rs.pendingChunks
+	if assembly == nil || !assembly.matches(args, rs.persistent.CurrentTerm) {
+		rs.logger.Printf("InstallSnapshot: chunk at offset %d for the snapshot at index %d "+
+			"continues nothing we hold; asking %s to restart from offset 0",
+			args.Offset, args.LastIncludedIndex, args.LeaderID)
+		reply.Offset = 0
+		return nil, false
+	}
+
+	if args.Offset != len(assembly.buf) {
+		// A gap would leave a hole in the payload and an overlap would duplicate
+		// bytes. Keep what we have — this chunk arrived out of order, which says
+		// nothing against the prefix already buffered — and name the offset that
+		// fits.
+		rs.logger.Printf("InstallSnapshot: chunk at offset %d does not continue the %d bytes "+
+			"buffered for the snapshot at index %d; expecting offset %d",
+			args.Offset, len(assembly.buf), args.LastIncludedIndex, len(assembly.buf))
+		reply.Offset = len(assembly.buf)
+		return nil, false
+	}
+
+	assembly.buf = append(assembly.buf, args.Data...) // rule 3
+
+	if !args.Done {
+		reply.Offset = len(assembly.buf) // rule 4
+		return nil, false
+	}
+
+	payload = assembly.buf
+	rs.pendingChunks = nil
+	return payload, true
 }
 
 // Serialization for InstallSnapshot
