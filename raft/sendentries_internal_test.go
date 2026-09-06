@@ -109,6 +109,11 @@ func TestReplicatedEntriesAreCopiedBeforeSending(t *testing.T) {
 	}()
 
 	wg.Wait()
+	// Stop before closing: the applier is the only sender on applyCh and Stop is
+	// what guarantees it has exited (KNOWN_ISSUES.md R19). Closing first raced
+	// the commits this test drives and panicked with "send on closed channel"
+	// once every dozen or so runs of the package.
+	rs.Stop()
 	close(applyCh)
 	<-drained
 }

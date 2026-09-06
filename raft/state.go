@@ -35,6 +35,13 @@ const (
 	// installSnapshotTimeout bounds a single InstallSnapshot RPC — that is, one
 	// chunk, not a whole snapshot transfer.
 	installSnapshotTimeout = 5 * time.Second
+	// minElectionTimeout is the shortest election timeout any node uses. A
+	// follower that heard from its leader more recently than this cannot yet have
+	// timed out, so a RequestVote arriving inside that window comes from a server
+	// that is not seeing the same leader — see RequestVote's disruption check
+	// (paper §6, "Servers disregard RequestVote RPCs when they believe a current
+	// leader exists").
+	minElectionTimeout = electionTimeoutBaseMs * time.Millisecond
 	// defaultSnapshotChunkSize is how many payload bytes one InstallSnapshot RPC
 	// carries. It bounds the size and the duration of a single RPC, which is what
 	// decides how long that peer's replication slot is occupied by one message
@@ -124,9 +131,9 @@ type RaftState struct {
 	state  NodeState
 	// peers is the peer list this node was constructed with. It seeds the
 	// initial cluster configuration and is kept only for that purpose plus
-	// diagnostics: the configuration itself (persistent.Config,
-	// raft/membership.go) is what later paths must consult, because it changes
-	// at runtime and this list does not.
+	// diagnostics: every decision about who votes, who is replicated to and what
+	// constitutes a quorum comes from persistent.Config (raft/membership.go),
+	// because the configuration changes at runtime and this list does not.
 	peers []string
 
 	persistent PersistentState
@@ -613,11 +620,9 @@ func (rs *RaftState) initializeLeaderState() {
 	}
 
 	nextIndex := rs.lastAbsLogIndex() + 1
-	for _, peer := range rs.peers {
-		if peer != rs.nodeID {
-			rs.leader.NextIndex[peer] = nextIndex
-			rs.leader.MatchIndex[peer] = 0
-		}
+	for _, peer := range rs.peerIDsLocked() {
+		rs.leader.NextIndex[peer] = nextIndex
+		rs.leader.MatchIndex[peer] = 0
 	}
 }
 

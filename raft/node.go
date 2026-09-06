@@ -75,10 +75,23 @@ func (rn *RaftNode) handleElectionTimeout() {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	if rn.state.GetNodeState() != Leader {
-		rn.logger.Printf("Election timeout, starting election for term %d", rn.state.GetCurrentTerm()+1)
-		rn.state.startElection(rn.transport)
+	if rn.state.GetNodeState() == Leader {
+		return
 	}
+	// A server that is not a voter in the configuration it holds must not
+	// campaign (paper §6). Two cases reach here: a server started with the
+	// existing cluster's peer list so it can be added to it, which is not in any
+	// configuration until C_old,new reaches its log; and a server that has been
+	// removed but has not shut down yet. Neither can win, and both would raise
+	// the cluster's term on every timeout if they tried. This is the weaker,
+	// local half of the protection — the disruption check in RequestVote is what
+	// protects the cluster from a server that campaigns anyway
+	// (KNOWN_ISSUES.md R14).
+	if !rn.state.IsVoter() {
+		return
+	}
+	rn.logger.Printf("Election timeout, starting election for term %d", rn.state.GetCurrentTerm()+1)
+	rn.state.startElection(rn.transport)
 }
 
 func (rn *RaftNode) handleTick() {

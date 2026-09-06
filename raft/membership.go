@@ -120,6 +120,44 @@ func (c *ClusterConfig) IsVoter(nodeID string) bool {
 	return ok
 }
 
+// QuorumReached reports whether the set of servers in agree constitutes
+// agreement under this configuration.
+//
+// This is the whole of joint consensus' safety argument in one function
+// (§6): while the configuration is joint, a decision needs a majority of C_old
+// *and* a majority of C_new, so no pair of decisions can be made by two
+// disjoint majorities during the transition. Outside the transition it is the
+// ordinary majority of the single voter set.
+//
+// Servers named in agree that are not in a group simply do not count towards
+// that group — which is how a leader that has been voted out of C_new keeps
+// replicating (it still has to get C_new committed) without counting itself.
+func (c *ClusterConfig) QuorumReached(agree map[string]bool) bool {
+	if c == nil {
+		return false
+	}
+	if !majorityOf(c.Voters, agree) {
+		return false
+	}
+	if c.OldVoters != nil && !majorityOf(c.OldVoters, agree) {
+		return false
+	}
+	return true
+}
+
+func majorityOf(group map[string]string, agree map[string]bool) bool {
+	if len(group) == 0 {
+		return false
+	}
+	count := 0
+	for id := range group {
+		if agree[id] {
+			count++
+		}
+	}
+	return count*quorumDivisor > len(group)
+}
+
 // encode renders the configuration as the JSON string carried in
 // LogEntry.Command. A string is used, like every other command in this
 // repository, so that the entry survives the JSON round trip the HTTP transport
@@ -203,6 +241,40 @@ func (rs *RaftState) configAtIndexLocked(idx int) *ClusterConfig {
 // reach disk in the same write as the log it was derived from.
 func (rs *RaftState) recomputeConfigLocked() {
 	rs.persistent.Config = rs.configAtIndexLocked(rs.lastAbsLogIndex())
+}
+
+// peerIDsLocked returns every server in the current configuration except this
+// one, in a stable order. This replaces the old fixed rs.peers list everywhere a
+// decision is made about who to talk to. Callers must hold rs.mu.
+func (rs *RaftState) peerIDsLocked() []string {
+	ids := rs.persistent.Config.MemberIDs()
+	peers := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id != rs.nodeID {
+			peers = append(peers, id)
+		}
+	}
+	return peers
+}
+
+// quorumReachedLocked evaluates agreement under the configuration currently in
+// effect. Callers must hold rs.mu (read or write).
+func (rs *RaftState) quorumReachedLocked(agree map[string]bool) bool {
+	return rs.persistent.Config.QuorumReached(agree)
+}
+
+// isVoterLocked reports whether this node votes in the current configuration.
+// Callers must hold rs.mu.
+func (rs *RaftState) isVoterLocked() bool {
+	return rs.persistent.Config.IsVoter(rs.nodeID)
+}
+
+// IsVoter reports whether this node votes in the configuration currently in
+// effect.
+func (rs *RaftState) IsVoter() bool {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.isVoterLocked()
 }
 
 // GetClusterConfig returns a copy of the configuration currently in effect.

@@ -3,7 +3,7 @@ package raft
 import (
 	"context"
 	"encoding/json"
-	"sync"
+	"time"
 )
 
 type RequestVoteArgs struct {
@@ -90,6 +90,26 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	reply.VoteGranted = false
 
 	if args.Term < rs.persistent.CurrentTerm {
+		return
+	}
+
+	// Disruption check (paper §6, last paragraph): a server that has heard from
+	// its leader within the minimum election timeout disregards RequestVote
+	// entirely — it does not grant the vote and, crucially, does not adopt the
+	// candidate's term.
+	//
+	// This is what makes removing a server safe. A server that has been taken out
+	// of the configuration stops receiving heartbeats, times out, and campaigns
+	// with ever-increasing terms; without this check each of those RPCs would
+	// depose the perfectly healthy leader and the cluster would never make
+	// progress again (KNOWN_ISSUES.md R14). It costs nothing in the normal case:
+	// a genuinely dead leader stops resetting lastHeartbeat, the window lapses,
+	// and the next candidate is heard. It has to precede the term adoption below,
+	// which is the very thing being suppressed.
+	if args.Term > rs.persistent.CurrentTerm && rs.currentLeader != "" &&
+		time.Since(rs.lastHeartbeat) < minElectionTimeout {
+		rs.logger.Printf("RequestVote: ignoring %s's request for term %d; heard from leader %s %v ago",
+			args.CandidateID, args.Term, rs.currentLeader, time.Since(rs.lastHeartbeat))
 		return
 	}
 
@@ -393,37 +413,36 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	lastLogIndex := rs.lastAbsLogIndex()
 	lastLogTerm := rs.lastAbsLogTerm()
 
-	// Use a vote counter that's protected by the RaftState mutex
-	votes := 1
-	votesNeeded := len(rs.peers)/quorumDivisor + 1
+	// Votes are tracked as the *set* of servers that granted one, not a count,
+	// because under joint consensus a majority has to be found separately in the
+	// old and the new voter set (KNOWN_ISSUES.md R14, §6). The set is only ever
+	// read and written under rs.mu — created here, updated in
+	// requestVoteFromPeer's locked section — so it needs no lock of its own.
+	votes := map[string]bool{rs.nodeID: true}
+	peers := rs.peerIDsLocked()
 	// Re-arm the (already fired) timer under the same lock the RPC handlers hold
 	// when they reset it, so this election's timeout does not race with an
 	// incoming AppendEntries (KNOWN_ISSUES.md E1). It also bounds this election:
 	// if it draws no quorum, the timeout starts the next one.
 	rs.resetElectionTimerLocked()
-	rs.mu.Unlock()
 
-	// If this is a single-node cluster, immediately become leader. becomeLeader
-	// appends the current-term no-op and stops the election timer.
-	if len(rs.peers) == 1 {
-		rs.mu.Lock()
+	// A single-voter configuration is its own majority, so the self-vote already
+	// wins the election. Asking the configuration rather than counting peers also
+	// covers the case where this node is not a voter at all: QuorumReached is
+	// then false and the election proceeds (and draws nothing), which
+	// handleElectionTimeout avoids reaching in the first place.
+	if rs.quorumReachedLocked(votes) {
 		rs.becomeLeader()
 		rs.mu.Unlock()
 		return
 	}
+	rs.mu.Unlock()
 
-	// Use a mutex to protect vote counting across goroutines
-	var voteMu sync.Mutex
-
-	for _, peer := range rs.peers {
-		if peer == rs.nodeID {
-			continue
-		}
-
+	for _, peer := range peers {
 		// Spawned through rs.spawn so Kill can wait for it; after Stop nothing is
 		// started and this election simply draws no votes (KNOWN_ISSUES.md R19).
 		rs.spawn(func() {
-			rs.requestVoteFromPeer(transport, peer, currentTerm, lastLogIndex, lastLogTerm, votesNeeded, &votes, &voteMu)
+			rs.requestVoteFromPeer(transport, peer, currentTerm, lastLogIndex, lastLogTerm, votes)
 		})
 	}
 }
@@ -434,9 +453,8 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 func (rs *RaftState) requestVoteFromPeer(
 	transport RPCTransport,
 	peerID string,
-	currentTerm, lastLogIndex, lastLogTerm, votesNeeded int,
-	votes *int,
-	voteMu *sync.Mutex,
+	currentTerm, lastLogIndex, lastLogTerm int,
+	votes map[string]bool,
 ) {
 	args := &RequestVoteArgs{
 		Term:         currentTerm,
@@ -471,12 +489,14 @@ func (rs *RaftState) requestVoteFromPeer(
 	}
 
 	if reply.VoteGranted {
-		voteMu.Lock()
-		*votes++
-		currentVotes := *votes
-		voteMu.Unlock()
+		votes[peerID] = true
 
-		if currentVotes >= votesNeeded && rs.state == Candidate {
+		// Evaluated against the configuration in effect right now, which under
+		// joint consensus needs a majority of the old *and* the new voter set
+		// (§6). A candidate does not append entries, so its configuration can
+		// only change by accepting a leader's — at which point it is no longer a
+		// Candidate and the check above has already returned.
+		if rs.quorumReachedLocked(votes) && rs.state == Candidate {
 			// becomeLeader appends the current-term no-op, initializes leader
 			// state, and stops the election timer. We already hold rs.mu.
 			rs.becomeLeader()
@@ -494,9 +514,10 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	currentTerm := rs.persistent.CurrentTerm
 	commitIndex := rs.volatile.CommitIndex
 
-	// For a single-node cluster the leader is its own majority, so it can commit
-	// outstanding entries directly.
-	if len(rs.peers) == 1 {
+	// With no other server in the configuration the leader is its own majority,
+	// so it can commit outstanding entries directly.
+	peers := rs.peerIDsLocked()
+	if len(peers) == 0 {
 		rs.updateCommitIndex()
 		rs.mu.Unlock()
 		return
@@ -506,9 +527,9 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	// still have a round outstanding. Claiming under the same lock that reads the
 	// term and commit index is what makes the serialization airtight: two ticks
 	// cannot both see a peer idle.
-	targets := make([]string, 0, len(rs.peers))
-	for _, peer := range rs.peers {
-		if peer == rs.nodeID || rs.leader.inFlight[peer] {
+	targets := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		if rs.leader.inFlight[peer] {
 			continue
 		}
 		rs.leader.inFlight[peer] = true
@@ -934,6 +955,8 @@ func (rs *RaftState) stepDownIfHigherTerm(replyTerm int, where string) bool {
 	return true
 }
 
+// updateCommitIndex advances the leader's commit index over every entry of its
+// own term that a quorum has stored. Callers must hold rs.mu.
 func (rs *RaftState) updateCommitIndex() {
 	if rs.state != Leader {
 		return
@@ -944,14 +967,20 @@ func (rs *RaftState) updateCommitIndex() {
 			continue
 		}
 
-		count := 1
-		for _, peer := range rs.peers {
-			if peer != rs.nodeID && rs.leader.MatchIndex[peer] >= n {
-				count++
+		// Which servers store index n, as a set: the leader itself (its log is
+		// the one being counted) plus every peer whose MatchIndex has reached n.
+		// Whether any of them actually counts is the configuration's decision —
+		// under joint consensus n needs a majority in both voter sets, and a
+		// leader that has been voted out of C_new contributes nothing
+		// (KNOWN_ISSUES.md R14, §6).
+		agree := map[string]bool{rs.nodeID: true}
+		for peer, matchIndex := range rs.leader.MatchIndex {
+			if matchIndex >= n {
+				agree[peer] = true
 			}
 		}
 
-		if count*2 > len(rs.peers) {
+		if rs.quorumReachedLocked(agree) {
 			rs.volatile.CommitIndex = n
 			rs.notifyApplierLocked()
 		}

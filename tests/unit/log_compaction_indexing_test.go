@@ -206,12 +206,20 @@ func TestAppendEntriesPrevLogIndexBelowBoundary(t *testing.T) {
 // TestRequestVoteUsesAbsoluteIndex verifies the election restriction (§5.4.1)
 // is evaluated against the absolute last log index/term after compaction
 // (item #1).
+//
+// The requests are sent in the follower's *current* term (1), not a higher one.
+// compactedFollower builds its state by accepting an AppendEntries, so the node
+// has just heard from a leader, and a request for a higher term would now be
+// disregarded outright by the §6 disruption check (KNOWN_ISSUES.md R14) before
+// any log comparison happens — which is not what this test is about. Within the
+// current term that check does not apply and the node has not voted yet, so the
+// log comparison alone decides, which is exactly the property under test.
 func TestRequestVoteUsesAbsoluteIndex(t *testing.T) {
 	// Candidate that is behind (LastLogIndex 8 < our absolute 10) must be denied.
 	behind, _ := compactedFollower(t)
 	reply := &raft.RequestVoteReply{}
 	behind.RequestVote(&raft.RequestVoteArgs{
-		Term:         2,
+		Term:         1,
 		CandidateID:  "cand",
 		LastLogIndex: 8,
 		LastLogTerm:  1,
@@ -224,7 +232,7 @@ func TestRequestVoteUsesAbsoluteIndex(t *testing.T) {
 	upToDate, _ := compactedFollower(t)
 	reply2 := &raft.RequestVoteReply{}
 	upToDate.RequestVote(&raft.RequestVoteArgs{
-		Term:         2,
+		Term:         1,
 		CandidateID:  "cand",
 		LastLogIndex: 10,
 		LastLogTerm:  1,

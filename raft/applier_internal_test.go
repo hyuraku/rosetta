@@ -66,12 +66,18 @@ func TestSlowStateMachineDoesNotBlockConsensus(t *testing.T) {
 	// The applier is now stuck mid-delivery with no lock held.
 	waitForLastApplied(t, rs, 3)
 
-	// A second RPC must still be served while that delivery is stuck.
+	// A second RPC must still be served while that delivery is stuck. The
+	// request names the current term, not a higher one: this node has just
+	// accepted an AppendEntries from n2, so a higher-term candidate would now be
+	// disregarded by the §6 disruption check (KNOWN_ISSUES.md R14) — correct, but
+	// beside the point here, which is that the handler runs at all while the
+	// applier is blocked. Within the current term nothing has been voted yet, so
+	// an up-to-date candidate is granted.
 	served := make(chan RequestVoteReply, 1)
 	go func() {
 		reply := RequestVoteReply{}
 		rs.RequestVote(&RequestVoteArgs{
-			Term:         2,
+			Term:         1,
 			CandidateID:  "n3",
 			LastLogIndex: 3,
 			LastLogTerm:  1,
