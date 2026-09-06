@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-09-06 against commit `d370c72`.
+> Last verified: 2026-09-06 against commit `d59bff3`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -105,11 +105,30 @@ Raft state is persisted when:
 6. Before responding to RequestVote/AppendEntries RPCs that changed
    persistent state (a failed persist causes the RPC to be rejected)
 
-A failed persist never passes silently. On the leader's own append paths
-(`AppendLogEntry`, `TruncateLogAfter`, and the no-op appended on election) the
-in-memory change is rolled back so memory and disk agree, and the error is
+A failed persist never passes silently, and it never leaves the in-memory log
+ahead of the disk. On the leader's own append paths (`RaftState.Start`, the
+`AppendLogEntry` wrapper, `TruncateLogAfter`, and the no-op appended on election)
+the in-memory change is rolled back so memory and disk agree, and the error is
 returned to the caller: `RaftNode.Start` reports it, and the KV store fails the
 client operation instead of waiting for it to be applied.
+
+The receiving side of `AppendEntries` behaves the same way (R2, fixed in
+`c362ae4`): if the entries merged into the log cannot be persisted, the merge is
+rolled back before the handler replies `Success=false`. That matters because the
+handler skips the write for a request whose entries already match — an
+optimization that is only sound while memory and disk agree. Leaving an
+un-persisted merge in memory used to make the leader's *resend* of the same
+request look like a duplicate, so the follower answered `Success=true` for
+entries that were on no disk, the leader counted that ACK in `MatchIndex`, and a
+crash of that follower could lose a committed entry.
+
+`RaftState.Start` also makes the leadership check, the term stamp and the
+persist one critical section (R1, fixed in `2c26b9a`), so a node demoted
+mid-append never writes a command under the new leader's term.
+
+The InstallSnapshot receive path is *not* yet covered by this discipline: a
+failed persist there leaves the in-memory log, snapshot boundary and volatile
+indices updated (KNOWN_ISSUES.md note 6, R3).
 
 KV store snapshots are saved automatically by the apply loop: after
 `max_raft_state` commands (default 1000) have been applied since the last

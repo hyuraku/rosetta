@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-09-06 / 対象 commit `dc5bb20`
+> 最終検証: 2026-09-06 / 対象 commit `d59bff3`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -23,9 +23,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 20（A1–A8, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5, R17） |
+| ✅ FIXED | 22（A1–A8, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5, R1, R2, R17） |
 | 🟠 PARTIAL | 0 |
-| ❌ UNFIXED | 18（B3, E1, E2 + グループ R 15 件: R1–R6, R9–R16, R18） |
+| ❌ UNFIXED | 16（B3, E1, E2 + グループ R 13 件: R3–R6, R9–R16, R18） |
 
 **実用上の含意**: ログ圧縮（グループ A）の受信側 §7 保持ルール（A7）は解消済みで、圧縮を
 有効にしても分岐 suffix を無条件保持することはない。ただし 2026-09-06 の再監査で、圧縮周りに
@@ -36,8 +36,10 @@ KV 状態の後退を防ぐガードがない（R5）。圧縮を有効にする
 **liveness** リスクも残る。
 
 読み取りは ReadIndex 化により線形化されている（D1–D3 解消。選挙直後は当選時 no-op が
-コミットされるまで一時的に読みが待たされる）。ただし Log Matching（R1）や AppendEntries の
-duplicate ACK（R2）に確認された安全性課題が残るため、「安全性違反なし」とは言えない。
+コミットされるまで一時的に読みが待たされる）。Log Matching（R1: `Start` の leader 確認と
+append の原子化）と AppendEntries の duplicate ACK（R2: 未永続 merge のロールバック）は解消した
+（`2c26b9a` / `c362ae4`）。ただし snapshot 経路の R3–R5 をはじめ未修正の安全性課題が残るため、
+「安全性違反なし」とは言えない。
 
 クライアントのリトライは D4/D5 の配線により重複検出の機構自体は実 API 経路に乗ったが、
 **ClientID を指定した場合に限る条件付きの at-most-once** であり（`kvstore/store.go:386`）、
@@ -104,8 +106,8 @@ duplicate ACK（R2）に確認された安全性課題が残るため、「安�
 
 | ID | 概要 | 優先度 | 状態 | 根拠（現コード）/ 監査参照 |
 |---|---|---|---|---|
-| R1 | `RaftNode.Start` が leader/term 確認と `AppendLogEntry` の durable append を別の `rs.mu` 臨界区間で行うため、その間に降格・高 term 化を挟むと非 leader が command を書き込みうる（Log Matching 違反） | P0 | ❌ UNFIXED | `raft/node.go:99-116`（`Start`）、`raft/log.go:93-111`（`AppendLogEntry`）。監査 §4 P0-1 |
-| R2 | AppendEntries が保存失敗後の同一要求の再送を `Success=true` で ACK しうる。`mergeLogEntries` は初回適用時に persist が失敗してもメモリ上の追記をロールバックしないため、再送時は「既に一致」と判定されて persist をスキップし、未永続のまま成功応答が返る。C3 の範囲不足であり、KNOWN 注記 2 の「安全側」評価は誤り | P0 | ❌ UNFIXED | `raft/rpc.go:180-196`（persist スキップ経路）、`:447-450`（`replicateToPeer` が `Success=true` を `MatchIndex` に反映）。監査 §4 P0-2、§2 表「応答前 persist」「Leader Completeness」 |
+| R1 | `RaftNode.Start` が leader/term 確認と `AppendLogEntry` の durable append を別の `rs.mu` 臨界区間で行うため、その間に降格・高 term 化を挟むと非 leader が command を書き込みうる（Log Matching 違反） | P0 | ✅ FIXED | `2c26b9a`（`RaftState.Start` が role 確認・term stamp・persist・ロールバックを `rs.mu` 1 回の中で行う。追記本体は `appendEntryLocked` に切り出し `appendNoOpLocked` と共有。`RaftNode.Start` は委譲のみで返り値の契約は不変） |
+| R2 | AppendEntries が保存失敗後の同一要求の再送を `Success=true` で ACK しうる。`mergeLogEntries` は初回適用時に persist が失敗してもメモリ上の追記をロールバックしないため、再送時は「既に一致」と判定されて persist をスキップし、未永続のまま成功応答が返る。C3 の範囲不足であり、KNOWN 注記 2 の「安全側」評価は誤り | P0 | ✅ FIXED | `c362ae4`（persist 失敗時に merge 前のログへロールバック。`mergeLogEntries` は衝突位置で `Log[:pos:pos]` と cap を切って追記するため上書きが起きず、保存しておいた slice header が有効な復元先になる。dirty フラグ方式ではなく「呼び出し完了後はメモリとディスクが一致する」という単一不変条件を選択） |
 | R3 | Raft state の境界 persist（InstallSnapshot 受信）と KV snapshot の保存が別段階で行われ、2 ファイル間の世代整合性（atomicity）がない。片方だけ保存できた状態で crash すると復旧不能または不整合になる | P0 | ❌ UNFIXED | `raft/rpc.go:658-665`（Raft 側境界 persist）、`kvstore/store.go:352-357`（KV 側 saveSnapshot）。監査 §4 P0-3、§2 表「snapshot と state の crash atomicity」 |
 | R4 | leader 送信側で snapshot のメタデータ（`LastIncludedIndex`/`LastIncludedTerm`）と実データ（`ReadSnapshot()` の戻り値）を別々のタイミングで読むため、両者が別世代になりうる | P0 | ❌ UNFIXED | `raft/rpc.go:379-406`（メタデータ取得、`rs.mu.RLock` 区間）、`:502-512`（`sendSnapshotToPeer` でのデータ読み出し、ロック外）。監査 §4 P0-4、§2 表「snapshot payload/metadata の同一性」 |
 | R5 | 受信側は snapshot の新旧を Raft の `LastIncludedIndex` としか比較せず（`volatile.CommitIndex`/`LastApplied` とは無関係）、KV 側 `installSnapshotFromApplyMsg` は適用済みインデックスとの比較なしに無条件で state を置換する。遅延・重複配送された古い snapshot が KV 状態を後退させうる | P0 | ❌ UNFIXED | `raft/rpc.go:635-637`（Raft 側の新旧比較）、`kvstore/store.go:340-344`（KV 側の無条件置換）。監査 §4 P0-5、§2 表「古い snapshot の適用」 |
@@ -126,15 +128,18 @@ duplicate ACK（R2）に確認された安全性課題が残るため、「安�
 1. **B1 修正のトレードオフ**: ブロッキング送信化により、applyCh 逆圧時（例: applyLoop 内の
    同期スナップショット保存中）は rs.mu 保持のまま全 RPC・選挙処理が停止する liveness 問題に
    転化した。専用 applier goroutine への分離が対策（TODO.md の項目 2.5）。
-2. **`2a35ce9` の副作用**: AppendEntries でメモリ上のログを切り詰め+追記した後に persist が
-   失敗すると `Success=false` を返すが、メモリとディスクの不一致が次回 persist 成功まで残る
-   （安全側の挙動）。
+2. **`2a35ce9` の副作用（R2 として `c362ae4` で修正済み）**: AppendEntries でメモリ上のログを
+   切り詰め+追記した後に persist が失敗すると `Success=false` を返すが、メモリとディスクの
+   不一致が次回 persist 成功まで残っていた。
    **訂正（2026-09-06 再監査、R2）**: 「安全側」なのは persist が失敗した*その*要求への応答
-   （`Success=false`）に限る。同一要求がリトライされた場合、`mergeLogEntries`
-   （`raft/rpc.go:206-230`）は前回の（未永続の）メモリ上の追記と比較して「既に一致」と判定して
-   `false` を返すため、`raft/rpc.go:180-196` の persist 呼び出し自体がスキップされ、
-   `Success=true` が返る。つまり未永続のエントリが再送によって恒久的に「永続化済み」であるかの
-   ように扱われる経路があり、単純に安全側とは言えない。詳細は下記グループ R の R2 を参照。
+   （`Success=false`）に限る。同一要求がリトライされた場合、`mergeLogEntries` は前回の
+   （未永続の）メモリ上の追記と比較して「既に一致」と判定して `false` を返すため、persist 呼び出し
+   自体がスキップされ、`Success=true` が返っていた。
+   **修正済み（`c362ae4`）**: persist に失敗した AppendEntries は merge 前のログへロールバック
+   するようになり、この不一致はハンドラを抜ける時点で残らない。したがって再送も改めて merge →
+   persist を通り、成功するまで `Success=false` が返る。「変更のない duplicate 要求は persist
+   しない」最適化は、メモリとディスクが一致している前提が成り立つため維持されている。同種の不一致は
+   InstallSnapshot 受信経路に残っている（注記 6・R3、本 PR の範囲外）。
 3. **RequestVote の persist 失敗時**: メモリ上の VotedFor は保持したまま `VoteGranted=false`
    のみ返す。同一 term 内の再投票を防ぐ安全方向の意図的設計（`raft/rpc.go:94-104` のコメント参照）。
 4. **A6 が CI で検出されなかった理由（解消済み）**: 旧統合テストは `fakeSnapshotter` を使い、
@@ -158,7 +163,7 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
 1. 現状訂正のみ（文書・行番号・保証範囲） — 本 PR
 2. ✅ 完了 — CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go` の
    timeout `break` を修正（R17）
-3. R1（`Start` の atomic 化）、R2（durable ACK）
+3. ✅ 完了 — R1（`Start` の atomic 化、`2c26b9a`）、R2（durable ACK、`c362ae4`）
 4. R3–R5（snapshot の世代整合・復旧・適用順序）
 5. R6、E1/E2（peer replication worker とタイマー/リーダー参照の統一）
 6. B3（ordered applier と shutdown lifecycle）

@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-06 / 対象 commit `dc5bb20`
+> 最終検証: 2026-09-06 / 対象 commit `d59bff3`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -10,8 +10,8 @@
 |---------|------|------|
 | リーダー選挙 (Section 5.2) | ⚠️ 要修正あり | 基本動作は実装済み。当選時に current-term no-op を追記（D3 解消）。圧縮後の投票判定も絶対 index 化済み（A2 解消・commit `8ad5367`）。残る懸念は E1（ロック外 `ResetElectionTimer` の data race）と R6（降格経路が `ResetElectionTimer` を呼ばず選挙タイマーが再始動しない） |
 | ログ複製 (Section 5.3) | ⚠️ 要修正あり | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）は完了。ただし境界 term 検査・commit 上限の一部分岐が未検証（R13、`raft/rpc.go:153-163,191-194`） |
-| 安全性保証 (Section 5.4) | ❌ 要修正あり | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。しかし 2026-09-06 再監査で Log Matching（R1: `Start` の leader 確認と append が別臨界区間）・Leader Completeness（R2: 未永続エントリの duplicate ACK）・State Machine Safety（R1 に加え R3–R5 の snapshot 世代不整合）に確認済みの問題がある |
-| 永続化 (Figure 2) | ⚠️ 要修正あり | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`AppendLogEntry`/`TruncateLogAfter`/当選時 no-op）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。ただし AppendEntries の受信経路には C3 の範囲外の問題が残る（R2: 未永続の merge 結果を再送時に `Success=true` で ACK しうる） |
+| 安全性保証 (Section 5.4) | ❌ 要修正あり | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。ただし State Machine Safety は R3–R5（snapshot の世代不整合）が未修正 |
+| 永続化 (Figure 2) | ⚠️ 要修正あり | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`appendEntryLocked` 経由の `AppendLogEntry`/`Start`/当選時 no-op、`TruncateLogAfter`）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。AppendEntries 受信経路の未永続 merge も persist 失敗時にロールバックするようになった（R2 解消・commit `c362ae4`）。ただし InstallSnapshot 受信経路には同種の不一致が残る（注記 6・R3） |
 | ログコンパクション (Section 7) | ❌ 要修正あり | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。ただし 2026-09-06 再監査で新たに: Raft state と KV snapshot の世代整合性がない（R3）、snapshot のメタデータと実データが別世代になりうる（R4）、古い snapshot による KV 状態の後退を防ぐガードがない（R5）ことを確認。B3（`rs.mu` 保持下の `applyCh` 送信、liveness）も残る |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応（R14）。`-join` は失敗してもログのみで起動を続ける fail-open（R12） |
 | クライアント相互作用 (Section 8) | ⚠️ 条件付きで配線済み | 重複検知（ClientID/SeqNum）を実 API 経路へ配線（D4 解消・commit `52afd48`）。ただし dedup は `ClientID` を指定した場合のみ発動する条件付きで（`kvstore/store.go:386`）、無条件の at-most-once ではない。committed 済みの結果解決は log index ではなく opID ベースで、pending 登録のタイミング競合（R9）がある。batch API は実装されておらず空 PUT として黙って成功する（R11） |
@@ -19,7 +19,7 @@
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信 = liveness）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）に加え、2026-09-06 再監査で確認されたグループ R（R1–R6, R9–R18、計 16 件）。R1（Log Matching）・R2（Leader Completeness/永続化）・R3–R5（State Machine Safety・snapshot 世代整合）は Raft の安全性そのものに関わる確認済みの問題であり、「論文の安全性性質を破る既知の経路は残っていない」とは言えない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信 = liveness）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）に加え、2026-09-06 再監査で確認されたグループ R のうち R3–R6, R9–R16, R18（計 13 件）。R1（Log Matching）と R2（Leader Completeness/永続化）は解消したが（`2c26b9a` / `c362ae4`）、R3–R5（State Machine Safety・snapshot 世代整合）は Raft の安全性そのものに関わる確認済みの問題として残っており、「論文の安全性性質を破る既知の経路は残っていない」とは言えない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -130,7 +130,7 @@ type AppendEntriesReply struct {
 
 ---
 
-### 3. 安全性保証 (Section 5.4) ❌ 要修正あり（R1, R2, R3–R5）
+### 3. 安全性保証 (Section 5.4) ❌ 要修正あり（R3–R5）
 
 #### 論文の要件
 - **選挙安全性**: 各任期で最大1人のリーダー
@@ -152,17 +152,17 @@ if args.LastLogTerm > lastLogTerm ||
 }
 ```
 
-選挙制限そのものと、現 term のエントリのみをコミットカウントする §5.4.2 規則（`updateCommitIndex`, `raft/rpc.go:540-548`）は実装済みです。ただし各安全性特性の実際の成立状況は以下の通りです:
+選挙制限そのものと、現 term のエントリのみをコミットカウントする §5.4.2 規則（`updateCommitIndex`, `raft/rpc.go:567-575`）は実装済みです。ただし各安全性特性の実際の成立状況は以下の通りです:
 
 - **選挙安全性**: 投票の応答前 persist（commit `2a35ce9`）により、クラッシュ跨ぎの二重投票は防止されます
-- **リーダー追記のみ**: リーダーの通常経路では満たされます
-- **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。InstallSnapshot 受信側の分岐 suffix 保持も §7 の保持ルール実装で解消（A7・`019d33e`）。ただし 2026-09-06 再監査（R1）により、`RaftNode.Start`（`raft/node.go:99-116`）が leader/term の確認と `AppendLogEntry`（`raft/log.go:93-111`）の durable append を別の `rs.mu` 臨界区間で行っていることが確認された。両者の間に降格・高 term 化が挟まると、非 leader になった後でも command が append されうる。既知の違反経路が残っている
-- **リーダー完全性 (Leader Completeness)**: 選挙制限が絶対 index でスナップショットメタデータを考慮するようになり（A2 解消・commit `8ad5367`）、圧縮後もコミット済みエントリを持たないノードは当選しません。加えて当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されます。一方 R2（`raft/rpc.go:180-196,447-450`）により、persist に失敗した AppendEntries の再送が `mergeLogEntries` の「既に一致」判定で persist をスキップし `Success=true` を返すため、未永続のエントリが `MatchIndex` に反映されうる
-- **状態機械安全性**: 上記（R1, R2）に加え、R3–R5（Raft state と KV snapshot の世代不整合、snapshot メタデータ/ペイロードの別世代化、古い snapshot による KV 状態の後退）が発火しない限り成立
+- **リーダー追記のみ**: `RaftState.Start`（`raft/log.go:148-165`）が leader 判定・term stamp・persist を 1 回の `rs.mu` の中で行うため、降格後に command が追記されることはありません（R1 解消・`2c26b9a`）
+- **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。InstallSnapshot 受信側の分岐 suffix 保持も §7 の保持ルール実装で解消（A7・`019d33e`）。2026-09-06 再監査で指摘された R1（`RaftNode.Start` が leader/term の確認と durable append を別の `rs.mu` 臨界区間で行い、間に降格が挟まると非 leader が新 term の command を追記しうる）は `2c26b9a` で解消した。`RaftNode.Start` は `RaftState.Start` へ委譲するだけになり、role 確認から persist・失敗時ロールバックまでが単一の `rs.mu` 臨界区間に収まっている
+- **リーダー完全性 (Leader Completeness)**: 選挙制限が絶対 index でスナップショットメタデータを考慮するようになり（A2 解消・commit `8ad5367`）、圧縮後もコミット済みエントリを持たないノードは当選しません。加えて当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されます。2026-09-06 再監査の R2（persist に失敗した AppendEntries の再送が `mergeLogEntries` の「既に一致」判定で persist をスキップし `Success=true` を返し、未永続のエントリが `MatchIndex` に反映されうる）は `c362ae4` で解消した。persist 失敗時に merge 前のログへロールバックするため、再送も改めて merge → persist を通り、成功するまで `Success=false` が返る
+- **状態機械安全性**: R1・R2 の解消後も、R3–R5（Raft state と KV snapshot の世代不整合、snapshot メタデータ/ペイロードの別世代化、古い snapshot による KV 状態の後退）が発火しない限りで成立
 
 ---
 
-### 4. 永続化 (Figure 2) ⚠️ 要修正あり（R2）
+### 4. 永続化 (Figure 2) ⚠️ 要修正あり（R3）
 
 #### 論文の要件
 - `currentTerm`, `votedFor`, `log[]` は永続化必須
@@ -192,15 +192,15 @@ type Persister interface {
 
 **応答前 persist 規律**（commit `2a35ce9` で確立）:
 - `RequestVote`: term/投票の変更を persist してから応答。**persist 失敗時にメモリ上の VotedFor を「取り消す」ことはしない** — VotedFor はセットされたまま `VoteGranted=false` のみ返す。これは同一 term 内の再投票を防ぐ意図的な安全側の設計（`raft/rpc.go:94-104`。KNOWN_ISSUES.md 注記 3 も参照）
-- `AppendEntries`: term 変更を persist してから応答する。失敗時は `Success=false`（`raft/rpc.go:134-140`）。追記エントリの persist も応答前に行われ、失敗時は `Success=false` のまま return する（`raft/rpc.go:185-188`）。ただし `mergeLogEntries` 自体はメモリ上の追記を先に行ってから persist するため、persist 失敗時にメモリの追記がロールバックされない。再送された同一要求はこの未永続の追記と一致するため `mergeLogEntries` が `false` を返し、persist を経ずに `Success=true` で応答してしまう（R2、`raft/rpc.go:180-196`）
-- `startElection`: 立候補（term+1・自己投票）を persist できなければ選挙を中止（`raft/rpc.go:232-250`）
+- `AppendEntries`: term 変更を persist してから応答する。失敗時は `Success=false`。追記エントリの persist も応答前に行われ、失敗時は merge 前のログへロールバックしたうえで `Success=false` のまま return する（`raft/rpc.go:178-207`。R2 解消・`c362ae4`）。ロールバックにより「ハンドラを抜けた時点でメモリとディスクが一致する」不変条件が保たれるため、再送された同一要求も改めて merge → persist を通り、永続化に成功するまで `Success=true` を返さない。`mergeLogEntries`（`raft/rpc.go:230-257`）は衝突位置で cap を切って（`Log[:pos:pos]`）追記するので既存エントリを上書きせず、保存しておいた slice header がそのまま復元先になる
+- `startElection`: 立候補（term+1・自己投票）を persist できなければ選挙を中止（`raft/rpc.go:259-277`）
 - 永続状態のロード失敗時は起動を拒否（`raft/state.go:157-161`, `raft/node.go:29-34`）
 
 **リーダー自身の追記経路**（commit `ffc2926` で C3 を解消）:
-- `AppendLogEntry` は `(int, error)` を返す。persist に失敗したら追記をロールバックし（メモリとディスクを一致させる）、エラーを返す（`raft/log.go:93-111`）
-- `TruncateLogAfter` は `error` を返す。persist に失敗したら切り詰め前のログを復元する（`raft/log.go:163-180`）
-- 当選時 no-op（`appendNoOpLocked`）も persist 失敗時はロールバック。no-op を失っても安全側で、current-term のエントリがコミットされるまで読み取りが `ErrNoCurrentTermCommit` を返し続けるだけ（`raft/noop.go:48-61`）
-- `RaftNode.Start` はエラーを返し、KV 層はタイムアウトを待たずに操作を失敗させる（`raft/node.go:99-116`, `kvstore/store.go:598-609`）。ただし R1（`raft/node.go:99-116`）: leader/term の確認と `AppendLogEntry` は別の `rs.mu` 臨界区間であり、両者の間に降格が挟まると非 leader が append しうる
+- 追記本体は `appendEntryLocked`（`rs.mu` 保持が前提）に切り出されている。persist に失敗したら追記をロールバックし（メモリとディスクを一致させる）、エラーを返す（`raft/log.go:100-118`）。`AppendLogEntry`（`:120-129`）はこれをロック取得付きで包んだもの
+- `TruncateLogAfter` は `error` を返す。persist に失敗したら切り詰め前のログを復元する（`raft/log.go:215-232`）
+- 当選時 no-op（`appendNoOpLocked`）も同じ `appendEntryLocked` を使い、persist 失敗時はロールバック。no-op を失っても安全側で、current-term のエントリがコミットされるまで読み取りが `ErrNoCurrentTermCommit` を返し続けるだけ（`raft/noop.go:48-54`）
+- `RaftNode.Start` はエラーを返し、KV 層はタイムアウトを待たずに操作を失敗させる（`raft/node.go:94-119`, `kvstore/store.go:598-609`）。leader 判定と追記は `RaftState.Start` の単一 `rs.mu` 臨界区間で行われる（R1 解消・`2c26b9a`）
 
 ---
 
@@ -416,7 +416,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 1. ✅ 完了 — 現状訂正のみ（PR #22）
 2. ✅ 完了 — CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go` の
    timeout `break` を修正（R17、`19bdb37`/`91b0f7c`）
-3. R1、R2 — P0
+3. ✅ 完了 — R1（`Start` の leader 判定と append の原子化、`2c26b9a`）、R2（未永続 merge のロールバックによる durable ACK、`c362ae4`）
 4. R3–R5（snapshot の世代整合・復旧・適用順序） — P0
 5. R6、E1/E2、peer replication worker（タイマー・リーダー参照の統一） — P1
 6. B3（受信ハンドラの `rs.mu` 保持下ブロッキング送信）の ordered applier と shutdown lifecycle

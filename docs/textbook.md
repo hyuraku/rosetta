@@ -1039,8 +1039,10 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
 | C3 | persist() のエラー無視 | ✅ **修正済み**（RPC 応答経路は `2a35ce9`。リーダー自身の `AppendLogEntry`/`TruncateLogAfter`/当選時 no-op は `ffc2926` でロールバック＋エラー通知） |
 | D1–D5 | lease 期間・起点、no-op 不在（D1–D3）、重複検出未配線（D4）、spurious leadership lost（D5） | ✅ **修正済み**（D1/D2 `b3b21a4`、D3 `60fd631`、D4 `52afd48`、D5 `16a9b31`） |
 | E1–E2 | ロック外タイマーリセット、スライス共有 | ❌ 未修正 |
+| R1 | `Start` の leader 判定と durable append が別の `rs.mu` 臨界区間（Log Matching 違反） | ✅ **修正済み**（`2c26b9a`、`RaftState.Start` で 1 回のロックに統合） |
+| R2 | persist 失敗後の同一 AppendEntries 再送を `Success=true` で ACK（Leader Completeness 違反） | ✅ **修正済み**（`c362ae4`、persist 失敗時に merge をロールバック） |
 
-> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです。B1・B2・A1–A8・C1–C4・D1–D5 はすべて別 PR で修正済みですが、2026-09-06 の再監査（`docs/raft-audit-2026-09-06.md`）により Log Matching（R1）・Leader Completeness/永続化（R2）・State Machine Safety・snapshot 世代整合（R3–R5）に新たな確認済みの問題が見つかっており、「Raft の安全性そのものを破る既知の経路は残っていない」とはもう言えません。未修正は B3（applyCh ブロッキング送信の liveness）・E1・E2（data race）に加え、グループ R（R1–R6, R9–R18）です。詳細は `KNOWN_ISSUES.md` を参照してください。**本文の第 12 章「InstallSnapshot RPC 受信側」にある A7 の指摘は 9a90cf5 当時の記述であり、現在は解消済み**です。
+> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです（同期時点: 2026-09-06 / commit `d59bff3`）。B1・B2・A1–A8・C1–C4・D1–D5 はすべて別 PR で修正済みで、2026-09-06 の再監査（`docs/raft-audit-2026-09-06.md`）で見つかった R1（Log Matching）・R2（Leader Completeness/永続化）も修正済みです。ただし State Machine Safety・snapshot 世代整合（R3–R5）は未修正のため、「Raft の安全性そのものを破る既知の経路は残っていない」とはまだ言えません。未修正は B3（applyCh ブロッキング送信の liveness）・E1・E2（data race）に加え、グループ R の R3–R6, R9–R16, R18 です。詳細は `KNOWN_ISSUES.md` を参照してください。**本文の第 12 章「InstallSnapshot RPC 受信側」にある A7 の指摘は 9a90cf5 当時の記述であり、現在は解消済み**です。
 
 ---
 
