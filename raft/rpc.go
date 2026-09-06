@@ -91,7 +91,7 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			rs.persistent.VotedFor = &args.CandidateID
 			reply.VoteGranted = true
-			rs.ResetElectionTimer()
+			rs.resetElectionTimerLocked()
 
 			// Persist the vote before responding. If the write fails we must not
 			// tell the candidate we voted for it: the vote is not durable, so a
@@ -280,9 +280,12 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	// Use a vote counter that's protected by the RaftState mutex
 	votes := 1
 	votesNeeded := len(rs.peers)/quorumDivisor + 1
+	// Re-arm the (already fired) timer under the same lock the RPC handlers hold
+	// when they reset it, so this election's timeout does not race with an
+	// incoming AppendEntries (KNOWN_ISSUES.md E1). It also bounds this election:
+	// if it draws no quorum, the timeout starts the next one.
+	rs.resetElectionTimerLocked()
 	rs.mu.Unlock()
-
-	rs.ResetElectionTimer()
 
 	// If this is a single-node cluster, immediately become leader. becomeLeader
 	// appends the current-term no-op and stops the election timer.
