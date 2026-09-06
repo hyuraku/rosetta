@@ -261,6 +261,56 @@ func (rs *RaftState) SetState(state NodeState) {
 	}
 }
 
+// becomeFollowerLocked is the single follower transition. Every path that ends
+// up a follower goes through it: a receiver accepting a leader's authority
+// (AppendEntries, InstallSnapshot), a node that learns of a higher term
+// (RequestVote and the three replication reply paths, plus ReadIndex's
+// stepDown), and an election attempt that could not be made durable. Callers
+// must hold rs.mu.
+//
+// It exists because those paths each did a slightly different subset of the
+// work. The leader-side demotion paths set state/term/VotedFor and persisted but
+// never re-armed the election timer that becomeLeader stopped, so a demoted
+// leader sat as a follower with a dead timer and could not campaign again unless
+// some other leader happened to reach it — a node lost to the cluster's
+// availability for as long as that took (KNOWN_ISSUES.md R6).
+//
+// term is the term to adopt; passing the current term (or an older one) leaves
+// the term and the vote untouched and performs only the role transition.
+// leaderID is the leader we are now following, or "" when it is unknown.
+//
+// The returned error is the result of persisting a term change. Nothing is
+// written when the term did not move, so the heartbeat path stays free of disk
+// I/O. Callers decide what a failure means, keeping the discipline each path
+// already had: an RPC handler must not answer under a term it has not durably
+// recorded, while a reply path only logs. Either way the in-memory term stays
+// bumped — the safe direction, since it can only stop us from acting in the
+// older term (KNOWN_ISSUES.md 注記 3).
+func (rs *RaftState) becomeFollowerLocked(term int, leaderID string) error {
+	termChanged := term > rs.persistent.CurrentTerm
+	if termChanged {
+		rs.persistent.CurrentTerm = term
+		rs.persistent.VotedFor = nil
+	}
+
+	rs.state = Follower
+	rs.currentLeader = leaderID
+	// Per-peer replication state belongs to one leader term. Dropping it stops a
+	// demoted leader from advancing MatchIndex on a reply that arrives late, and
+	// makes "rs.leader != nil" mean "we are the leader" everywhere.
+	rs.leader = nil
+	// Always re-arm. This is the one place that knows the node is (or remains) a
+	// follower, and the timer here is either stopped (we were the leader) or has
+	// already fired (we are handling our own election timeout); a follower with
+	// no armed timer never campaigns again.
+	rs.ResetElectionTimer()
+
+	if !termChanged {
+		return nil
+	}
+	return rs.persist()
+}
+
 func (rs *RaftState) IncrementTerm() {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()

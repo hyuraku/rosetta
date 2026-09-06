@@ -65,14 +65,19 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 		return
 	}
 
-	// Track whether we mutated persistent state (term or vote) so we can flush
-	// it to stable storage before replying.
-	dirty := false
+	// Adopt a higher term through the common follower transition. It persists the
+	// term bump itself, so granting a vote below costs a second write; that only
+	// happens on the election path, and it keeps the "durable before responding"
+	// rule (Figure 2) in one place instead of spread across every caller.
+	//
+	// A failure here does not end the handler: the vote decision below still runs
+	// and its persist covers the whole persistent state (term and vote together),
+	// so a write that succeeds there makes both durable. The in-memory VotedFor
+	// it may set is the safe direction either way (KNOWN_ISSUES.md 注記 3).
 	if args.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = args.Term
-		rs.persistent.VotedFor = nil
-		rs.state = Follower
-		dirty = true
+		if err := rs.becomeFollowerLocked(args.Term, ""); err != nil {
+			rs.logger.Printf("RequestVote: persist of higher term failed: %v", err)
+		}
 	}
 
 	if rs.persistent.VotedFor == nil || *rs.persistent.VotedFor == args.CandidateID {
@@ -87,19 +92,17 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 			rs.persistent.VotedFor = &args.CandidateID
 			reply.VoteGranted = true
 			rs.ResetElectionTimer()
-			dirty = true
-		}
-	}
 
-	// Persist the vote/term change before responding. If the write fails we must
-	// not tell the candidate we voted for it: the vote is not durable, so a crash
-	// here could let us vote again for a different candidate in the same term.
-	// The in-memory VotedFor stays set, which is the safe direction (it only
-	// prevents further votes this term); a later successful persist reconciles it.
-	if dirty {
-		if err := rs.persist(); err != nil {
-			reply.VoteGranted = false
-			rs.logger.Printf("RequestVote: refusing to grant vote, persist failed: %v", err)
+			// Persist the vote before responding. If the write fails we must not
+			// tell the candidate we voted for it: the vote is not durable, so a
+			// crash here could let us vote again for a different candidate in the
+			// same term. The in-memory VotedFor stays set, which is the safe
+			// direction (it only prevents further votes this term); a later
+			// successful persist reconciles it.
+			if err := rs.persist(); err != nil {
+				reply.VoteGranted = false
+				rs.logger.Printf("RequestVote: refusing to grant vote, persist failed: %v", err)
+			}
 		}
 	}
 
@@ -117,26 +120,15 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		return
 	}
 
-	termChanged := false
-	if args.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = args.Term
-		rs.persistent.VotedFor = nil
-		termChanged = true
-	}
-
-	rs.state = Follower
-	rs.currentLeader = args.LeaderID // Track who the current leader is
-	rs.ResetElectionTimer()
-
-	// A term bump must reach stable storage before we respond. On failure we
-	// leave Success=false and bail out rather than acknowledging under a term
-	// we have not durably recorded.
-	if termChanged {
-		if err := rs.persist(); err != nil {
-			rs.logger.Printf("AppendEntries: persist of term change failed: %v", err)
-			reply.Term = rs.persistent.CurrentTerm
-			return
-		}
+	// Accept this leader's authority through the common follower transition: it
+	// adopts the term, records the leader, and re-arms the election timer, which
+	// every valid AppendEntries must do. A term bump must reach stable storage
+	// before we respond, so on a persist failure we leave Success=false and bail
+	// out rather than acknowledging under a term we have not durably recorded.
+	if err := rs.becomeFollowerLocked(args.Term, args.LeaderID); err != nil {
+		rs.logger.Printf("AppendEntries: persist of term change failed: %v", err)
+		reply.Term = rs.persistent.CurrentTerm
+		return
 	}
 	reply.Term = rs.persistent.CurrentTerm
 
@@ -267,12 +259,16 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 		// Abort this election attempt; a later election timeout will retry once
 		// storage recovers, rather than campaigning under an unpersisted term.
 		rs.logger.Printf("startElection: persist failed, aborting election: %v", err)
-		rs.state = Follower
+		// Drop back to follower through the common transition, which re-arms the
+		// (already fired) election timer so we retry on the next timeout once
+		// storage recovers; otherwise this node would never campaign again until
+		// it hears from a leader. The term stays bumped in memory as on every
+		// other unpersisted term change, so becomeFollowerLocked is passed the
+		// term we already hold and writes nothing.
+		if ferr := rs.becomeFollowerLocked(rs.persistent.CurrentTerm, ""); ferr != nil {
+			rs.logger.Printf("startElection: follower transition after failed persist: %v", ferr)
+		}
 		rs.mu.Unlock()
-		// Re-arm the (already fired) election timer so we retry on the next
-		// timeout once storage recovers; otherwise this node would never
-		// campaign again until it hears from a leader.
-		rs.ResetElectionTimer()
 		return
 	}
 	currentTerm := rs.persistent.CurrentTerm
@@ -342,10 +338,10 @@ func (rs *RaftState) requestVoteFromPeer(
 	}
 
 	if reply.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = reply.Term
-		rs.state = Follower
-		rs.persistent.VotedFor = nil
-		if err := rs.persist(); err != nil {
+		// Step down through the common transition, which also re-arms the election
+		// timer (KNOWN_ISSUES.md R6). A failed persist is only logged here: there
+		// is no RPC response riding on it, and the next election timeout retries.
+		if err := rs.becomeFollowerLocked(reply.Term, ""); err != nil {
 			rs.logger.Printf("requestVoteFromPeer: persist of higher term failed: %v", err)
 		}
 		return
@@ -404,6 +400,13 @@ func (rs *RaftState) replicateToPeer(
 	currentTerm, commitIndex int,
 ) {
 	rs.mu.RLock()
+	if rs.state != Leader || rs.leader == nil {
+		// Demoted between the tick that scheduled this round and now.
+		// becomeFollowerLocked drops the per-peer replication state, so this is
+		// also what keeps the read below from dereferencing a nil LeaderState.
+		rs.mu.RUnlock()
+		return
+	}
 	nextIndex := rs.leader.NextIndex[peerID]
 	lastIncludedIndex := rs.persistent.LastIncludedIndex
 	lastIncludedTerm := rs.persistent.LastIncludedTerm
@@ -462,10 +465,10 @@ func (rs *RaftState) replicateToPeer(
 	defer rs.mu.Unlock()
 
 	if reply.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = reply.Term
-		rs.state = Follower
-		rs.persistent.VotedFor = nil
-		if err := rs.persist(); err != nil {
+		// Step down through the common transition, which also re-arms the election
+		// timer becomeLeader stopped. Without that, a leader demoted by a reply
+		// could never start an election again (KNOWN_ISSUES.md R6).
+		if err := rs.becomeFollowerLocked(reply.Term, ""); err != nil {
 			rs.logger.Printf("replicateToPeer: persist of higher term failed: %v", err)
 		}
 		return
@@ -571,10 +574,9 @@ func (rs *RaftState) sendSnapshotToPeer(
 	defer rs.mu.Unlock()
 
 	if reply.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = reply.Term
-		rs.state = Follower
-		rs.persistent.VotedFor = nil
-		if err := rs.persist(); err != nil {
+		// Step down through the common transition, which also re-arms the election
+		// timer becomeLeader stopped (KNOWN_ISSUES.md R6).
+		if err := rs.becomeFollowerLocked(reply.Term, ""); err != nil {
 			rs.logger.Printf("sendSnapshotToPeer: persist of higher term failed: %v", err)
 		}
 		return
@@ -685,24 +687,18 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		return
 	}
 
-	// Update term if necessary
-	if args.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = args.Term
-		rs.persistent.VotedFor = nil
-		rs.state = Follower
-		if err := rs.persist(); err != nil {
-			rs.logger.Printf("InstallSnapshot: persist of term change failed: %v", err)
-			reply.Term = rs.persistent.CurrentTerm
-			return
-		}
+	// Accept this leader's authority through the common follower transition: it
+	// adopts the term, records the leader and resets the election timer (valid
+	// communication from a leader). A term bump must be durable before we answer,
+	// so a persist failure ends the handler before anything else is touched —
+	// which also keeps this ahead of the ordering invariant's step 1.
+	if err := rs.becomeFollowerLocked(args.Term, args.LeaderID); err != nil {
+		rs.logger.Printf("InstallSnapshot: persist of term change failed: %v", err)
+		reply.Term = rs.persistent.CurrentTerm
+		return
 	}
 
 	reply.Term = rs.persistent.CurrentTerm
-
-	// Reset election timer - valid communication from leader
-	rs.state = Follower
-	rs.currentLeader = args.LeaderID
-	rs.ResetElectionTimer()
 
 	// Refuse any snapshot that would move this node backwards. Comparing only
 	// against LastIncludedIndex (the previous behavior) let a delayed or
