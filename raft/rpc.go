@@ -501,6 +501,21 @@ func (rs *RaftState) releaseReplicationSlot(peerID string) {
 	}
 }
 
+// clampNextIndexIfStale corrects peerID's NextIndex down to one past the live
+// log's end when it has drifted beyond it — the log was shortened (e.g.
+// TruncateLogAfter) after NextIndex was last advanced. A no-op once the map
+// already agrees, including when this node is no longer the leader.
+func (rs *RaftState) clampNextIndexIfStale(peerID string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.leader == nil {
+		return
+	}
+	if lastIdx := rs.lastAbsLogIndex(); rs.leader.NextIndex[peerID] > lastIdx+1 {
+		rs.leader.NextIndex[peerID] = lastIdx + 1
+	}
+}
+
 // replicateToPeer sends one round of replication to a single follower. It
 // decides between AppendEntries and InstallSnapshot based on whether the
 // follower's nextIndex still lies within the leader's (post-compaction) log.
@@ -510,6 +525,22 @@ func (rs *RaftState) replicateToPeer(
 	peerID string,
 	currentTerm, commitIndex int,
 ) {
+	// nextIndex can be stale relative to a log that has since been shortened —
+	// TruncateLogAfter running between the tick that scheduled this round (and
+	// read NextIndex to decide whether a slot was free) and this goroutine's
+	// turn to actually run. Left unclamped, the prevLogIndex computed below
+	// could exceed the live log's end and the slice index derived from it would
+	// run past len(Log): a panic (KNOWN_ISSUES.md R13-3, PR #26 followup).
+	// Correcting the map entry itself — not just a local copy — needs its own
+	// brief Lock: sendHeartbeats' inFlight claim already guarantees only one
+	// round runs per peer at a time, so this cannot race the reply-processing
+	// path's own writes to the same entry below, and it keeps a permanently
+	// stale NextIndex from silently pinning every future round to zero new
+	// entries (which a merely-local clamp would do, since it would recompute
+	// the same "one past the log's current end" on every round without ever
+	// correcting what sendHeartbeats/replicatePeerOnce actually schedules from).
+	rs.clampNextIndexIfStale(peerID)
+
 	rs.mu.RLock()
 	if rs.state != Leader || rs.leader == nil {
 		// Demoted between the tick that scheduled this round and now.
