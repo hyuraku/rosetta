@@ -170,8 +170,21 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 
 	if args.LeaderCommit > rs.volatile.CommitIndex {
-		rs.volatile.CommitIndex = min(args.LeaderCommit, rs.lastAbsLogIndex())
-		rs.notifyApplierLocked()
+		// Figure 2, receiver rule 5: commitIndex = min(leaderCommit, index of
+		// last new entry) — never min(leaderCommit, our whole log's end).
+		// lastNewIndex is the last index *this* request actually vouches for; a
+		// short request (fewer entries than our live log holds beyond
+		// PrevLogIndex) must not let LeaderCommit reach into whatever suffix we
+		// already had lying around. That suffix can be leftover from a term the
+		// current leader knows nothing about — mergeLogEntries only overwrites it
+		// on conflict, so an old, never-agreed-on tail can still be sitting past
+		// where this request's Entries end (KNOWN_ISSUES.md R13-2).
+		lastNewIndex := args.PrevLogIndex + len(args.Entries)
+		newCommitIndex := min(args.LeaderCommit, lastNewIndex, rs.lastAbsLogIndex())
+		if newCommitIndex > rs.volatile.CommitIndex {
+			rs.volatile.CommitIndex = newCommitIndex
+			rs.notifyApplierLocked()
+		}
 	}
 
 	reply.Success = true

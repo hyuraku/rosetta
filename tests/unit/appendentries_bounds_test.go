@@ -2,6 +2,7 @@ package unit
 
 import (
 	"testing"
+	"time"
 
 	"rosetta/raft"
 )
@@ -103,5 +104,103 @@ func TestAppendEntriesRejectsBoundaryTermMismatchWithinEntries(t *testing.T) {
 	if gotLii != liiBefore || gotLit != litBefore {
 		t.Errorf("snapshot boundary mutated by a rejected request: got (%d,%d), want unchanged (%d,%d)",
 			gotLii, gotLit, liiBefore, litBefore)
+	}
+}
+
+// R13-2: commitIndex must advance only to the last index *this* request
+// actually vouches for (Figure 2, receiver rule 5: min(leaderCommit, index of
+// last new entry)), never past it just because the follower's own log happens
+// to extend further. This reproduces a follower holding a leftover suffix from
+// a stale term (as if left by a leader that never committed it) and a new
+// leader sending a short request (here, an empty heartbeat) whose LeaderCommit
+// reaches into that leftover suffix.
+//
+// Before the fix this test fails: CommitIndex advances to 8 (min(LeaderCommit,
+// lastAbsLogIndex())) even though this request only vouches for up to index 5.
+func TestAppendEntriesCommitIndexBoundedByLastNewEntry(t *testing.T) {
+	applyCh := make(chan raft.ApplyMsg, 16)
+	follower := raft.NewRaftState("follower", []string{"follower", "leader"}, applyCh)
+
+	// Seed indices 1..5 at term 1 (as if from an earlier, legitimate leader).
+	seedReply := &raft.AppendEntriesReply{}
+	follower.AppendEntries(&raft.AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "leader",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries: []raft.LogEntry{
+			{Term: 1, Index: 1, Command: "e1", Type: "command"},
+			{Term: 1, Index: 2, Command: "e2", Type: "command"},
+			{Term: 1, Index: 3, Command: "e3", Type: "command"},
+			{Term: 1, Index: 4, Command: "e4", Type: "command"},
+			{Term: 1, Index: 5, Command: "e5", Type: "command"},
+		},
+		LeaderCommit: 0,
+	}, seedReply)
+	if !seedReply.Success {
+		t.Fatalf("setup: seeding indices 1..5 failed: %+v", seedReply)
+	}
+
+	// A second, later leader (term 2) appends a suffix at 6..8 that it never
+	// gets to commit before this test moves on — an ordinary, never-agreed-on
+	// tail left sitting on the follower's log.
+	staleReply := &raft.AppendEntriesReply{}
+	follower.AppendEntries(&raft.AppendEntriesArgs{
+		Term:         2,
+		LeaderID:     "leader",
+		PrevLogIndex: 5,
+		PrevLogTerm:  1,
+		Entries: []raft.LogEntry{
+			{Term: 2, Index: 6, Command: "stale6", Type: "command"},
+			{Term: 2, Index: 7, Command: "stale7", Type: "command"},
+			{Term: 2, Index: 8, Command: "stale8", Type: "command"},
+		},
+		LeaderCommit: 0,
+	}, staleReply)
+	if !staleReply.Success {
+		t.Fatalf("setup: appending the stale term-2 suffix failed: %+v", staleReply)
+	}
+	if got := follower.GetLastLogIndex(); got != 8 {
+		t.Fatalf("setup: last log index = %d, want 8", got)
+	}
+
+	// A third leader (term 3) probes this follower with an empty heartbeat at
+	// PrevLogIndex=5 (it has not yet learned about, let alone verified, entries
+	// 6..8) but reports LeaderCommit=8 from its own, unrelated replication
+	// state. This request's "last new entry" is only index 5.
+	heartbeatReply := &raft.AppendEntriesReply{}
+	follower.AppendEntries(&raft.AppendEntriesArgs{
+		Term:         3,
+		LeaderID:     "leader",
+		PrevLogIndex: 5,
+		PrevLogTerm:  1,
+		Entries:      nil,
+		LeaderCommit: 8,
+	}, heartbeatReply)
+
+	if !heartbeatReply.Success {
+		t.Fatalf("heartbeat rejected unexpectedly: %+v", heartbeatReply)
+	}
+	if got := follower.GetCommitIndex(); got != 5 {
+		t.Errorf("CommitIndex = %d, want 5 (min(LeaderCommit=8, lastNewIndex=5, lastAbsLogIndex=8)); "+
+			"a short request must not let LeaderCommit reach into a suffix it never vouched for", got)
+	}
+
+	// The applier must only have delivered entries 1..5, never the stale 6..8.
+	for want := 1; want <= 5; want++ {
+		select {
+		case msg := <-applyCh:
+			if msg.CommandIndex != want {
+				t.Fatalf("applied out of order: got CommandIndex %d, want %d", msg.CommandIndex, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for applied entry %d", want)
+		}
+	}
+	select {
+	case msg := <-applyCh:
+		t.Fatalf("applier delivered an entry beyond CommitIndex 5: %+v", msg)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: nothing more to apply.
 	}
 }
