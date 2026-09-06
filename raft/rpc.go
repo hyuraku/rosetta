@@ -200,7 +200,7 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 
 	if args.LeaderCommit > rs.volatile.CommitIndex {
 		rs.volatile.CommitIndex = min(args.LeaderCommit, rs.lastAbsLogIndex())
-		rs.applyEntries()
+		rs.notifyApplierLocked()
 	}
 
 	reply.Success = true
@@ -680,7 +680,7 @@ func (rs *RaftState) updateCommitIndex() {
 
 		if count*2 > len(rs.peers) {
 			rs.volatile.CommitIndex = n
-			rs.applyEntries()
+			rs.notifyApplierLocked()
 		}
 	}
 }
@@ -744,9 +744,11 @@ func DeserializeAppendEntriesReply(data []byte) (*AppendEntriesReply, error) {
 // its log discarded below N, while the state machine on disk was still at some
 // index < N and could never be sent those entries again.
 //
-// The same invariant has to hold once the applyCh send moves off this goroutine
-// (KNOWN_ISSUES.md B3): steps 1 and 2 must still complete, in that order, before
-// the snapshot is handed to the applier.
+// The applyCh send now happens on the applier goroutine (KNOWN_ISSUES.md B3),
+// which does not change the invariant: steps 1 and 2 still complete, in that
+// order, inside this handler, and only then is the snapshot queued for the
+// applier. What step 3 becomes is "queue the in-memory update"; it is no longer
+// this goroutine that waits for the state machine to take it.
 func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -849,7 +851,15 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	}
 
 	// Step 3: hand the snapshot to the state machine for its in-memory update.
-	rs.applyCh <- ApplyMsg{
+	// Queued for the applier rather than sent from here, so a state machine that
+	// is slow to take it does not hold rs.mu — and with it every RPC and the
+	// election timer — for the duration (KNOWN_ISSUES.md B3).
+	//
+	// The queue slot is claimed under the same lock that just advanced
+	// LastApplied to this snapshot's index, which is what orders the two streams:
+	// no command above this index can have been claimed by the applier yet, so
+	// the snapshot reaches the state machine before all of them.
+	rs.pendingSnapshot = &ApplyMsg{
 		CommandValid:      false,
 		Command:           args.Data,
 		CommandIndex:      args.LastIncludedIndex,
@@ -859,6 +869,7 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		SnapshotData:      args.Data,
 		SnapshotPersisted: snapshotPersisted,
 	}
+	rs.notifyApplierLocked()
 }
 
 // Serialization for InstallSnapshot

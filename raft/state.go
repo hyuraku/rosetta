@@ -107,9 +107,74 @@ type RaftState struct {
 	persister Persister
 	logger    *log.Logger
 
+	// applyNotify wakes the applier goroutine when there is new work: the commit
+	// index moved, or an installed snapshot is waiting to be handed over. It is
+	// buffered with room for one token and written with a non-blocking send, so a
+	// lock holder never blocks on it and repeated notifications coalesce into the
+	// single "go look again" the applier needs.
+	applyNotify chan struct{}
+	// pendingSnapshot is the most recently installed snapshot that the applier
+	// has not delivered yet, or nil. Written under rs.mu by the InstallSnapshot
+	// receive path and taken by the applier under the same lock. Only the newest
+	// one is kept: snapshots arrive in increasing index order (older ones are
+	// rejected outright), so an undelivered one is always subsumed by its
+	// successor.
+	pendingSnapshot *ApplyMsg
+
+	// Goroutine lifecycle. lifecycleMu guards the stopped flag so that spawn can
+	// never call wg.Add after Stop has begun waiting; stopCh is the broadcast
+	// every spawned goroutine (and the applier's channel sends) selects on.
+	lifecycleMu sync.Mutex
+	stopped     bool
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+
 	// snapshotter is consulted by the leader when a follower needs InstallSnapshot.
 	// May be nil if log compaction is not configured (snapshot RPCs will be skipped).
 	snapshotter Snapshotter
+}
+
+// spawn starts fn in a goroutine that Stop will wait for, and reports whether it
+// was started. It is the only way a RaftState creates a goroutine, so that
+// shutdown has an exact list of what to join (KNOWN_ISSUES.md R19).
+//
+// After Stop has been entered nothing new is started and false is returned:
+// callers that reserved something for the goroutine (the replication slot, a
+// slot in a results channel) must undo that reservation themselves.
+func (rs *RaftState) spawn(fn func()) bool {
+	rs.lifecycleMu.Lock()
+	if rs.stopped {
+		rs.lifecycleMu.Unlock()
+		return false
+	}
+	// Add under lifecycleMu, which Stop also takes before it starts waiting, so
+	// an Add can never race a Wait that has already begun.
+	rs.wg.Add(1)
+	rs.lifecycleMu.Unlock()
+
+	go func() {
+		defer rs.wg.Done()
+		fn()
+	}()
+	return true
+}
+
+// Stop closes the stop signal and blocks until every goroutine this RaftState
+// started has returned — the applier, the replication and vote rounds, and the
+// ReadIndex heartbeats. It is idempotent, and a concurrent second caller waits
+// for the same set of goroutines rather than returning early.
+//
+// Returning from Stop is what makes it safe to close applyCh: the applier is the
+// only sender on that channel and it has exited by then (KNOWN_ISSUES.md R19).
+func (rs *RaftState) Stop() {
+	rs.lifecycleMu.Lock()
+	if !rs.stopped {
+		rs.stopped = true
+		close(rs.stopCh)
+	}
+	rs.lifecycleMu.Unlock()
+
+	rs.wg.Wait()
 }
 
 // SetSnapshotter wires the state machine snapshotter so the leader can serve
@@ -164,6 +229,8 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 		heartbeatTimeout: heartbeatInterval,
 		lastHeartbeat:    time.Now(),
 		applyCh:          applyCh,
+		applyNotify:      make(chan struct{}, 1),
+		stopCh:           make(chan struct{}),
 		persister:        persister,
 		logger:           log.New(log.Writer(), "[RAFT-STATE-"+nodeID+"] ", log.LstdFlags),
 	}
@@ -180,6 +247,12 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 	}
 
 	rs.electionTimer = time.NewTimer(rs.electionTimeout)
+
+	// The applier is owned by the state, not by RaftNode, because RaftState is
+	// constructed on its own in tests and by callers that drive the RPC handlers
+	// directly; those paths must still see committed entries reach applyCh.
+	// Stop() (via RaftNode.Kill) is what ends it.
+	rs.spawn(rs.applier)
 
 	return rs, nil
 }
