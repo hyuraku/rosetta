@@ -8,17 +8,27 @@ import (
 
 // recordingPersister is an in-memory raft.Persister for durability tests. It
 // keeps the last state that was *successfully* saved (so a test can assert what
-// a crash-and-restart would recover) and can run a hook inside SaveRaftState so
-// a test can drive a concurrent RPC while the caller still holds rs.mu.
+// a crash-and-restart would recover), can be told to fail an arbitrary number of
+// upcoming saves, and can run a hook inside SaveRaftState so a test can drive a
+// concurrent RPC while the caller still holds rs.mu.
 type recordingPersister struct {
-	mu    sync.Mutex
-	saved raft.PersistentState
-	hook  func()
+	mu       sync.Mutex
+	saved    raft.PersistentState
+	failures int
+	hook     func()
+}
+
+// setFailures makes the next n calls to SaveRaftState fail with errPersist.
+// A negative count fails every save until it is reset.
+func (p *recordingPersister) setFailures(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.failures = n
 }
 
 // setHook installs a function that runs on entry to SaveRaftState, before the
-// save completes. It runs while the caller holds rs.mu, which is exactly what a
-// test needs in order to prove that no other rs.mu critical section can
+// save succeeds or fails. It runs while the caller holds rs.mu, which is exactly
+// what a test needs in order to prove that no other rs.mu critical section can
 // interleave with a persist.
 func (p *recordingPersister) setHook(f func()) {
 	p.mu.Lock()
@@ -29,10 +39,17 @@ func (p *recordingPersister) setHook(f func()) {
 func (p *recordingPersister) SaveRaftState(state *raft.PersistentState) error {
 	p.mu.Lock()
 	hook := p.hook
+	fail := p.failures != 0
+	if p.failures > 0 {
+		p.failures--
+	}
 	p.mu.Unlock()
 
 	if hook != nil {
 		hook()
+	}
+	if fail {
+		return errPersist
 	}
 
 	p.mu.Lock()

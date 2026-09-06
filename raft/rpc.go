@@ -176,15 +176,33 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 
 	// Only persist/acknowledge if the merge actually changed the log; a delayed
-	// or duplicated request whose entries already match is a no-op.
-	if len(args.Entries) > 0 && rs.mergeLogEntries(args) {
-		// The appended entries must be durable before we acknowledge them: a
-		// leader that sees Success advances its commit index, so reporting
-		// success for entries we could lose on a crash would break the log
-		// matching guarantee.
-		if err := rs.persist(); err != nil {
-			rs.logger.Printf("AppendEntries: persist of log entries failed: %v", err)
-			return
+	// or duplicated request whose entries already match is a no-op. That
+	// optimization is only sound while the in-memory log and the on-disk log
+	// agree, which is why the failure path below rolls the merge back.
+	if len(args.Entries) > 0 {
+		previousLog := rs.persistent.Log
+		if rs.mergeLogEntries(args) {
+			// The appended entries must be durable before we acknowledge them: a
+			// leader that sees Success advances its commit index, so reporting
+			// success for entries we could lose on a crash would break the log
+			// matching guarantee.
+			if err := rs.persist(); err != nil {
+				// Roll the merge back (KNOWN_ISSUES.md R2). Keeping the
+				// un-persisted entries in memory used to make the *retry* of this
+				// very request look like a duplicate: mergeLogEntries compared the
+				// resent entries against the in-memory copy, reported "already
+				// present", skipped the persist entirely and answered Success=true.
+				// The leader then counted this follower in MatchIndex and committed
+				// entries that exist on no disk at all, so a crash here could lose a
+				// committed entry (Figure 2 "before responding to RPCs", §5.4 Leader
+				// Completeness). Restoring the previous slice header is enough
+				// because mergeLogEntries never overwrites entries in place — it
+				// caps the slice before appending, so the discarded entries stay
+				// intact in the old backing array — and rs.mu is held throughout.
+				rs.persistent.Log = previousLog
+				rs.logger.Printf("AppendEntries: persist of log entries failed, rolled back merge: %v", err)
+				return
+			}
 		}
 	}
 
@@ -203,6 +221,12 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 // left in place. This prevents a delayed or reordered AppendEntries from
 // truncating a suffix the leader has already committed. It returns true only
 // when the log was actually modified. Callers must hold rs.mu.
+//
+// The merge never writes over an existing entry in place: on a conflict the log
+// is re-sliced with its capacity capped at the conflict point, so the append
+// that follows allocates a fresh backing array and the caller's saved slice
+// header remains a valid snapshot of the pre-merge log. AppendEntries relies on
+// that to roll the merge back when the persist fails (KNOWN_ISSUES.md R2).
 func (rs *RaftState) mergeLogEntries(args *AppendEntriesArgs) bool {
 	lii := rs.persistent.LastIncludedIndex
 	for i, entry := range args.Entries {
@@ -216,8 +240,11 @@ func (rs *RaftState) mergeLogEntries(args *AppendEntriesArgs) bool {
 			continue // already present, no conflict
 		}
 		if pos < len(rs.persistent.Log) {
-			// Conflicting term at this index: drop it and everything after.
-			rs.persistent.Log = rs.persistent.Log[:pos]
+			// Conflicting term at this index: drop it and everything after. The
+			// capacity is capped at pos so the append below cannot overwrite the
+			// dropped entries in the shared backing array — that keeps the
+			// caller's pre-merge slice header usable as a rollback target.
+			rs.persistent.Log = rs.persistent.Log[:pos:pos]
 		}
 		rs.persistent.Log = append(rs.persistent.Log, args.Entries[i:]...)
 		// Re-stamp absolute indices on the appended suffix.
