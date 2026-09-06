@@ -1032,7 +1032,7 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
 |---|---|---|
 | B1 | applyCh 満杯時にコミット済みエントリを破棄 | ✅ **修正済み**（`9a90cf5`、ブロッキング送信化） |
 | B2 | AppendEntries の無条件切り詰め | ✅ **修正済み**（`7151e77`、§5.3 step 3 準拠の conflict ベース切り詰め） |
-| B3 | rs.mu 保持のまま applyCh 送信 | ❌ 未修正（現仕様。安全だが liveness 課題） |
+| B3 | rs.mu 保持のまま applyCh 送信 | ✅ **修正済み**（`f873d9b`、専用 applier goroutine へ分離。停止順の R19 は `7c96f14`/`13570d5`） |
 | A1–A6, A8 | 圧縮の index 体系（受信/投票/NextIndex/commit/apply/復元）・本番配線・フォロワー永続化 | ✅ **修正済み**（A1–A5 `8ad5367` / A6 `d0cbdc1`+`c516f54` / A8 `c516f54`） |
 | A7 | InstallSnapshot 受信側が分岐 suffix を term 検査なしで保持（Log Matching 違反） | ✅ **修正済み**（`019d33e`、論文 §7 Figure 13 の受信ルール 6/7 を実装） |
 | C1/C2/C4 | 投票・term 更新の persist 欠如、ロード失敗時の起動継続 | ✅ **修正済み**（`2a35ce9`） |

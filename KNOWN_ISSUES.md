@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-09-06 against commit `3018c96`
+> 最終検証: 2026-09-06 against commit `980f43d`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -23,9 +23,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 28（A1–A8, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R17） |
+| ✅ FIXED | 30（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R17, R19） |
 | 🟠 PARTIAL | 0 |
-| ❌ UNFIXED | 11（B3 + グループ R 10 件: R9–R16, R18, R19） |
+| ❌ UNFIXED | 9（グループ R: R9–R16, R18） |
 
 **実用上の含意**: ログ圧縮（グループ A）の受信側 §7 保持ルール（A7）は解消済みで、圧縮を
 有効にしても分岐 suffix を無条件保持することはない。2026-09-06 の再監査で見つかった snapshot
@@ -33,9 +33,17 @@
 R5: 古い snapshot による後退の禁止）も解消した（`0695b95` / `f53617e` / `156510a`）。
 InstallSnapshot 受信は「KV payload を durable 化 → Raft 境界を durable 化 → メモリ適用」の
 順序不変条件を守り、crash 時は必ず復旧可能な側（snapshot が Raft より新しい）に倒れる。
-ただし同じ受信経路には B3（`rs.mu` 保持のまま `applyCh` へブロッキング送信）の **liveness**
-リスクが残り、R3 で追加した payload の同期書き込みも同じロック下で行われるため、遅い storage は
-RPC と選挙タイマーを止める。圧縮を有効にする場合はこの点を踏まえて評価すること。
+同じ受信経路に残っていた B3（`rs.mu` 保持のまま `applyCh` へブロッキング送信）の **liveness**
+リスクも解消した（`f873d9b`）: 適用は専用の applier goroutine に分離され、コミット経路と
+InstallSnapshot 受信は「適用可能になった」ことを通知するだけになったため、遅い state machine や
+遅い storage が RPC と選挙タイマーを止めることはなくなった。順序不変条件（payload → 境界 →
+メモリ）は受信ハンドラ内でそのまま保たれ、非同期になったのは 3 番目の引き渡しだけである。
+
+停止処理も同時に整理した（R19・`7c96f14` / `13570d5`）。`RaftNode.Kill` は自分が起動した
+goroutine（event loop・applier・replication・投票・ReadIndex heartbeat・圧縮）の終了を待って
+から返るようになり、`main.go` は「HTTP API → Raft transport → `raftNode.Kill()` → `kvs.Close()`」
+の順で停止する。applyCh の送信者は applier ただ 1 本で、Kill が返った時点で終了しているため、
+その後の `Close()` で `send on closed channel` に落ちることはない。
 
 読み取りは ReadIndex 化により線形化されている（D1–D3 解消。選挙直後は当選時 no-op が
 コミットされるまで一時的に読みが待たされる）。Log Matching（R1: `Start` の leader 確認と
@@ -78,7 +86,7 @@ InstallSnapshot が並走し、応答が逆順に戻ると follower の進捗が
 |---|---|---|---|
 | B1 | applyCh 満杯時にコミット済みコマンドを黙って破棄 | ✅ FIXED | `9a90cf5`（ブロッキング送信化。ただしトレードオフあり — 下記「注記 1」） |
 | B2 | AppendEntries の無条件切り詰めでコミット済み suffix が消える（論文 §5.3 step 3 違反） | ✅ FIXED | `7151e77`（論文 §5.3 step 3 準拠の conflict ベース切り詰め） |
-| B3 | InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信（PLAUSIBLE）。R3 の修正で、同じ臨界区間に snapshot payload の同期書き込み（`raft/rpc.go:730`）も加わった | ❌ UNFIXED | `raft/rpc.go:679-680`（`defer rs.mu.Unlock()`）と `raft/rpc.go:786`（保持したままの送信） |
+| B3 | InstallSnapshot（および全コミット経路）が rs.mu 保持のまま applyCh へブロッキング送信（PLAUSIBLE）。R3 の修正で、同じ臨界区間に snapshot payload の同期書き込みも加わった | ✅ FIXED | `f873d9b`（専用 applier goroutine に分離: `raft/applier.go`。`UpdateCommitIndex`／`AppendEntries`／leader の `updateCommitIndex`／`InstallSnapshot` は `rs.mu` 下で `notifyApplierLocked` を呼ぶだけになり、applier が `takeApplyWork` でバッチを**コピー**してからロック外で送信する。`LastApplied` はバッチ確保時にロック内で進める — R5 の単調性ガードが同じロックで `LastApplied` を見るため、snapshot は「applier がこれから渡す全 command より厳密に新しい」ときだけ受理され、これが 2 系統の順序を決める。snapshot index N より上の command は必ず snapshot の後に届く。N 以下の command は先行バッチの残りとして後に届きうるが、KV 側の単調性ガードが捨てる。InstallSnapshot の順序不変条件（payload durable → 境界 durable → メモリ適用）はハンドラ内でそのまま。回帰テスト `raft/applier_internal_test.go`） |
 
 ## グループ C: 永続化規律
 
@@ -111,8 +119,10 @@ InstallSnapshot が並走し、応答が逆順に戻ると follower の進捗が
 [docs/raft-audit-2026-09-06.md](docs/raft-audit-2026-09-06.md)（凍結・対象 commit `d370c72`）
 で新規に確認された問題（R1–R18）と、その修正作業中に見つかった問題（R19 以降。監査には存在しない）。
 R1–R18 はいずれも `go test ./...`／`go test -race ./...` が green のままで検出されない静的確認
-として起票された。修正済みの R1–R5・R17 には障害注入・世代競合の決定的テストが付いているが、
-未修正の項目にはまだない。R7・R8 は監査に存在しない（欠番ではなく、そもそも採番されていない）。
+として起票された。修正済みの R1–R5・R17・R19 には障害注入・世代競合・停止順の決定的テストが
+付いているが、未修正の項目にはまだない。R19 は例外的に `-race` でも捕まる panic だったが、
+発火が停止時のタイミング依存だったため CI では不安定失敗としてしか現れていなかった。
+R7・R8 は監査に存在しない（欠番ではなく、そもそも採番されていない）。
 
 | ID | 概要 | 優先度 | 状態 | 根拠（現コード）/ 監査参照 |
 |---|---|---|---|---|
@@ -132,13 +142,18 @@ R1–R18 はいずれも `go test ./...`／`go test -race ./...` が green の�
 | R16 | `config/config.go:23-38` の `SnapshotInterval` は宣言されているが読み出し側で使われていない（自動 snapshot のトリガーは `maxRaftState` のみ）。`LoadConfig`（`:61-83`）はファイルにないフィールドをゼロ値のまま `Validate` に渡すため、`DefaultConfig()` の既定値を経由しない設定ファイルは意図せず起動を拒否されうる | P3 | ❌ UNFIXED | `config/config.go:23-38,61-83`。監査 §4 P3「R16」 |
 | R17 | CI (`.github/workflows/ci.yml:37-41`) は `./tests/unit/...` と `./tests/integration/...` のみを `-race` 実行し、`./...`（各パッケージ直下の `_test.go`、例: `raft/installsnapshot_internal_test.go`）を対象にしない。また `tests/integration/cluster_test.go:393` の `break` は `select` から抜けるだけで外側の `for` ループを抜けないため、timeout 後も残りの `done` 受信を待ち続ける（意図した「テスト失敗で即座に打ち切る」動作になっていない） | P3 | ✅ FIXED | `19bdb37`（CI の 2 ステップを `go test -v -race -timeout=10m -coverprofile=coverage.txt -covermode=atomic ./...` の 1 ステップに統合、全パッケージ直下のテストを `-race` 対象化）、`91b0f7c`（`tests/integration/cluster_test.go` の timeout `break` をラベル付き `break waitLoop` に変更し、外側の for ループを確実に抜けるよう修正。SA4011 解消） |
 | R18 | `examples/benchmark/benchmark.go` の read ワークロードはヒットしない: `populateInitialData`（`:152-162`、鍵生成は `:157`）が `i` を種に `Operations/populateFraction` 件を書き込む一方、読み取り側 `worker`（`:184-222`、鍵生成は `:201`）は `r.Intn(config.Operations/populateFraction)` で毎回ランダムな種を選ぶ。`generateKey` の乱数サフィックスは呼び出しごとに RNG ストリームが進むため、同じ数値シードでも書き込み時と読み取り時で鍵文字列が一致せず、GET はほぼ確実に 404 になる。成功率・引数検証・失敗統計もない | P3 | ❌ UNFIXED | `examples/benchmark/benchmark.go:152-162,184-222,285-287`。監査 §4 P3「R18」 |
-| R19 | `RaftNode.Kill`（`raft/node.go:141`）は done を閉じるだけで run goroutine と replication goroutine の終了を待たない。呼び出し側が Kill 直後に `kvs.Close()` で applyCh を閉じると、進行中の tick／応答処理が `updateCommitIndex` → `applyEntries`（`raft/log.go:245`）で閉じた applyCh に送信し `panic: send on closed channel` になる。CI（macOS）で `TestFullSystemPersistence_CrashAndRecover` が不安定失敗（PR #24 の run 34011107561）。監査 §4 P1-3（B3 と shutdown lifecycle）の範囲で、ロードマップ 6 で修正予定 | P1 | ❌ UNFIXED | `raft/node.go:141` の `Kill`、`raft/log.go:245` の `applyEntries`、`kvstore/store.go:720` の `Close`。**更新（`499c4b8`）**: replication goroutine の起動と終了が `replicatePeerOnce`（`raft/rpc.go`）の 1 箇所に集約され、peer あたり同時 1 本に制限されたため、待つべき goroutine の生成点は 1 つになった（発火面は狭まったが未修正であることは変わらない）。WaitGroup と `rn.done` の配線はここに入れる |
+| R19 | `RaftNode.Kill` は done を閉じるだけで run goroutine と replication goroutine の終了を待たない。呼び出し側が Kill 直後に `kvs.Close()` で applyCh を閉じると、進行中の tick／応答処理が閉じた applyCh に送信し `panic: send on closed channel` になる。CI（macOS）で `TestFullSystemPersistence_CrashAndRecover` が不安定失敗（PR #24 の run 34011107561）。監査 §4 P1-3（B3 と shutdown lifecycle）の範囲 | P1 | ✅ FIXED | `7c96f14`（`RaftState` が `stopCh` と `WaitGroup` を持ち、goroutine の起動は `spawn`（`raft/state.go`）の 1 経路に統一。対象は applier・`RaftNode.run`・`replicatePeerOnce`・`requestVoteFromPeer`・ReadIndex の `confirmLeadership` heartbeat・`TriggerSnapshot` の圧縮。`Kill` は `sync.Once` で冪等、`RaftState.Stop` で全 goroutine の終了を待ってから返る。Stop 開始後は `spawn` が false を返して何も起動せず、予約を持つ 2 箇所（`sendHeartbeats` の replication slot、`confirmLeadership` の results 枠）は自分で解放する。applier の送信は停止シグナルを先に見るので Kill 後は 1 件も送らない）＋ `13570d5`（`main.go` の停止順を HTTP API → transport → `Kill` → `kvs.Close()` に変更）。回帰テスト `raft/shutdown_internal_test.go` |
 
 ## 注記（レビュー後に判明した事実）
 
-1. **B1 修正のトレードオフ**: ブロッキング送信化により、applyCh 逆圧時（例: applyLoop 内の
-   同期スナップショット保存中）は rs.mu 保持のまま全 RPC・選挙処理が停止する liveness 問題に
-   転化した。専用 applier goroutine への分離が対策（TODO.md の項目 2.5）。
+1. **B1 修正のトレードオフ（B3 として `f873d9b` で解消済み）**: ブロッキング送信化により、
+   applyCh 逆圧時（例: applyLoop 内の同期スナップショット保存中）は rs.mu 保持のまま全 RPC・
+   選挙処理が停止する liveness 問題に転化していた。専用 applier goroutine への分離（TODO.md
+   の項目 2.5）でこれを解消した。送信がブロッキングであること自体は変わっていない — B1 の
+   安全性（コミット済みエントリを落とさない）はそのままで、ブロックする場所がロックを持たない
+   goroutine に移っただけである。付随して `LastApplied` の意味が「state machine に届いた」から
+   「applier が確保した」に変わった（`raft/applier.go` の `takeApplyWork` 参照）。volatile な
+   状態なので crash 時の扱いは従来どおり（境界まで巻き戻り、ログから再適用される）。
 2. **`2a35ce9` の副作用（R2 として `c362ae4` で修正済み）**: AppendEntries でメモリ上のログを
    切り詰め+追記した後に persist が失敗すると `Success=false` を返すが、メモリとディスクの
    不一致が次回 persist 成功まで残っていた。
@@ -195,7 +210,8 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
 5. ✅ 完了 — R6（`becomeFollowerLocked` への降格統一、`ac93fcb`）、E1（選挙タイマーの
    mutex 統一、`c5fdc0f`）、E2（送信エントリのコピー、`7e3eb61`）、peer 単位の送信直列化と
    進捗の単調化（`499c4b8`）
-6. B3（ordered applier と shutdown lifecycle）— R19（`Kill` が goroutine の終了を待たない）も同時に
+6. ✅ 完了 — B3（ordered applier、`f873d9b`）と shutdown lifecycle（R19・`7c96f14` /
+   `13570d5`）
 7. R9–R13（KV/client/API/RPC 細部）
 8. R15（chunk transfer）
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順）

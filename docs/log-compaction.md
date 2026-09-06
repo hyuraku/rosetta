@@ -1,10 +1,10 @@
 # Log Compaction and Snapshotting
 
-> Last verified: 2026-09-06 against commit `2a85ced`.
+> Last verified: 2026-09-06 against commit `980f43d`.
 
 This document describes the log compaction and snapshotting features in Rosetta, which are intended to prevent unbounded log growth and enable efficient operation over long periods.
 
-> **Status**: The index/wiring defects that made compaction unusable are fixed. Absolute-index handling is unified across the receive, vote, commit, and apply paths (A1-A5, `8ad5367`), the snapshotter is wired in the production binary and the V2 snapshot format parses (A6, `d0cbdc1`/`c516f54`), follower-side snapshots are persisted (A8, `c516f54`), and the InstallSnapshot receiver applies the paper's §7 retention rule instead of keeping a divergent suffix (A7, `019d33e`). The three **safety** gaps a 2026-09-06 re-audit (`docs/raft-audit-2026-09-06.md`, frozen) found on this same path are fixed too: the receive path now persists the KV payload before the Raft boundary and startup refuses an unrecoverable pair (R3, `0695b95`); the leader ships one immutable `(index, term, data)` envelope (R4, `f53617e`); and both receivers refuse a snapshot at or below what they have already applied (R5, `156510a`). B3 remains as a **liveness** issue: the InstallSnapshot handler holds `rs.mu` across both the snapshot payload write and the `applyCh` send, so slow storage or a slow state machine stalls RPCs and the election timer. See ../KNOWN_ISSUES.md.
+> **Status**: The index/wiring defects that made compaction unusable are fixed. Absolute-index handling is unified across the receive, vote, commit, and apply paths (A1-A5, `8ad5367`), the snapshotter is wired in the production binary and the V2 snapshot format parses (A6, `d0cbdc1`/`c516f54`), follower-side snapshots are persisted (A8, `c516f54`), and the InstallSnapshot receiver applies the paper's §7 retention rule instead of keeping a divergent suffix (A7, `019d33e`). The three **safety** gaps a 2026-09-06 re-audit (`docs/raft-audit-2026-09-06.md`, frozen) found on this same path are fixed too: the receive path now persists the KV payload before the Raft boundary and startup refuses an unrecoverable pair (R3, `0695b95`); the leader ships one immutable `(index, term, data)` envelope (R4, `f53617e`); and both receivers refuse a snapshot at or below what they have already applied (R5, `156510a`). The **liveness** gap on the same path (B3) is fixed as well (`f873d9b`): the handler still writes the payload under `rs.mu`, but it queues the snapshot for a dedicated applier goroutine instead of sending on `applyCh` with the lock held, so a slow state machine no longer stalls RPCs or the election timer. See ../KNOWN_ISSUES.md.
 
 ## Overview
 
@@ -153,7 +153,7 @@ When a node is far behind or joins the cluster, the design intent is:
 [Follower catches up with recent entries]
 ```
 
-> **Note**: This flow works end to end for the four defects it used to have: the production snapshotter is wired so the leader actually sends (A6), the receiver applies the §7 retention rule instead of keeping a divergent suffix (A7, `019d33e` — see "Follower discards conflicting log entries" above, implemented by `logAfterSnapshot` in raft/log.go), the KV store parses the V2 snapshot format (A6), and the installed snapshot is persisted on the follower (A8). The 2026-09-06 re-audit's safety findings on this flow are fixed as well: the leader ships metadata and payload as one generation (R4), both receivers refuse a snapshot at or below what they have already applied (R5), and the payload is made durable before the Raft boundary so a crash falls on the recoverable side (R3). One gap remains, and it is a liveness one: B3 — the handler holds `rs.mu` across both the payload write and the `applyCh` send. See ../KNOWN_ISSUES.md.
+> **Note**: This flow works end to end for the four defects it used to have: the production snapshotter is wired so the leader actually sends (A6), the receiver applies the §7 retention rule instead of keeping a divergent suffix (A7, `019d33e` — see "Follower discards conflicting log entries" above, implemented by `logAfterSnapshot` in raft/log.go), the KV store parses the V2 snapshot format (A6), and the installed snapshot is persisted on the follower (A8). The 2026-09-06 re-audit's safety findings on this flow are fixed as well: the leader ships metadata and payload as one generation (R4), both receivers refuse a snapshot at or below what they have already applied (R5), and the payload is made durable before the Raft boundary so a crash falls on the recoverable side (R3). The liveness gap on the same path is closed too: B3 (`f873d9b`) moved the `applyCh` hand-off to a dedicated applier goroutine, so the handler no longer holds `rs.mu` across a send the state machine may be slow to take. See ../KNOWN_ISSUES.md.
 
 ### 3. Recovery Process
 
@@ -173,7 +173,7 @@ On node restart:
 [Node fully recovered]
 ```
 
-> **Note**: These last two steps used to be wrong: volatile state was reinitialized to `CommitIndex=0, LastApplied=0` instead of the snapshot boundary, and `applyEntries` indexed the log by slice position. `8ad5367` makes `loadPersistentState` restore both from `LastIncludedIndex` (raft/state.go) and routes `applyEntries` through `slicePos` with a range guard (A5, fixed).
+> **Note**: These last two steps used to be wrong: volatile state was reinitialized to `CommitIndex=0, LastApplied=0` instead of the snapshot boundary, and `applyEntries` indexed the log by slice position. `8ad5367` makes `loadPersistentState` restore both from `LastIncludedIndex` (raft/state.go) and routes the apply path through `slicePos` with a range guard (A5, fixed). That apply path now lives in `takeApplyWork` (raft/applier.go), which kept the same guard when the applier was split out (B3, `f873d9b`).
 
 ## File Structure
 
@@ -287,7 +287,7 @@ Log indices: [1001, 1002, ...]
                ↑ Still starts from actual index, not 0!
 ```
 
-> **Note**: Every path now agrees with this diagram. Absolute indices are the single representation throughout the package, and the conversion to a post-truncation slice position happens only through the `slicePos`/`logTermAt`/`lastAbsLogIndex` helpers in raft/log.go — used by the AppendEntries/RequestVote handlers, `updateCommitIndex`, and `applyEntries` alike (A1, A2, A4, A5, fixed in `8ad5367`).
+> **Note**: Every path now agrees with this diagram. Absolute indices are the single representation throughout the package, and the conversion to a post-truncation slice position happens only through the `slicePos`/`logTermAt`/`lastAbsLogIndex` helpers in raft/log.go — used by the AppendEntries/RequestVote handlers, `updateCommitIndex`, and the applier's `takeApplyWork` alike (A1, A2, A4, A5, fixed in `8ad5367`).
 
 ### Concurrent Snapshots
 
@@ -383,4 +383,4 @@ Key metrics to track:
 
 ## Conclusion
 
-Log compaction through snapshotting is essential for long-term operation of a Raft system, and Rosetta implements it: snapshot persistence, log truncation, the InstallSnapshot RPC, unified absolute indexing, production wiring, follower-side persistence, and the §7 retention rule on the receiver (A1-A8, all fixed). The 2026-09-06 re-audit's three safety findings on this path are fixed as well (R3, R4, R5). What remains is a liveness defect: the InstallSnapshot handler holds `rs.mu` across both the snapshot payload write and its `applyCh` send, so slow storage or a slow state machine stalls the node (B3) — see ../KNOWN_ISSUES.md. Rosetta is a learning-oriented implementation and is not production-ready.
+Log compaction through snapshotting is essential for long-term operation of a Raft system, and Rosetta implements it: snapshot persistence, log truncation, the InstallSnapshot RPC, unified absolute indexing, production wiring, follower-side persistence, and the §7 retention rule on the receiver (A1-A8, all fixed). The 2026-09-06 re-audit's three safety findings on this path are fixed as well (R3, R4, R5), and so is the liveness defect: the InstallSnapshot handler queues the snapshot for the applier goroutine rather than sending on `applyCh` under `rs.mu` (B3, `f873d9b`) — see ../KNOWN_ISSUES.md. What is still missing here is chunked transfer (R15). Rosetta is a learning-oriented implementation and is not production-ready.

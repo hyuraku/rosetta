@@ -46,9 +46,11 @@ suffix. All of that is fixed; compaction no longer has to be avoided for safety.
 - [x] Restore `LastApplied`/`CommitIndex` from snapshot on restart — `8ad5367`
 
 **Follow-up (not part of this item):**
-- B3 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): the InstallSnapshot receiver sends to
-  `applyCh` while holding `rs.mu`, so a slow state machine stalls the node. Same
-  root cause as item 2.5 below and best fixed together.
+- B3 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) is fixed (`f873d9b`) together with
+  item 2.5 below: the InstallSnapshot receiver no longer sends to `applyCh` while
+  holding `rs.mu`, it queues the snapshot for the applier goroutine. The
+  durability ordering inside the handler (payload, then Raft boundary, then the
+  hand-off) is unchanged.
 - Integration coverage for automatic snapshot creation through the KV store and
   for recovery from a snapshot after restart is still missing
   (`docs/log-compaction.md`, Testing section).
@@ -57,10 +59,10 @@ suffix. All of that is fixed; compaction no longer has to be avoided for safety.
   payload before the Raft boundary and startup refuses an unrecoverable pair;
   the send path ships one immutable (index, term, data) envelope; and both
   receivers refuse a snapshot at or below what they have already applied.
-- R19 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): `RaftNode.Kill` closes `done`
-  without waiting for the run and replication goroutines, so a `kvs.Close()`
-  right after it can panic with `send on closed channel`. Best fixed with B3 /
-  item 2.5 below.
+- R19 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) is fixed (`7c96f14` / `13570d5`),
+  alongside B3 as planned: `RaftNode.Kill` joins every goroutine it started
+  before returning, and `main.go` stops the HTTP API and the Raft transport
+  before killing the node and closing `applyCh`.
 - R15 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): `InstallSnapshotArgs` transfers the
   whole snapshot in one `Data []byte` field with no chunking/offset/resume
   support (see the "Streaming" item in `docs/log-compaction.md`'s Future
@@ -121,17 +123,18 @@ Add comprehensive monitoring and observability features for production operation
 ### 2.5. Decouple Log Application into a Dedicated Applier Goroutine
 **Priority:** 🔴 High
 **Estimated Effort:** Medium (3-5 days)
-**Status:** Not Started — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (B3) for the current
-tracked status of the underlying issue this item fixes.
+**Status:** ✅ Done (`f873d9b`, with the shutdown half in `7c96f14` / `13570d5`) —
+see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (B3, R19) for the tracked status and the
+design notes.
 
 **Background:**
-`applyEntries` (`raft/log.go`) sends committed entries to `applyCh` while holding
+`applyEntries` (`raft/log.go`, since removed) sent committed entries to `applyCh` while holding
 `rs.mu`. A prior bug silently dropped entries with a non-blocking `select`/`default`
 send while `LastApplied` had already advanced, permanently skipping committed entries
 (Raft state-machine safety violation). This was fixed by switching to a blocking send,
-which guarantees safety but keeps `rs.mu` held until the state machine drains the
-channel. Under heavy write bursts (once `applyCh`'s buffer of 100 fills), the entire
-node stalls — vote responses, heartbeat handling, and the election timer are all
+which guaranteed safety but kept `rs.mu` held until the state machine drained the
+channel. Under heavy write bursts (once `applyCh`'s buffer of 100 filled), the entire
+node stalled — vote responses, heartbeat handling, and the election timer were all
 blocked — trading liveness for safety.
 
 **Goal:**
@@ -140,25 +143,34 @@ Separate application from consensus. A dedicated applier goroutine should wait f
 `applyCh` **without holding `rs.mu`**, so consensus progress is never blocked by a slow
 state machine. This is the standard MIT 6.824-style pattern.
 
-**Requirements:**
-- Applier goroutine reads `CommitIndex`/`LastApplied` and copies entries under a brief
-  lock, then releases `rs.mu` before sending to `applyCh`.
-- `UpdateCommitIndex` / `AppendEntries` / commit-advance paths signal the applier
-  (cond var / notify channel) instead of calling `applyEntries` inline under the lock.
-- Preserve ordering and exactly-once apply semantics; `LastApplied` must only advance
-  after a successful send.
-- Reconcile with the `InstallSnapshot` apply path (`raft/rpc.go`), which also currently
-  sends to `applyCh` under `rs.mu`.
-- Clean shutdown so the applier goroutine exits without racing `close(applyCh)`.
+**Requirements:** (all met)
+- [x] Applier goroutine reads `CommitIndex`/`LastApplied` and copies entries under a
+  brief lock, then releases `rs.mu` before sending to `applyCh` — `takeApplyWork`
+  in `raft/applier.go`
+- [x] `UpdateCommitIndex` / `AppendEntries` / commit-advance paths signal the applier
+  instead of applying inline under the lock — `notifyApplierLocked`, a non-blocking
+  send into a one-slot channel
+- [x] Preserve ordering and the safety of the blocking send — a single sender, in
+  index order, snapshot ahead of every command above its index
+- [x] Reconcile with the `InstallSnapshot` apply path — the handler queues the
+  snapshot in `pendingSnapshot` under the same lock that advanced `LastApplied`
+- [x] Clean shutdown so the applier exits without racing `close(applyCh)` —
+  `RaftState.Stop`, joined by `RaftNode.Kill` (R19)
+
+**Deviation from the original plan:** `LastApplied` advances when the applier
+*claims* a batch, not after each send completes. Advancing it after the send would
+have left the window in which a second notification re-claims entries that are
+still in flight, and would have made `InstallSnapshot`'s monotonicity guard (R5)
+compare against a stale value. The trade-off — entries claimed but not delivered
+are lost on a crash — costs nothing: `LastApplied` is volatile state that restarts
+at the snapshot boundary, so those entries are re-applied from the log anyway.
 
 **Affected Files:**
-- `raft/log.go` (`applyEntries`, `UpdateCommitIndex`)
-- `raft/state.go` (applier goroutine, notify primitive, lifecycle)
-- `raft/rpc.go` (`AppendEntries` commit path, `InstallSnapshot` apply path)
-- `raft/node.go` (start/stop the applier goroutine)
-
-**Note:** Recommended as a standalone PR, separate from the safety fix that made the
-send blocking.
+- `raft/applier.go` (new: the applier, the notify primitive, the claim)
+- `raft/log.go` (`UpdateCommitIndex`)
+- `raft/state.go` (lifecycle: `spawn`, `Stop`, the stop channel and WaitGroup)
+- `raft/rpc.go` (`AppendEntries` commit path, `updateCommitIndex`, `InstallSnapshot`)
+- `raft/node.go` (`Kill` joins the applier along with everything else)
 
 ---
 
@@ -555,7 +567,7 @@ Create official client libraries for easy integration.
 - [x] Basic Raft implementation
 - [x] Key-value operations
 - [x] Persistence
-- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (group A/B1/B2/C/D done; B3, E1, E2 remain)
+- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; the open items are R9-R16 and R18 from the 2026-09-06 re-audit)
 - [x] Log compaction reworked and wired
 - [ ] Monitoring
 - [x] Documentation verified against code (2026-07 overhaul)
