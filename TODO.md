@@ -63,10 +63,15 @@ suffix. All of that is fixed; compaction no longer has to be avoided for safety.
   alongside B3 as planned: `RaftNode.Kill` joins every goroutine it started
   before returning, and `main.go` stops the HTTP API and the Raft transport
   before killing the node and closing `applyCh`.
-- R15 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): `InstallSnapshotArgs` transfers the
-  whole snapshot in one `Data []byte` field with no chunking/offset/resume
-  support (see the "Streaming" item in `docs/log-compaction.md`'s Future
-  Enhancements).
+- R15 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) is fixed
+  (`c8c87d0` / `3ad0220` / `b3fbdbb`): `InstallSnapshotArgs` carries
+  `Offset`/`Done`, the leader ships the payload as 64 KiB chunks, and the
+  receiver assembles them without touching its Raft state, the state machine or
+  either file until the final chunk. Resumption is deliberately not implemented
+  — a failed round restarts from offset 0 with a freshly read envelope. Still
+  open from the original "Streaming" idea in `docs/log-compaction.md`: neither
+  end's memory is bounded, since the receiver assembles the whole payload before
+  installing it in one atomic write.
 
 **Related Files:**
 - `raft/snapshot.go` (new)
