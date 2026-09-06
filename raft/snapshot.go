@@ -187,13 +187,26 @@ func (rs *RaftState) TruncateLogTo(absoluteIndex int) error {
 	sliceIdx := absoluteIndex - rs.persistent.LastIncludedIndex - 1
 	boundaryTerm := rs.persistent.Log[sliceIdx].Term
 
-	// Discard entries up to and including the boundary.
+	// Discard entries up to and including the boundary. The pre-truncation
+	// values are kept so a failed persist can be undone: the truncation only
+	// moves the slice header forward, leaving the discarded entries in the
+	// backing array, and rs.mu is held throughout (same rollback discipline as
+	// TruncateLogAfter and the AppendEntries merge, KNOWN_ISSUES.md R2/R3).
+	prevLog := rs.persistent.Log
+	prevLastIncludedIndex := rs.persistent.LastIncludedIndex
+	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
+
 	discarded := absoluteIndex - rs.persistent.LastIncludedIndex
 	rs.persistent.Log = rs.persistent.Log[discarded:]
 
 	rs.persistent.LastIncludedIndex = absoluteIndex
 	rs.persistent.LastIncludedTerm = boundaryTerm
 	if err := rs.persist(); err != nil {
+		rs.persistent.Log = prevLog
+		rs.persistent.LastIncludedIndex = prevLastIncludedIndex
+		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
+		rs.logger.Printf("TruncateLogTo: persist failed, restored the log at boundary %d: %v",
+			prevLastIncludedIndex, err)
 		return fmt.Errorf("failed to persist state after truncating log: %w", err)
 	}
 

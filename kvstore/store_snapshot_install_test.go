@@ -87,6 +87,8 @@ func TestInstallSnapshotFromApplyMsgV1BackwardCompat(t *testing.T) {
 // folded in. Replacing state with an older snapshot loses committed writes with
 // no error anywhere.
 func TestInstallSnapshotFromApplyMsgIsMonotonic(t *testing.T) {
+	const installed = "at-10"
+
 	kvs := NewKVStore(0)
 	defer kvs.Close()
 
@@ -104,21 +106,21 @@ func TestInstallSnapshotFromApplyMsgIsMonotonic(t *testing.T) {
 		})
 	}
 
-	install(10, 3, map[string]string{"k": "at-10"})
-	if got := kvs.GetSnapshot()["k"]; got != "at-10" {
-		t.Fatalf("setup: k = %q, want %q", got, "at-10")
+	install(10, 3, map[string]string{"k": installed})
+	if got := kvs.GetSnapshot()["k"]; got != installed {
+		t.Fatalf("setup: k = %q, want %q", got, installed)
 	}
 
 	// Strictly older: ignored.
 	install(6, 2, map[string]string{"k": "at-6"})
-	if got := kvs.GetSnapshot()["k"]; got != "at-10" {
-		t.Fatalf("snapshot at index 6 rolled the store back: k = %q, want %q", got, "at-10")
+	if got := kvs.GetSnapshot()["k"]; got != installed {
+		t.Fatalf("snapshot at index 6 rolled the store back: k = %q, want %q", got, installed)
 	}
 
 	// Same index (a duplicate delivery): ignored.
 	install(10, 3, map[string]string{"k": "duplicate"})
-	if got := kvs.GetSnapshot()["k"]; got != "at-10" {
-		t.Fatalf("duplicate snapshot at index 10 replaced the store: k = %q, want %q", got, "at-10")
+	if got := kvs.GetSnapshot()["k"]; got != installed {
+		t.Fatalf("duplicate snapshot at index 10 replaced the store: k = %q, want %q", got, installed)
 	}
 
 	kvs.mu.RLock()

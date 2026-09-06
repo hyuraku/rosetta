@@ -226,6 +226,31 @@ func resolveConfig(configFile, nodeID, listenAddr, httpAddr, peers string) *conf
 	return cfg
 }
 
+// verifyDurableState compares the two files this node recovers from before any
+// of them is opened for real.
+//
+// The Raft state file and the KV snapshot file are written in separate steps, so
+// a crash can leave them at different generations (KNOWN_ISSUES.md R3). Startup
+// is refused when the Raft boundary is ahead of the snapshot: Raft has discarded
+// the log below its boundary while the state machine stops short of it, so the
+// missing entries can never be delivered again and the node would silently serve
+// incomplete data. This mirrors C4's fail-closed handling of an unreadable state
+// file. The opposite direction is recoverable and only logged — the KV store
+// ignores replayed entries it has already applied.
+func verifyDurableState(storage persistence.Storage) {
+	consistency, err := persistence.VerifySnapshotConsistency(storage)
+	if err != nil {
+		log.Fatalf("Refusing to start: %v", err)
+	}
+	if consistency.CompactionPending {
+		log.Printf("Snapshot (index %d) is ahead of the Raft state (index %d): a log compaction did not "+
+			"complete before the last shutdown. Replayed entries at or below index %d will be ignored "+
+			"by the state machine.",
+			consistency.SnapshotLastIncludedIndex, consistency.RaftLastIncludedIndex,
+			consistency.SnapshotLastIncludedIndex)
+	}
+}
+
 func main() {
 	var (
 		configFile = flag.String("config", "", "Configuration file path")
@@ -246,6 +271,8 @@ func main() {
 		log.Fatalf("Failed to create storage: %v", err)
 	}
 	log.Printf("Persistence enabled: data directory = %s", dataDir)
+
+	verifyDurableState(storage)
 
 	// Create Raft persister and KV snapshotter
 	raftPersister := persistence.NewRaftPersister(storage)
