@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-09-06 / 対象 commit `d370c72`
+> 最終検証: 2026-09-06 / 対象 commit `dc5bb20`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -23,9 +23,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 19（A1–A8, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5） |
+| ✅ FIXED | 20（A1–A8, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5, R17） |
 | 🟠 PARTIAL | 0 |
-| ❌ UNFIXED | 19（B3, E1, E2 + グループ R 16 件: R1–R6, R9–R18） |
+| ❌ UNFIXED | 18（B3, E1, E2 + グループ R 15 件: R1–R6, R9–R16, R18） |
 
 **実用上の含意**: ログ圧縮（グループ A）の受信側 §7 保持ルール（A7）は解消済みで、圧縮を
 有効にしても分岐 suffix を無条件保持することはない。ただし 2026-09-06 の再監査で、圧縮周りに
@@ -118,7 +118,7 @@ duplicate ACK（R2）に確認された安全性課題が残るため、「安�
 | R14 | Joint consensus・構成変更ログエントリ・新旧 quorum の二重確認は未実装。`network/discovery.go` の `ClusterManager` は HTTP レベルの参加/離脱のみで Raft レイヤーの安全なメンバーシップ変更ではない | P2 | ❌ UNFIXED | `raft/state.go:81-84`（peers は固定）。監査 §4 P2「R14」。TODO.md 3「Dynamic Cluster Membership」の計画対象 |
 | R15 | InstallSnapshot は `Data []byte` を一括転送するのみで offset/done によるチャンク転送・再送・中断からの再開がない。大容量 snapshot は一括メモリ確保・一括 RPC になる | P2 | ❌ UNFIXED | `raft/rpc.go:39-45`（`InstallSnapshotArgs`）。監査 §4 P2「R15」。`docs/log-compaction.md` Future Enhancements の Streaming 計画に対応 |
 | R16 | `config/config.go:23-38` の `SnapshotInterval` は宣言されているが読み出し側で使われていない（自動 snapshot のトリガーは `maxRaftState` のみ）。`LoadConfig`（`:61-83`）はファイルにないフィールドをゼロ値のまま `Validate` に渡すため、`DefaultConfig()` の既定値を経由しない設定ファイルは意図せず起動を拒否されうる | P3 | ❌ UNFIXED | `config/config.go:23-38,61-83`。監査 §4 P3「R16」 |
-| R17 | CI (`.github/workflows/ci.yml:37-41`) は `./tests/unit/...` と `./tests/integration/...` のみを `-race` 実行し、`./...`（各パッケージ直下の `_test.go`、例: `raft/installsnapshot_internal_test.go`）を対象にしない。また `tests/integration/cluster_test.go:393` の `break` は `select` から抜けるだけで外側の `for` ループを抜けないため、timeout 後も残りの `done` 受信を待ち続ける（意図した「テスト失敗で即座に打ち切る」動作になっていない） | P3 | ❌ UNFIXED | `.github/workflows/ci.yml:37-41`、`tests/integration/cluster_test.go:393`。監査 §4 P3「R17」 |
+| R17 | CI (`.github/workflows/ci.yml:37-41`) は `./tests/unit/...` と `./tests/integration/...` のみを `-race` 実行し、`./...`（各パッケージ直下の `_test.go`、例: `raft/installsnapshot_internal_test.go`）を対象にしない。また `tests/integration/cluster_test.go:393` の `break` は `select` から抜けるだけで外側の `for` ループを抜けないため、timeout 後も残りの `done` 受信を待ち続ける（意図した「テスト失敗で即座に打ち切る」動作になっていない） | P3 | ✅ FIXED | `19bdb37`（CI の 2 ステップを `go test -v -race -timeout=10m -coverprofile=coverage.txt -covermode=atomic ./...` の 1 ステップに統合、全パッケージ直下のテストを `-race` 対象化）、`91b0f7c`（`tests/integration/cluster_test.go` の timeout `break` をラベル付き `break waitLoop` に変更し、外側の for ループを確実に抜けるよう修正。SA4011 解消） |
 | R18 | `examples/benchmark/benchmark.go` の read ワークロードはヒットしない: `populateInitialData`（`:152-162`、鍵生成は `:157`）が `i` を種に `Operations/populateFraction` 件を書き込む一方、読み取り側 `worker`（`:184-222`、鍵生成は `:201`）は `r.Intn(config.Operations/populateFraction)` で毎回ランダムな種を選ぶ。`generateKey` の乱数サフィックスは呼び出しごとに RNG ストリームが進むため、同じ数値シードでも書き込み時と読み取り時で鍵文字列が一致せず、GET はほぼ確実に 404 になる。成功率・引数検証・失敗統計もない | P3 | ❌ UNFIXED | `examples/benchmark/benchmark.go:152-162,184-222,285-287`。監査 §4 P3「R18」 |
 
 ## 注記（レビュー後に判明した事実）
@@ -156,7 +156,7 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
 `docs/raft-audit-2026-09-06.md` §6 のロードマップに従う:
 
 1. 現状訂正のみ（文書・行番号・保証範囲） — 本 PR
-2. CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go:393` の
+2. ✅ 完了 — CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go` の
    timeout `break` を修正（R17）
 3. R1（`Start` の atomic 化）、R2（durable ACK）
 4. R3–R5（snapshot の世代整合・復旧・適用順序）
@@ -165,4 +165,4 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
 7. R9–R13（KV/client/API/RPC 細部）
 8. R15（chunk transfer）
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順）
-10. R16–R18（設定、CI 監視、examples、benchmark）
+10. R16、R18（設定、examples、benchmark）
