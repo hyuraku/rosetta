@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-06 against commit `980f43d`
+> 最終検証: 2026-09-06 against commit `5404af7`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -9,8 +9,8 @@
 | カテゴリ | 状態 | 備考 |
 |---------|------|------|
 | リーダー選挙 (Section 5.2) | ✅ 実装済み | 基本動作は実装済み。当選時に current-term no-op を追記（D3 解消）。圧縮後の投票判定も絶対 index 化済み（A2 解消・commit `8ad5367`）。降格処理は `becomeFollowerLocked` に一本化され、高 term を見て降格した元 leader も選挙タイマーが再始動する（R6 解消・`ac93fcb`）。選挙タイマーの更新も `rs.mu` 下に統一（E1 解消・`c5fdc0f`） |
-| ログ複製 (Section 5.3) | ⚠️ 要修正あり | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）は完了。ただし境界 term 検査・commit 上限の一部分岐が未検証（R13、`raft/rpc.go:153-163,191-194`） |
-| 安全性保証 (Section 5.4) | ⚠️ 要修正あり | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。State Machine Safety の R3–R5（snapshot の世代整合・古い snapshot の適用）も解消（`0695b95` / `f53617e` / `156510a`）。E2（送信エントリの backing array 共有）も送信前コピーで解消（`7e3eb61`）。残る懸念は R13（境界 term 検査・commit 上限の未検証分岐） |
+| ログ複製 (Section 5.3) | ✅ 実装済み | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）に加え、境界 term 検査・commit 上限の未検証分岐も解消（R13・`f0b0ba9`/`4d81414`/`ae33b52`/`87234ad`） |
+| 安全性保証 (Section 5.4) | ✅ 実装済み | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。State Machine Safety の R3–R5（snapshot の世代整合・古い snapshot の適用）も解消（`0695b95` / `f53617e` / `156510a`）。E2（送信エントリの backing array 共有）も送信前コピーで解消（`7e3eb61`）。境界 term 検査・commit 上限（R13）も解消し、AppendEntries 側の未検証分岐は残っていない |
 | 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`appendEntryLocked` 経由の `AppendLogEntry`/`Start`/当選時 no-op、`TruncateLogAfter`）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。AppendEntries 受信経路の未永続 merge も persist 失敗時にロールバックするようになった（R2 解消・commit `c362ae4`）。InstallSnapshot 受信経路と `TruncateLogTo` も同じロールバック規律に揃えた（R3 解消・commit `0695b95`）。加えて raft_state.json と snapshot.json の世代整合を起動時に検証し、復旧不能な組み合わせでは起動を拒否する |
 | ログコンパクション (Section 7) | ⚠️ 要修正あり（chunk 転送のみ） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）、受信側の §7 保持ルール（A7・`019d33e`）に加え、2026-09-06 再監査の 3 件も解消: 受信経路の世代整合と起動時検証（R3・`0695b95`）、メタデータとペイロードの同一世代化（R4・`f53617e`）、古い snapshot の適用禁止（R5・`156510a`）。安全性の未修正項目はない。B3（`rs.mu` 保持下での `applyCh` 送信、liveness）も専用 applier goroutine への分離で解消した（`f873d9b`）。残るのは R15（chunk 転送なし） |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応（R14）。`-join` は失敗してもログのみで起動を続ける fail-open（R12） |
@@ -19,7 +19,7 @@
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID、R19 以降はその修正作業中に見つかった ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: グループ R のうち R9–R16, R18（計 9 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。ただし R13（AppendEntries の境界 term 検査・commit 上限）のように安全性に触れうる未修正項目が残るため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: グループ R のうち R9–R12, R14–R16, R18（計 8 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。P1 の R13（AppendEntries の境界 term 検査・commit 上限、および PR #24/#26 のフォローアップ 2 件）も解消した（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）。ただし R9–R12 など KV/client/API 層の未修正項目が残るため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -137,10 +137,11 @@ type AppendEntriesReply struct {
 
 - **AppendEntries step 3 の conflict ベース切り詰め**（✅ 解消）: 受信ハンドラは「同一 index で term が異なる最初のエントリ以降のみ削除」する §5.3 step 3 準拠の切り詰めに修正され、既存エントリと一致する suffix は保持します。HTTPトランスポートで遅延・重複配送された古い AppendEntries がコミット済み suffix を削除する経路が塞がれました。修正 commit `7151e77`。see ../KNOWN_ISSUES.md (B2)
 - **受信ハンドラが圧縮後のインデックス体系に対応**（✅ 解消）: 受信ハンドラは `PrevLogIndex` を `LastIncludedIndex` オフセットに合わせて絶対 index として扱い、圧縮境界を越えない一貫性チェック・衝突探索を行うようになりました。圧縮済みフォロワーへの複製がログを破壊する経路は解消されています。修正 commit `8ad5367`。see ../KNOWN_ISSUES.md (A1)
+- **境界 term 検査・commit 上限の未検証分岐**（✅ 解消）: `PrevLogIndex` が snapshot 境界に一致・それ以下のケースで term を検証せず素通りしていた分岐（受信側は `checkLogConsistency` に切り出し、`PrevLogTerm`/`Entries` 中の境界エントリの term を `LastIncludedTerm` と照合するよう修正・`f0b0ba9`）と、commit index が当該リクエストの末尾を超えて前進し得た分岐（`min(LeaderCommit, PrevLogIndex+len(Entries), lastAbsLogIndex())` に変更・`4d81414`）を解消しました。あわせて `replicateToPeer` の stale な `NextIndex` による panic（`ae33b52`）と、persist 失敗応答が leader の `NextIndex` を 1 へ巻き戻す退行（`87234ad`）も解消しています。see ../KNOWN_ISSUES.md (R13)
 
 ---
 
-### 3. 安全性保証 (Section 5.4) ⚠️ 要修正あり（R13）
+### 3. 安全性保証 (Section 5.4) ✅ 実装済み
 
 #### 論文の要件
 - **選挙安全性**: 各任期で最大1人のリーダー
@@ -168,7 +169,7 @@ if args.LastLogTerm > lastLogTerm ||
 - **リーダー追記のみ**: `RaftState.Start`（`raft/log.go:148-165`）が leader 判定・term stamp・persist を 1 回の `rs.mu` の中で行うため、降格後に command が追記されることはありません（R1 解消・`2c26b9a`）
 - **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。InstallSnapshot 受信側の分岐 suffix 保持も §7 の保持ルール実装で解消（A7・`019d33e`）。2026-09-06 再監査で指摘された R1（`RaftNode.Start` が leader/term の確認と durable append を別の `rs.mu` 臨界区間で行い、間に降格が挟まると非 leader が新 term の command を追記しうる）は `2c26b9a` で解消した。`RaftNode.Start` は `RaftState.Start` へ委譲するだけになり、role 確認から persist・失敗時ロールバックまでが単一の `rs.mu` 臨界区間に収まっている
 - **リーダー完全性 (Leader Completeness)**: 選挙制限が絶対 index でスナップショットメタデータを考慮するようになり（A2 解消・commit `8ad5367`）、圧縮後もコミット済みエントリを持たないノードは当選しません。加えて当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されます。2026-09-06 再監査の R2（persist に失敗した AppendEntries の再送が `mergeLogEntries` の「既に一致」判定で persist をスキップし `Success=true` を返し、未永続のエントリが `MatchIndex` に反映されうる）は `c362ae4` で解消した。persist 失敗時に merge 前のログへロールバックするため、再送も改めて merge → persist を通り、成功するまで `Success=false` が返る
-- **状態機械安全性**: R1・R2 に続き、snapshot 経路の R3–R5 も解消しました。受信経路は「KV payload を durable 化 → Raft 境界を durable 化 → メモリ適用」の順序不変条件を守り（R3・`0695b95`、`RaftState.InstallSnapshot` の doc comment に明記）、crash は必ず復旧可能な側（snapshot が Raft より新しい）に倒れます。復旧不能な組み合わせは起動時に `persistence.VerifySnapshotConsistency` が拒否します。送信側は index/term/data を 1 つの envelope として扱い（R4・`f53617e`）、受信側は Raft も KV も適用済みインデックス以下の snapshot を無視します（R5・`156510a`）。E2（送信 slice の data race）も送信前コピーで解消しました（`7e3eb61`）。ただし R13（AppendEntries の境界 term 検査と commit 上限の未検証分岐）は未修正のため、無条件に成立するとは言えません
+- **状態機械安全性**: R1・R2 に続き、snapshot 経路の R3–R5 も解消しました。受信経路は「KV payload を durable 化 → Raft 境界を durable 化 → メモリ適用」の順序不変条件を守り（R3・`0695b95`、`RaftState.InstallSnapshot` の doc comment に明記）、crash は必ず復旧可能な側（snapshot が Raft より新しい）に倒れます。復旧不能な組み合わせは起動時に `persistence.VerifySnapshotConsistency` が拒否します。送信側は index/term/data を 1 つの envelope として扱い（R4・`f53617e`）、受信側は Raft も KV も適用済みインデックス以下の snapshot を無視します（R5・`156510a`）。E2（送信 slice の data race）も送信前コピーで解消しました（`7e3eb61`）。AppendEntries の境界 term 検査と commit 上限の未検証分岐（R13）も解消しました: `PrevLogIndex` が snapshot 境界に一致・それ以下のケースで `PrevLogTerm`/境界エントリの term を照合するようになり（`checkLogConsistency`、`f0b0ba9`）、commit index は当該リクエストの `PrevLogIndex+len(Entries)`（Figure 2 receiver rule 5 の「last new entry」）を超えて前進しなくなりました（`4d81414`）。あわせて `replicateToPeer` の stale な `NextIndex` による panic（`ae33b52`）と、persist 失敗応答が leader の `NextIndex` を 1 へ巻き戻していた退行（`87234ad`）も解消しています
 
 ---
 
@@ -437,7 +438,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 4. ✅ 完了 — R3（世代整合・順序不変条件・起動時検証、`0695b95`）、R4（payload/metadata の同一世代化、`f53617e`）、R5（古い snapshot の適用禁止、`156510a`）
 5. ✅ 完了 — R6（`becomeFollowerLocked` への降格統一、`ac93fcb`）、E1（選挙タイマーの mutex 統一、`c5fdc0f`）、E2（送信エントリのコピー、`7e3eb61`）、peer 単位の送信直列化と `MatchIndex`/`NextIndex` の単調化（`499c4b8`）
 6. ✅ 完了 — B3 の ordered applier（`f873d9b`）と shutdown lifecycle（R19: `Kill` が自分の起動した goroutine を join し、`main.go` は HTTP API → transport → Kill → `kvs.Close()` の順で停止。`7c96f14` / `13570d5`）
-7. R9–R13（KV/client/API/RPC 細部） — P1
+7. ✅ 完了 — R13（AppendEntries の境界 term 検査・commit 上限、`f0b0ba9`/`4d81414`/`ae33b52`/`87234ad`）。残る R9–R12（KV/client/API/RPC 細部）は未着手 — P1
 8. R15（chunk transfer） — P2
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順） — P2
 10. R16、R18（設定、examples/benchmark） — P3

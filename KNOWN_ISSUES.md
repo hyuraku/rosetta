@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-09-06 against commit `980f43d`
+> 最終検証: 2026-09-06 against commit `5404af7`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -23,9 +23,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 30（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R17, R19） |
+| ✅ FIXED | 31（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R13, R17, R19） |
 | 🟠 PARTIAL | 0 |
-| ❌ UNFIXED | 9（グループ R: R9–R16, R18） |
+| ❌ UNFIXED | 8（グループ R: R9–R12, R14–R16, R18） |
 
 **実用上の含意**: ログ圧縮（グループ A）の受信側 §7 保持ルール（A7）は解消済みで、圧縮を
 有効にしても分岐 suffix を無条件保持することはない。2026-09-06 の再監査で見つかった snapshot
@@ -49,8 +49,8 @@ goroutine（event loop・applier・replication・投票・ReadIndex heartbeat・
 コミットされるまで一時的に読みが待たされる）。Log Matching（R1: `Start` の leader 確認と
 append の原子化）と AppendEntries の duplicate ACK（R2: 未永続 merge のロールバック）は解消した
 （`2c26b9a` / `c362ae4`）。R3–R5 の解消により、監査が指摘した snapshot 経路の State Machine
-Safety 違反経路は塞がった。ただし R9–R13 をはじめ未修正の課題が残るため、
-「安全性違反なし」とは言えない。
+Safety 違反経路は塞がった。AppendEntries の境界 term 照合と commit 上限（R13）も
+解消したが、R9–R12 をはじめ未修正の課題が残るため、「安全性違反なし」とは言えない。
 
 降格処理は `becomeFollowerLocked` に一本化され（R6・`ac93fcb`）、高 term を見て降格した元 leader も
 選挙タイマーが再始動して自力で立候補できる。既知の data race 2 件も解消した（E1・`c5fdc0f`、
@@ -136,7 +136,7 @@ R7・R8 は監査に存在しない（欠番ではなく、そもそも採番さ
 | R10 | `kvstore/client.go` の `Put`/`Delete` は `seqNum` を採番した後に送信 mutex を解放するため（`:80-91`）、並行呼び出しの到着順を保証しない。`sendRequest`（`:120-184`）は timeout やネットワークエラー時に操作が実際に適用されたかどうかを呼び出し元に伝えない | P1 | ❌ UNFIXED | `kvstore/client.go:80-91,120-184`。監査 §4 P1-5、§3「Go client の内部 retry」 |
 | R11 | `Client.Batch`（`kvstore/client.go:216-240`）が `POST /kv/batch` を送るが、`main.go` にそのルートはなく `/kv/` prefix ハンドラ（`handleKV` → `handlePut`）に落ちる。`BatchArgs{Operations}` は `PutArgs{Key,Value}` として空文字列にデコードされ、空 PUT が `success:true` で返る — batch は実装されていないのに黙って（誤った）成功を返す | P1 | ❌ UNFIXED | `kvstore/client.go:216-240`、`main.go:45-70`（`/kv`,`/kv/` のルーティング）。監査 §4 P1-6。TODO.md 8「Advanced Query Features」に batch 計画はあるが、この誤動作は未記載 |
 | R12 | `-join` 失敗はログ出力のみで起動は継続する（fail-open）。`ClusterManager` のノード一覧は HTTP レベルの参加/離脱を記録するだけで Raft quorum には反映されない。`StartDiscovery`（`network/discovery.go:99`）は通常起動経路から呼ばれない | P1 | ❌ UNFIXED | `main.go:285-289`、`network/discovery.go:99-116`。監査 §4 P1-7、§3「fixed peers のみ」 |
-| R13 | AppendEntries の境界 term 検査・commit 上限が §5.3 の規律を完全にはカバーしない: `PrevLogIndex` が snapshot 境界と一致・それ以下のケースでは term を検証せずに素通りする分岐がある（`:153-163`）。commit index は `min(args.LeaderCommit, rs.lastAbsLogIndex())` で前進するのみで、当該リクエストで実際にマージされた末尾との整合は別途確認されない（`:191-194`） | P1 | ❌ UNFIXED | `raft/rpc.go:153-163,191-194`。監査 §4 P1-8、§2 表「§5.3 prev/commit 規律」 |
+| R13 | AppendEntries の境界 term 検査・commit 上限が §5.3 の規律を完全にはカバーしない: `PrevLogIndex` が snapshot 境界と一致・それ以下のケースでは term を検証せずに素通りする分岐がある（`:153-163`）。commit index は `min(args.LeaderCommit, rs.lastAbsLogIndex())` で前進するのみで、当該リクエストで実際にマージされた末尾との整合は別途確認されない（`:191-194`） | P1 | ✅ FIXED | R13-1（`f0b0ba9`）: `checkLogConsistency` に切り出し、`PrevLogIndex == LastIncludedIndex` で `PrevLogTerm` を `LastIncludedTerm` と照合、`PrevLogIndex < LastIncludedIndex` でも `Entries` が境界エントリ自体を含む場合は同様に照合。不一致は `ConflictTerm=-1, ConflictIndex=LastIncludedIndex+1` で拒否し続ける（committed prefix 不一致は snapshot 再送でも解決しないため、安全側で拒否し続ける設計。理由は `raft/rpc.go` の `checkLogConsistency` コメントに明記）。R13-2（`4d81414`）: commit index を `min(LeaderCommit, PrevLogIndex+len(Entries), lastAbsLogIndex())` に変更し、Figure 2 receiver rule 5 の「当該リクエストの末尾」を超えて前進しないようにした。R13-3（`ae33b52`、PR #26 のフォローアップ）: `replicateToPeer` が `NextIndex` を読む前に `clampNextIndexIfStale` で `lastAbsLogIndex()+1` にクランプし、`TruncateLogAfter` 後の stale な `NextIndex` による panic を解消。R13-4（`87234ad`、PR #24 のフォローアップ）: merge 後の persist 失敗応答に `ConflictTerm=-1, ConflictIndex=PrevLogIndex+1` を設定し、leader が `NextIndex` を 1 に戻して全ログを再送する退行を防止。変更箇所は `raft/rpc.go`（`checkLogConsistency`、`AppendEntries` の commit index 計算、`clampNextIndexIfStale`、`replicateToPeer`）。回帰テスト `tests/unit/appendentries_bounds_test.go`、`raft/appendentries_bounds_internal_test.go` |
 | R14 | Joint consensus・構成変更ログエントリ・新旧 quorum の二重確認は未実装。`network/discovery.go` の `ClusterManager` は HTTP レベルの参加/離脱のみで Raft レイヤーの安全なメンバーシップ変更ではない | P2 | ❌ UNFIXED | `raft/state.go:81-84`（peers は固定）。監査 §4 P2「R14」。TODO.md 3「Dynamic Cluster Membership」の計画対象 |
 | R15 | InstallSnapshot は `Data []byte` を一括転送するのみで offset/done によるチャンク転送・再送・中断からの再開がない。大容量 snapshot は一括メモリ確保・一括 RPC になる | P2 | ❌ UNFIXED | `raft/rpc.go:39-45`（`InstallSnapshotArgs`）。監査 §4 P2「R15」。`docs/log-compaction.md` Future Enhancements の Streaming 計画に対応 |
 | R16 | `config/config.go:23-38` の `SnapshotInterval` は宣言されているが読み出し側で使われていない（自動 snapshot のトリガーは `maxRaftState` のみ）。`LoadConfig`（`:61-83`）はファイルにないフィールドをゼロ値のまま `Validate` に渡すため、`DefaultConfig()` の既定値を経由しない設定ファイルは意図せず起動を拒否されうる | P3 | ❌ UNFIXED | `config/config.go:23-38,61-83`。監査 §4 P3「R16」 |
@@ -212,7 +212,8 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
    進捗の単調化（`499c4b8`）
 6. ✅ 完了 — B3（ordered applier、`f873d9b`）と shutdown lifecycle（R19・`7c96f14` /
    `13570d5`）
-7. R9–R13（KV/client/API/RPC 細部）
+7. ✅ 完了 — R13（AppendEntries の境界 term 照合・commit 上限、`f0b0ba9` / `4d81414` /
+   `ae33b52` / `87234ad`）。残る R9–R12（KV/client/API/RPC 細部）は未着手
 8. R15（chunk transfer）
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順）
 10. R16、R18（設定、examples、benchmark）
