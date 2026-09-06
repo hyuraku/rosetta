@@ -52,6 +52,15 @@ suffix. All of that is fixed; compaction no longer has to be avoided for safety.
 - Integration coverage for automatic snapshot creation through the KV store and
   for recovery from a snapshot after restart is still missing
   (`docs/log-compaction.md`, Testing section).
+- R3, R4, R5 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (2026-09-06 re-audit): the
+  Raft-state boundary persist and the KV snapshot save are two non-atomic steps;
+  snapshot metadata and payload can be read from different generations on the
+  send path; and neither side guards against installing an older snapshot than
+  what has already been applied.
+- R15 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): `InstallSnapshotArgs` transfers the
+  whole snapshot in one `Data []byte` field with no chunking/offset/resume
+  support (see the "Streaming" item in `docs/log-compaction.md`'s Future
+  Enhancements).
 
 **Related Files:**
 - `raft/snapshot.go` (new)
@@ -108,7 +117,8 @@ Add comprehensive monitoring and observability features for production operation
 ### 2.5. Decouple Log Application into a Dedicated Applier Goroutine
 **Priority:** 🔴 High
 **Estimated Effort:** Medium (3-5 days)
-**Status:** Not Started
+**Status:** Not Started — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (B3) for the current
+tracked status of the underlying issue this item fixes.
 
 **Background:**
 `applyEntries` (`raft/log.go`) sends committed entries to `applyCh` while holding
@@ -153,7 +163,10 @@ send blocking.
 ### 3. Dynamic Cluster Membership
 **Priority:** 🟡 Medium
 **Estimated Effort:** Large (3-4 weeks)
-**Status:** Not Started
+**Status:** Not Started — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R14, joint consensus
+not implemented; R12, the existing `-join` flag is a fail-open HTTP-level notification,
+not a real membership mechanism, and its `ClusterManager` node list is not reflected
+in the Raft quorum)
 
 **Description:**
 Allow adding and removing nodes from a running cluster without downtime.
@@ -335,7 +348,11 @@ Add multi-key transaction support with ACID guarantees.
 ### 8. Advanced Query Features
 **Priority:** 🟢 Low
 **Estimated Effort:** Medium (2-3 weeks)
-**Status:** Not Started
+**Status:** Not Started — note that a client-side `Batch`/`PutBatch`/`GetBatch` already
+exists in `kvstore/client.go` and silently misbehaves against the current server
+(no `/kv/batch` route; requests fall through to the plain PUT handler as an empty
+write) rather than being genuinely unimplemented-and-absent; see
+[KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R11) before building a real batch endpoint.
 
 **Description:**
 Add advanced querying capabilities beyond simple key-value operations.
@@ -371,7 +388,10 @@ Add advanced querying capabilities beyond simple key-value operations.
 ### 9. Configuration Management
 **Priority:** 🟢 Low
 **Estimated Effort:** Small (1 week)
-**Status:** Partially Implemented
+**Status:** Partially Implemented — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R16):
+`SnapshotInterval` is declared in `config/config.go` but not read by anything, and
+`LoadConfig` validates a file-loaded config without filling in `DefaultConfig()`'s
+defaults for fields the file omits.
 
 **Description:**
 Improve configuration management and runtime configurability.
