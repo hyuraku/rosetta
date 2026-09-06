@@ -65,6 +65,30 @@ type PersistentState struct {
 	// Snapshot metadata
 	LastIncludedIndex int // Index of last entry in snapshot
 	LastIncludedTerm  int // Term of last entry in snapshot
+
+	// Config is the cluster configuration currently in effect: the last
+	// configuration entry in Log, or SnapshotConfig when Log holds none. Paper
+	// §6 puts a configuration into effect the moment its entry reaches the log,
+	// committed or not, so this is derived state that must be written in the same
+	// persist() as the log it was derived from — see recomputeConfigLocked.
+	//
+	// It is nil in a state file written before dynamic membership existed; the
+	// peer list passed to NewRaftStateWithPersister then seeds it.
+	Config *ClusterConfig
+
+	// SnapshotConfig is the configuration in effect at LastIncludedIndex. It is
+	// what Config falls back to when every configuration entry has been
+	// compacted away or truncated off, so the paper's rule "revert to the
+	// previous configuration when a configuration entry is removed from the log"
+	// stays answerable after compaction.
+	//
+	// It lives here rather than in snapshot.json on purpose: it is Raft's own
+	// state, it must be exactly the configuration the boundary it accompanies was
+	// taken under, and raft_state.json is the file that already carries that
+	// boundary atomically. Keeping the two in one file means log compaction never
+	// has to rewrite the state machine's snapshot, and leaves both R3's
+	// payload-before-boundary ordering and VerifySnapshotConsistency untouched.
+	SnapshotConfig *ClusterConfig
 }
 
 type VolatileState struct {
@@ -98,7 +122,12 @@ type RaftState struct {
 
 	nodeID string
 	state  NodeState
-	peers  []string
+	// peers is the peer list this node was constructed with. It seeds the
+	// initial cluster configuration and is kept only for that purpose plus
+	// diagnostics: the configuration itself (persistent.Config,
+	// raft/membership.go) is what later paths must consult, because it changes
+	// at runtime and this list does not.
+	peers []string
 
 	persistent PersistentState
 	volatile   VolatileState
@@ -275,6 +304,16 @@ type ApplyMsg struct {
 	CommandIndex int
 	CommandTerm  int
 
+	// ConfigChange marks a cluster configuration entry (KNOWN_ISSUES.md R14).
+	// Such an entry is consensus bookkeeping, not a state machine command: its
+	// Command is a JSON cluster configuration that the state machine cannot
+	// decode. The state machine must advance its applied index over it — the
+	// log-compaction accounting and the ReadIndex catch-up both need every
+	// committed index accounted for — and otherwise skip it, exactly as it does
+	// for the election no-op. It is delivered rather than filtered out in the
+	// applier for that reason.
+	ConfigChange bool
+
 	// For snapshots
 	SnapshotValid bool
 	SnapshotIndex int
@@ -330,6 +369,16 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 			return nil, fmt.Errorf("refusing to start: cannot load persistent state: %w", err)
 		}
 	}
+
+	if rs.persistent.SnapshotConfig == nil {
+		rs.persistent.SnapshotConfig = NewClusterConfig(peers)
+	}
+	// Re-derive the configuration in effect from the recovered log rather than
+	// trusting the field. It costs one backwards scan at startup and makes
+	// "Config is the last configuration entry in the durable log, else
+	// SnapshotConfig" an invariant that holds from the first instruction — which
+	// is what the truncation and snapshot paths rely on.
+	rs.recomputeConfigLocked()
 
 	rs.electionTimer = time.NewTimer(rs.electionTimeout)
 

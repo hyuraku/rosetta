@@ -80,6 +80,11 @@ func (rs *RaftState) takeApplyWork() (snapshot *ApplyMsg, commands []ApplyMsg) {
 			Command:      entry.Command,
 			CommandIndex: next,
 			CommandTerm:  entry.Term,
+			// Configuration entries are still delivered, flagged rather than
+			// dropped: the state machine has to move its applied index over every
+			// committed index or the ReadIndex catch-up wait never completes
+			// (KNOWN_ISSUES.md R14).
+			ConfigChange: entry.Type == entryTypeConfig,
 		})
 		rs.volatile.LastApplied = next
 	}

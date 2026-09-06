@@ -217,14 +217,20 @@ func (rs *RaftState) TruncateLogAfter(index int) error {
 	defer rs.mu.Unlock()
 
 	previous := rs.persistent.Log
+	previousConfig := rs.persistent.Config
 	keep := index - rs.persistent.LastIncludedIndex
 	if keep < 0 {
 		rs.persistent.Log = make([]LogEntry, 0)
 	} else if keep < len(rs.persistent.Log) {
 		rs.persistent.Log = rs.persistent.Log[:keep]
 	}
+	// Discarding entries can discard a configuration entry, in which case §6
+	// requires reverting to the last configuration still in the log (or the
+	// snapshot's). Re-deriving before the persist puts both on disk together.
+	rs.recomputeConfigLocked()
 	if err := rs.persist(); err != nil {
 		rs.persistent.Log = previous
+		rs.persistent.Config = previousConfig
 		rs.logger.Printf("TruncateLogAfter: persist failed, restored log after index %d: %v", index, err)
 		return fmt.Errorf("persist log truncated after index %d: %w", index, err)
 	}

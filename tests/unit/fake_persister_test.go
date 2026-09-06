@@ -82,5 +82,9 @@ func clonePersistentState(state *raft.PersistentState) raft.PersistentState {
 		votedFor := *state.VotedFor
 		clone.VotedFor = &votedFor
 	}
+	// The cluster configuration is a pointer to maps the membership paths mutate
+	// in place (SetPeerAddresses), so it needs the same treatment.
+	clone.Config = state.Config.Clone()
+	clone.SnapshotConfig = state.SnapshotConfig.Clone()
 	return clone
 }

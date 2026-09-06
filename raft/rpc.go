@@ -172,7 +172,16 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	// agree, which is why the failure path below rolls the merge back.
 	if len(args.Entries) > 0 {
 		previousLog := rs.persistent.Log
+		previousConfig := rs.persistent.Config
 		if rs.mergeLogEntries(args) {
+			// A merge can both add and remove configuration entries — the append
+			// puts a new configuration into effect the moment it lands (§6), and
+			// the conflict truncation that may precede it reverts to whatever
+			// configuration entry is now last. Re-deriving covers both, and doing
+			// it before the persist is what puts the configuration on disk in the
+			// same write as the log it was derived from.
+			rs.recomputeConfigLocked()
+
 			// The appended entries must be durable before we acknowledge them: a
 			// leader that sees Success advances its commit index, so reporting
 			// success for entries we could lose on a crash would break the log
@@ -191,6 +200,7 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 				// caps the slice before appending, so the discarded entries stay
 				// intact in the old backing array — and rs.mu is held throughout.
 				rs.persistent.Log = previousLog
+				rs.persistent.Config = previousConfig
 
 				// Tell the leader this was a transient storage failure, not a log
 				// conflict. Left at their zero value, ConflictTerm/ConflictIndex
@@ -1106,6 +1116,7 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
 	prevCommitIndex := rs.volatile.CommitIndex
 	prevLastApplied := rs.volatile.LastApplied
+	prevConfig := rs.persistent.Config
 
 	// Replace the log per the paper's §7 retention rule: entries the snapshot
 	// covers always go, and the suffix above the boundary survives only when
@@ -1117,6 +1128,11 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	// Update snapshot metadata
 	rs.persistent.LastIncludedIndex = args.LastIncludedIndex
 	rs.persistent.LastIncludedTerm = args.LastIncludedTerm
+
+	// Re-derive the configuration from whatever the §7 retention rule left of the
+	// log; with the log emptied, SnapshotConfig is what remains. Carrying the
+	// sender's boundary configuration in the RPC itself comes later.
+	rs.recomputeConfigLocked()
 
 	// Update commit index and last applied
 	if rs.volatile.CommitIndex < args.LastIncludedIndex {
@@ -1138,6 +1154,7 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
 		rs.volatile.CommitIndex = prevCommitIndex
 		rs.volatile.LastApplied = prevLastApplied
+		rs.persistent.Config = prevConfig
 		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed, rolled back: %v", err)
 		return
 	}
