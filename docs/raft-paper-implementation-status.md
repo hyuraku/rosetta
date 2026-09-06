@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-06 / 対象 commit `d370c72`
+> 最終検証: 2026-09-06 / 対象 commit `dc5bb20`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -412,10 +412,10 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 3. ✅ **当選時 no-op の導入とリース設計の見直し**（解消済み） — 当選時 no-op（`becomeLeader`、commit `60fd631`）と ReadIndex 方式（`b3b21a4`）を実装し、旧リース機構を撤去（D1〜D3）
 4. ✅ **重複検知の実配線**（解消済み・条件付き） — HTTP API 経路への ClientID/SeqNum の受け渡し（D4・commit `52afd48`）と、"leadership lost" spurious エラーの解消（D5・commit `16a9b31`）を実装。ただし dedup は ClientID 指定時のみで、opID ベースの結果解決には R9 が残る
 
-### 2026-09-06 再監査分（未修正、`docs/raft-audit-2026-09-06.md` §6 のロードマップ順）
-1. 現状訂正のみ（本 PR）
-2. CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go:393` の
-   timeout `break` を修正（R17）
+### 2026-09-06 再監査分（`docs/raft-audit-2026-09-06.md` §6 のロードマップ順）
+1. ✅ 完了 — 現状訂正のみ（PR #22）
+2. ✅ 完了 — CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go` の
+   timeout `break` を修正（R17、`19bdb37`/`91b0f7c`）
 3. R1、R2 — P0
 4. R3–R5（snapshot の世代整合・復旧・適用順序） — P0
 5. R6、E1/E2、peer replication worker（タイマー・リーダー参照の統一） — P1
@@ -423,7 +423,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 7. R9–R13（KV/client/API/RPC 細部） — P1
 8. R15（chunk transfer） — P2
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順） — P2
-10. R16–R18（設定、CI 監視、examples/benchmark） — P3
+10. R16、R18（設定、examples/benchmark） — P3
 
 ---
 
