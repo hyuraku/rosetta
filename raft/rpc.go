@@ -163,6 +163,19 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 				// caps the slice before appending, so the discarded entries stay
 				// intact in the old backing array — and rs.mu is held throughout.
 				rs.persistent.Log = previousLog
+
+				// Tell the leader this was a transient storage failure, not a log
+				// conflict. Left at their zero value, ConflictTerm/ConflictIndex
+				// read to handleReplicationConflict as "conflicting term 0": it
+				// finds no entry with term 0 in its own log, falls back to
+				// ConflictIndex 0, and NextIndex gets clamped to 1 — resending this
+				// follower's entire log on every heartbeat until storage recovers
+				// (KNOWN_ISSUES.md R13-4). ConflictTerm=-1 with ConflictIndex set to
+				// this request's own PrevLogIndex+1 asks the leader to retry from
+				// exactly the position this request already tried, instead.
+				reply.ConflictTerm = -1
+				reply.ConflictIndex = args.PrevLogIndex + 1
+
 				rs.logger.Printf("AppendEntries: persist of log entries failed, rolled back merge: %v", err)
 				return
 			}

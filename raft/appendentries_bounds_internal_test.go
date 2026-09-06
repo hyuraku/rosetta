@@ -79,3 +79,73 @@ func TestReplicateToPeerClampsNextIndexAfterTruncation(t *testing.T) {
 		}
 	}
 }
+
+// R13-4 (PR #24 followup): a persist failure on the merge path used to leave
+// AppendEntriesReply's ConflictTerm/ConflictIndex at their zero value.
+// handleReplicationConflict reads ConflictTerm==0 as "the follower conflicts at
+// term 0", finds no such term in its own log, falls back to ConflictIndex 0
+// (clamped to 1), and resets NextIndex to 1 — resending the follower's entire
+// log on every heartbeat until storage recovers, even though nothing about the
+// follower's log actually conflicted.
+//
+// This drives a real persist failure through AppendEntries to get a genuine
+// reply, then feeds that reply into handleReplicationConflict on a leader
+// whose NextIndex for this follower already sits where the failed request's
+// PrevLogIndex implies, and checks that NextIndex is left exactly there.
+func TestAppendEntriesPersistFailureReplyDoesNotResetNextIndex(t *testing.T) {
+	applyCh := make(chan ApplyMsg, 8)
+	persister := &flakyPersister{}
+	follower, err := NewRaftStateWithPersister("follower", []string{"follower", "leader"}, applyCh, persister)
+	if err != nil {
+		t.Fatalf("NewRaftStateWithPersister: %v", err)
+	}
+
+	// A heartbeat first, so the term change is durable and the failure
+	// injected below can only hit the log write (mirrors
+	// tests/unit/append_entries_durability_test.go's R2 setup).
+	heartbeat := &AppendEntriesArgs{Term: 1, LeaderID: "leader", PrevLogIndex: 0, PrevLogTerm: 0, LeaderCommit: 0}
+	hbReply := &AppendEntriesReply{}
+	follower.AppendEntries(heartbeat, hbReply)
+	if !hbReply.Success {
+		t.Fatalf("setup heartbeat rejected: %+v", hbReply)
+	}
+
+	persister.setFail(true)
+	args := &AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     "leader",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      []LogEntry{{Term: 1, Index: 1, Command: "cmd", Type: entryTypeCommand}},
+		LeaderCommit: 0,
+	}
+	reply := &AppendEntriesReply{}
+	follower.AppendEntries(args, reply)
+	if reply.Success {
+		t.Fatal("follower acknowledged entries it could not persist")
+	}
+	if reply.ConflictTerm != -1 {
+		t.Fatalf("ConflictTerm = %d, want -1 (transient storage failure, not a log conflict)", reply.ConflictTerm)
+	}
+	if reply.ConflictIndex != args.PrevLogIndex+1 {
+		t.Fatalf("ConflictIndex = %d, want %d (retry from where this request left off)",
+			reply.ConflictIndex, args.PrevLogIndex+1)
+	}
+
+	// Leader side: NextIndex[peer] already sits at PrevLogIndex+1 — exactly
+	// where a leader that just sent this same request would have it.
+	leaderApplyCh := make(chan ApplyMsg, 8)
+	leader := NewRaftState("leader", []string{"leader", "follower"}, leaderApplyCh)
+	leader.SetState(Leader)
+
+	leader.mu.Lock()
+	leader.leader.NextIndex["follower"] = args.PrevLogIndex + 1
+	leader.handleReplicationConflict("follower", reply)
+	got := leader.leader.NextIndex["follower"]
+	leader.mu.Unlock()
+
+	if got != args.PrevLogIndex+1 {
+		t.Errorf("NextIndex[follower] after a persist-failure reply = %d, want unchanged %d (not reset to 1)",
+			got, args.PrevLogIndex+1)
+	}
+}
