@@ -331,6 +331,21 @@ func (kvs *KVStore) applyLoop() {
 // the new snapshot boundary, so failing to persist the state machine here would
 // leave a restarted follower with neither data nor log.
 func (kvs *KVStore) installSnapshotFromApplyMsg(msg *raft.ApplyMsg) {
+	// Monotonicity guard (KNOWN_ISSUES.md R5). Raft rejects stale snapshots on
+	// its side too, but this store is also fed by the apply loop after a restart
+	// in which the snapshot on disk was ahead of the Raft state, so it must
+	// enforce its own rule: nothing at or below what has already been folded in
+	// may replace the state machine. Without it a delayed or replayed snapshot
+	// silently rolls committed data back.
+	kvs.mu.RLock()
+	applied := kvs.lastAppliedIndex
+	kvs.mu.RUnlock()
+	if msg.SnapshotIndex <= applied {
+		kvs.logger.Printf("Ignoring snapshot at index %d: state machine has already applied through %d",
+			msg.SnapshotIndex, applied)
+		return
+	}
+
 	snapshotData, err := parseSnapshotBytes(msg.SnapshotData)
 	if err != nil {
 		kvs.logger.Printf("Failed to unmarshal snapshot data: %v", err)

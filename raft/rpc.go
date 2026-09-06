@@ -683,8 +683,19 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	rs.currentLeader = args.LeaderID
 	rs.ResetElectionTimer()
 
-	// Don't install older snapshots
-	if args.LastIncludedIndex <= rs.persistent.LastIncludedIndex {
+	// Refuse any snapshot that would move this node backwards. Comparing only
+	// against LastIncludedIndex (the previous behavior) let a delayed or
+	// duplicated RPC carrying an old snapshot through whenever this node had
+	// applied past that index without compacting to it: the log was then cut
+	// back to the stale boundary and the payload was handed to the state
+	// machine, which replaced already-applied state with an earlier version
+	// (KNOWN_ISSUES.md R5). LastApplied is never below LastIncludedIndex on the
+	// normal paths, but both are checked because TruncateLogTo can advance the
+	// boundary independently.
+	if args.LastIncludedIndex <= rs.volatile.LastApplied ||
+		args.LastIncludedIndex <= rs.persistent.LastIncludedIndex {
+		rs.logger.Printf("InstallSnapshot: ignoring snapshot at index %d (lastApplied=%d, lastIncluded=%d)",
+			args.LastIncludedIndex, rs.volatile.LastApplied, rs.persistent.LastIncludedIndex)
 		return
 	}
 

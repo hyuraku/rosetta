@@ -104,8 +104,11 @@ func (rs *RaftState) InstallSnapshotFromData(lastIncludedIndex, lastIncludedTerm
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
-	// Don't install older snapshots
-	if lastIncludedIndex <= rs.persistent.LastIncludedIndex {
+	// Don't install a snapshot that would move this node backwards — neither
+	// behind the current snapshot boundary nor behind what the state machine has
+	// already applied (KNOWN_ISSUES.md R5, same rule as the RPC handler).
+	if lastIncludedIndex <= rs.volatile.LastApplied ||
+		lastIncludedIndex <= rs.persistent.LastIncludedIndex {
 		return nil
 	}
 
