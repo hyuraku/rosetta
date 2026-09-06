@@ -304,7 +304,11 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 			continue
 		}
 
-		go rs.requestVoteFromPeer(transport, peer, currentTerm, lastLogIndex, lastLogTerm, votesNeeded, &votes, &voteMu)
+		// Spawned through rs.spawn so Kill can wait for it; after Stop nothing is
+		// started and this election simply draws no votes (KNOWN_ISSUES.md R19).
+		rs.spawn(func() {
+			rs.requestVoteFromPeer(transport, peer, currentTerm, lastLogIndex, lastLogTerm, votesNeeded, &votes, &voteMu)
+		})
 	}
 }
 
@@ -397,17 +401,21 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	rs.mu.Unlock()
 
 	for _, peer := range targets {
-		go rs.replicatePeerOnce(transport, peer, currentTerm, commitIndex)
+		// The slot was claimed above; if shutdown has already begun and nothing
+		// is started, hand it back rather than leaving the peer marked busy.
+		if !rs.spawn(func() { rs.replicatePeerOnce(transport, peer, currentTerm, commitIndex) }) {
+			rs.releaseReplicationSlot(peer)
+		}
 	}
 }
 
 // replicatePeerOnce runs one replication round against peerID and releases that
 // peer's slot when it returns, so the next tick can schedule another round.
 //
-// This is the one place a leader spawns replication work. Keeping the spawn and
-// the release together here is deliberate: when shutdown learns to wait for its
-// goroutines (KNOWN_ISSUES.md R19, roadmap step 6) this is the single site that
-// has to join a WaitGroup and honor the node's done signal.
+// This is the one place a leader spawns replication work, which is what lets
+// shutdown account for it: sendHeartbeats starts every round through rs.spawn,
+// so Stop joins them all and Kill cannot return while a round is still running
+// (KNOWN_ISSUES.md R19).
 func (rs *RaftState) replicatePeerOnce(
 	transport RPCTransport,
 	peerID string,

@@ -14,6 +14,10 @@ type RaftNode struct {
 	done      chan struct{}
 	applyCh   chan ApplyMsg
 
+	// killOnce keeps Kill idempotent: done is closed exactly once, while every
+	// caller still waits for the goroutines through RaftState.Stop.
+	killOnce sync.Once
+
 	logger *log.Logger
 }
 
@@ -41,7 +45,9 @@ func NewRaftNodeWithPersister(
 		logger:    log.New(log.Writer(), "[RAFT-"+nodeID+"] ", log.LstdFlags),
 	}
 
-	go node.run()
+	// Started through the state's spawn helper so Kill joins the event loop along
+	// with everything else it starts (KNOWN_ISSUES.md R19).
+	state.spawn(node.run)
 	return node, nil
 }
 
@@ -52,6 +58,10 @@ func (rn *RaftNode) run() {
 	for {
 		select {
 		case <-rn.done:
+			return
+		case <-rn.state.stopCh:
+			// Also honor the state's stop signal, so the loop cannot outlive a
+			// Stop that was reached by some route other than Kill.
 			return
 		case <-rn.state.ElectionTimer():
 			rn.handleElectionTimeout()
@@ -140,8 +150,28 @@ func (rn *RaftNode) GetLeader() string {
 	return rn.state.GetCurrentLeader()
 }
 
+// Kill stops this node and blocks until every goroutine it started has returned:
+// the event loop, the applier, in-flight replication and vote rounds, and the
+// ReadIndex heartbeats. It is idempotent, and a second caller waits for the same
+// set rather than returning early.
+//
+// It has to be synchronous because of what callers do next. Closing done and
+// returning immediately (the previous behavior) left the tick handler and the
+// replication replies running, so a kvs.Close() on the following line closed
+// applyCh out from under an in-flight apply and the process died with "send on
+// closed channel" — the flake behind TestFullSystemPersistence_CrashAndRecover
+// in CI (KNOWN_ISSUES.md R19). After Kill returns, the applier has exited and
+// the channel has no sender left, so closing it is safe.
+//
+// RPCs can still arrive after Kill — the transport is stopped separately, and in
+// tests not at all. The handlers stay correct: they take rs.mu and update state
+// as before, and the only thing they can no longer do is reach the state machine,
+// because the applier is gone and every send is gated on the stop signal.
 func (rn *RaftNode) Kill() {
-	close(rn.done)
+	rn.killOnce.Do(func() {
+		close(rn.done)
+	})
+	rn.state.Stop()
 }
 
 func (rn *RaftNode) GetLogLength() int {
@@ -179,14 +209,17 @@ func (rn *RaftNode) SetLogger(logger *log.Logger) {
 // Concurrency: TruncateLogTo is idempotent and self-locks via rs.mu, so we
 // do not need an extra mutex here. Stacked goroutines from rapid triggers
 // will each acquire rs.mu in turn; the second-and-later calls become no-ops
-// because absoluteIndex <= LastIncludedIndex by then.
+// because absoluteIndex <= LastIncludedIndex by then. The compaction is spawned
+// through the state so Kill waits for it too; after Kill nothing is started and
+// the trigger is dropped, which is harmless — compaction is an optimization and
+// the log is durable either way.
 func (rn *RaftNode) TriggerSnapshot(lastIncludedIndex int) {
 	rn.logger.Printf("Snapshot trigger received for index %d", lastIncludedIndex)
-	go func() {
+	rn.state.spawn(func() {
 		if err := rn.state.TruncateLogTo(lastIncludedIndex); err != nil {
 			rn.logger.Printf("Failed to truncate log at index %d: %v", lastIncludedIndex, err)
 		}
-	}()
+	})
 }
 
 // SetSnapshotter delegates to the underlying RaftState. Callers (typically
