@@ -121,8 +121,10 @@ Implemented in [`raft/state.go`](raft/state.go). Randomized election timeouts pr
 - **network/**: Network communication layer
   - HTTP-based RPC transport
   - `ClusterManager` tracks node join/leave over HTTP, but this bookkeeping is not
-    wired into the Raft quorum — the cluster is effectively fixed-peer. See
-    [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R12, R14)
+    wired into the Raft quorum — the cluster is effectively fixed-peer, and `-join`
+    now fails startup rather than pretending otherwise (R12, fixed). Real Raft-level
+    membership changes are still unimplemented (R14, open). See
+    [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
 
 - **config/**: Configuration management
 
@@ -172,12 +174,15 @@ Command line options:
 - `-http`: HTTP API listen address
 - `-peers`: Comma-separated list of peer nodes (format: `id:addr,id:addr`)
 - `-config`: Configuration file path
-- `-join`: Attempt to notify an existing cluster member over HTTP that this node
-  exists. This is **not a real membership-join mechanism**: on failure it only
-  logs and continues starting (fail-open), and even on success the peer list it
-  exchanges is not reflected in the Raft quorum. Run clusters with a fixed,
-  matching `-peers` list on every node instead. See
-  [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R12)
+- `-join`: Reserved, and **rejected** if given a non-empty value: startup fails
+  fast with an error instead of continuing without the node it named. Dynamic
+  membership is not implemented — `ClusterManager`'s HTTP-level node
+  bookkeeping is never reflected in the Raft quorum — so there is no safe way
+  to honor a join request yet. Run clusters with a fixed, matching `-peers`
+  list on every node instead. `config.Validate` rejects a `-peers` list that
+  includes this node's own ID, has two peers at the same address, or has a
+  peer at this node's own listen address. See
+  [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R12, fixed; R14, open)
 
 Cluster sizing: Raft needs a majority to commit, so run an odd number of nodes —
 3 nodes tolerate 1 failure, 5 tolerate 2. Adding nodes does not make writes faster.
@@ -186,8 +191,9 @@ Cluster sizing: Raft needs a majority to commit, so run an odd number of nodes �
 
 - **Election Timeouts**: Randomized timeouts (150ms + offset) prevent split votes
 - **Log Consistency**: AppendEntries includes consistency checks with backtracking
-- **Pending Operations**: Request tracking with unique IDs for client matching
+- **Pending Operations**: Request tracking with unique IDs for client matching. The tracking entry is registered before the command is submitted to Raft, not after, so a commit that completes unusually fast can never find nothing to deliver its result to — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R9, fixed)
 - **State Persistence**: Durable storage of Raft state and log entries
+- **At-Most-Once Writes — Conditional**: Duplicate detection (`ClientID`/`SeqNum`) only applies when a write carries a non-empty `ClientID` — a request without one gets no dedup, so retrying it after a timeout can still apply twice. The `kvstore.Client` Go client always sets one and serializes writes per `Client` instance (one in-flight write at a time; use a separate `Client` per concurrent writer) so its own internal retries (to a different server after a 503 or network error) reuse the same `SeqNum` and stay at-most-once. If every server fails, `Client.Put`/`Delete` return an error wrapping `kvstore.ErrResultUnknown`: calling `Put`/`Delete` again on the same `Client` after that allocates a new `SeqNum` and is not deduplicated against the uncertain attempt — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R10, fixed)
 
 ## Documentation
 

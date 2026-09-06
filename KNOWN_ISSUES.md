@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-09-06 against commit `5404af7`
+> 最終検証: 2026-09-06 against commit `bde6619`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -23,9 +23,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 31（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R13, R17, R19） |
+| ✅ FIXED | 35（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R9, R10, R11, R12, R13, R17, R19） |
 | 🟠 PARTIAL | 0 |
-| ❌ UNFIXED | 8（グループ R: R9–R12, R14–R16, R18） |
+| ❌ UNFIXED | 4（グループ R: R14–R16, R18） |
 
 **実用上の含意**: ログ圧縮（グループ A）の受信側 §7 保持ルール（A7）は解消済みで、圧縮を
 有効にしても分岐 suffix を無条件保持することはない。2026-09-06 の再監査で見つかった snapshot
@@ -49,8 +49,9 @@ goroutine（event loop・applier・replication・投票・ReadIndex heartbeat・
 コミットされるまで一時的に読みが待たされる）。Log Matching（R1: `Start` の leader 確認と
 append の原子化）と AppendEntries の duplicate ACK（R2: 未永続 merge のロールバック）は解消した
 （`2c26b9a` / `c362ae4`）。R3–R5 の解消により、監査が指摘した snapshot 経路の State Machine
-Safety 違反経路は塞がった。AppendEntries の境界 term 照合と commit 上限（R13）も
-解消したが、R9–R12 をはじめ未修正の課題が残るため、「安全性違反なし」とは言えない。
+Safety 違反経路は塞がった。R9–R12（KV/client/API の細部）と、AppendEntries の境界 term 照合・
+commit 上限（R13）も解消したが、R14–R16・R18 をはじめ未修正の課題が残るため、
+「安全性違反なし」とは言えない。
 
 降格処理は `becomeFollowerLocked` に一本化され（R6・`ac93fcb`）、高 term を見て降格した元 leader も
 選挙タイマーが再始動して自力で立候補できる。既知の data race 2 件も解消した（E1・`c5fdc0f`、
@@ -60,8 +61,13 @@ InstallSnapshot が並走し、応答が逆順に戻ると follower の進捗が
 
 クライアントのリトライは D4/D5 の配線により重複検出の機構自体は実 API 経路に乗ったが、
 **ClientID を指定した場合に限る条件付きの at-most-once** であり（`kvstore/store.go:386`）、
-「無条件に at-most-once 化済み」ではない。並行リクエストの順序保証や、timeout 発生時に
-操作が実際に適用されたかどうかの契約もない（R9, R10）。
+「無条件に at-most-once 化済み」ではない。committed 済みの結果解決（opID を `pendingOps` で
+引く経路）と `Client` 側の並行書き込み・失敗時契約は R9/R10 として解消済み（`29bf047` /
+`73e744f`）: `pendingOps` への登録は `raft.Start` の**前**に行われ、失敗時は登録を削除する
+ようになった（早い apply による結果の握りつぶしがなくなった）。`Client.Put`/`Delete` は
+seqNum 採番から `sendRequest` 完了まで同一 mutex を保持し、Client ごとに書き込みを直列化する
+ようになった。`sendRequest` が全サーバーに失敗したときは `ErrResultUnknown` をラップして返し、
+「操作の成否が不明である」ことを呼び出し元に伝える。
 
 なお、これまで暫定策として案内していた `MaxRaftState=0`（圧縮無効）は**設定として指定できない**
 （`config/config.go:123-125` の `Validate` が正数を強制する）。A7 修正前の暫定策の記述は
@@ -132,10 +138,10 @@ R7・R8 は監査に存在しない（欠番ではなく、そもそも採番さ
 | R4 | leader 送信側で snapshot のメタデータ（`LastIncludedIndex`/`LastIncludedTerm`）と実データ（`ReadSnapshot()` の戻り値）を別々のタイミングで読むため、両者が別世代になりうる | P0 | ✅ FIXED | `f53617e`（`Snapshotter.ReadSnapshot` が `*SnapshotData`（index/term/data）の immutable envelope を返すよう変更。`sendSnapshotToPeer`（`raft/rpc.go:533-590`）は `InstallSnapshotArgs` と follower の MatchIndex/NextIndex をその envelope だけから組み立てる。ロック内で読んだ nextIndex は「その envelope が follower を前進させられるか」の判定にのみ使う） |
 | R5 | 受信側は snapshot の新旧を Raft の `LastIncludedIndex` としか比較せず（`volatile.CommitIndex`/`LastApplied` とは無関係）、KV 側 `installSnapshotFromApplyMsg` は適用済みインデックスとの比較なしに無条件で state を置換する。遅延・重複配送された古い snapshot が KV 状態を後退させうる | P0 | ✅ FIXED | `156510a`（Raft 側は `args.LastIncludedIndex <= volatile.LastApplied` なら term 更新と timer reset だけ行って無視する: `raft/rpc.go:716-722`。`InstallSnapshotFromData` にも同じ規則。KV 側 `installSnapshotFromApplyMsg` は `msg.SnapshotIndex <= lastAppliedIndex` を無視する単調性ガードを持つ: `kvstore/store.go:355-362`） |
 | R6 | 降格経路（高 term を見た `requestVoteFromPeer`/`replicateToPeer`/`sendSnapshotToPeer`）が `ResetElectionTimer` を呼ばないため、`becomeLeader` で停止した選挙タイマー（`raft/noop.go:35`）が再始動せず、降格後にそのノードが二度と選挙に参加しなくなりうる。E1（ロック外 `ResetElectionTimer`）と隣接する経路だが別の欠陥 | P1 | ✅ FIXED | `ac93fcb`（`becomeFollowerLocked`（`raft/state.go`）を唯一の follower 遷移として新設。state=Follower・term 更新と VotedFor=nil・`currentLeader`・`rs.leader = nil`・選挙タイマー再始動・persist を 1 箇所にまとめ、降格 3 経路と `stepDown`（`raft/readindex.go`）、受信 3 経路（RequestVote/AppendEntries/InstallSnapshot）、`startElection` の persist 失敗経路をすべてこれに統一。persist は term が動いたときだけ行うので heartbeat 経路は従来どおりディスク I/O なし。persist 失敗時の方針は各経路の従来どおり（RPC 応答経路は拒否応答、送信側は log のみ）。`rs.leader = nil` により「`rs.leader != nil` ⇔ leader」が成り立つので `replicateToPeer` は読み出し前に role を再確認する。回帰テスト `raft/followertransition_internal_test.go`） |
-| R9 | `kvstore/store.go:598` で `raft.Start` を呼んだ後、`:611-614` で `pendingOps` に登録するため、その間に committed → applied が完了すると `applyLoop`（`:290-298`）が該当 `opID` を見つけられず結果を握りつぶし、クライアントは実際には成功した操作を timeout として扱う | P1 | ❌ UNFIXED | `kvstore/store.go:598-614`。監査 §4 P1-4。KNOWN D5 の「log index で解決」という記載は現実装（opID ベース）と不一致 |
-| R10 | `kvstore/client.go` の `Put`/`Delete` は `seqNum` を採番した後に送信 mutex を解放するため（`:80-91`）、並行呼び出しの到着順を保証しない。`sendRequest`（`:120-184`）は timeout やネットワークエラー時に操作が実際に適用されたかどうかを呼び出し元に伝えない | P1 | ❌ UNFIXED | `kvstore/client.go:80-91,120-184`。監査 §4 P1-5、§3「Go client の内部 retry」 |
-| R11 | `Client.Batch`（`kvstore/client.go:216-240`）が `POST /kv/batch` を送るが、`main.go` にそのルートはなく `/kv/` prefix ハンドラ（`handleKV` → `handlePut`）に落ちる。`BatchArgs{Operations}` は `PutArgs{Key,Value}` として空文字列にデコードされ、空 PUT が `success:true` で返る — batch は実装されていないのに黙って（誤った）成功を返す | P1 | ❌ UNFIXED | `kvstore/client.go:216-240`、`main.go:45-70`（`/kv`,`/kv/` のルーティング）。監査 §4 P1-6。TODO.md 8「Advanced Query Features」に batch 計画はあるが、この誤動作は未記載 |
-| R12 | `-join` 失敗はログ出力のみで起動は継続する（fail-open）。`ClusterManager` のノード一覧は HTTP レベルの参加/離脱を記録するだけで Raft quorum には反映されない。`StartDiscovery`（`network/discovery.go:99`）は通常起動経路から呼ばれない | P1 | ❌ UNFIXED | `main.go:285-289`、`network/discovery.go:99-116`。監査 §4 P1-7、§3「fixed peers のみ」 |
+| R9 | `kvstore/store.go:598` で `raft.Start` を呼んだ後、`:611-614` で `pendingOps` に登録するため、その間に committed → applied が完了すると `applyLoop`（`:290-298`）が該当 `opID` を見つけられず結果を握りつぶし、クライアントは実際には成功した操作を timeout として扱う | P1 | ✅ FIXED | `29bf047`（`executeOperationWithResult` が `pendingOps[opID]` の登録を `raft.Start` 呼び出しの**前**に行うよう変更。`Start` が `!isLeader` または `err != nil` を返したら登録を削除し、失敗した Start がエントリを永遠に leak させないようにした。実際の競合窓（`Start` 返却から次の行までの数ナノ秒 vs 単一ノードの commit を駆動する 50ms のハートビート tick）を black box で再現するテストは raft/ 側の変更が必要で本 PR の範囲外のため、`kvstore/store_pendingops_order_test.go` は実コンポーネント（実 `raft.Start`・実 `applyLoop`）を使い登録を意図的に遅らせて同じ不変条件を直接実証するテストと、Start 失敗時の leak 防止を検証する回帰テストの 2 本で担保） |
+| R10 | `kvstore/client.go` の `Put`/`Delete` は `seqNum` を採番した後に送信 mutex を解放するため（`:80-91`）、並行呼び出しの到着順を保証しない。`sendRequest`（`:120-184`）は timeout やネットワークエラー時に操作が実際に適用されたかどうかを呼び出し元に伝えない | P1 | ✅ FIXED | `73e744f`（承認済み方針「client ごと同時 1 要求」を採用。`Put`/`Delete` は `seqNum` 採番から `sendRequest` 完了まで `c.mu` を保持し、同一 `Client` からの書き込みを直列化する — 並行して書きたい呼び出し元は `Client` を分ける。`Get` は seqNum を持たないため直列化されない。全サーバー失敗時は新設の exported `ErrResultUnknown` をラップして返し、「操作が適用済みか不明」であることと、同じ `Client` で `Put` を再度呼ぶと新しい seqNum になり dedup されない（内部リトライは同一 seqNum なので at-most-once が効く）ことを doc comment に明記） |
+| R11 | `Client.Batch`（`kvstore/client.go:216-240`）が `POST /kv/batch` を送るが、`main.go` にそのルートはなく `/kv/` prefix ハンドラ（`handleKV` → `handlePut`）に落ちる。`BatchArgs{Operations}` は `PutArgs{Key,Value}` として空文字列にデコードされ、空 PUT が `success:true` で返る — batch は実装されていないのに黙って（誤った）成功を返す | P1 | ✅ FIXED | `e71926a`（サーバー側 `handleKV` が path `/kv/batch` をどのメソッドでも `501 Not Implemented`（JSON `{"success":false,"error":"batch operations are not implemented"}`）で拒否するようになり、`handlePut` は空 key を `400` で拒否するようになった。クライアント側 `Client.Batch`/`PutBatch`/`GetBatch` は HTTP リクエストを送らず exported `ErrBatchNotImplemented` を返す。`BatchOperation`/`BatchArgs`/`BatchReply` は TODO.md「Advanced Query Features」向けの予約された wire shape として維持） |
+| R12 | `-join` 失敗はログ出力のみで起動は継続する（fail-open）。`ClusterManager` のノード一覧は HTTP レベルの参加/離脱を記録するだけで Raft quorum には反映されない。`StartDiscovery`（`network/discovery.go:99`）は通常起動経路から呼ばれない | P1 | ✅ FIXED | `9d411ba`（動的メンバーシップ（R14）が実装されるまでの暫定として、`validateJoinFlag` を新設し `-join` に非空値が渡されたら起動を拒否する fail-closed に変更。フラグ自体は予約として残し、`clusterManager.JoinCluster` の呼び出しは削除。`config.Validate` に (i) `Peers` に自ノードの `NodeID` を含めない、(ii) `Peers` 内でアドレスが重複しない、(iii) `Peers` のアドレスが自ノードの `ListenAddr` と重複しない、の 3 検査を追加し、`-join` を使わない固定 `-peers` 運用の設定不整合を起動時に検出できるようにした） |
 | R13 | AppendEntries の境界 term 検査・commit 上限が §5.3 の規律を完全にはカバーしない: `PrevLogIndex` が snapshot 境界と一致・それ以下のケースでは term を検証せずに素通りする分岐がある（`:153-163`）。commit index は `min(args.LeaderCommit, rs.lastAbsLogIndex())` で前進するのみで、当該リクエストで実際にマージされた末尾との整合は別途確認されない（`:191-194`） | P1 | ✅ FIXED | R13-1（`f0b0ba9`）: `checkLogConsistency` に切り出し、`PrevLogIndex == LastIncludedIndex` で `PrevLogTerm` を `LastIncludedTerm` と照合、`PrevLogIndex < LastIncludedIndex` でも `Entries` が境界エントリ自体を含む場合は同様に照合。不一致は `ConflictTerm=-1, ConflictIndex=LastIncludedIndex+1` で拒否し続ける（committed prefix 不一致は snapshot 再送でも解決しないため、安全側で拒否し続ける設計。理由は `raft/rpc.go` の `checkLogConsistency` コメントに明記）。R13-2（`4d81414`）: commit index を `min(LeaderCommit, PrevLogIndex+len(Entries), lastAbsLogIndex())` に変更し、Figure 2 receiver rule 5 の「当該リクエストの末尾」を超えて前進しないようにした。R13-3（`ae33b52`、PR #26 のフォローアップ）: `replicateToPeer` が `NextIndex` を読む前に `clampNextIndexIfStale` で `lastAbsLogIndex()+1` にクランプし、`TruncateLogAfter` 後の stale な `NextIndex` による panic を解消。R13-4（`87234ad`、PR #24 のフォローアップ）: merge 後の persist 失敗応答に `ConflictTerm=-1, ConflictIndex=PrevLogIndex+1` を設定し、leader が `NextIndex` を 1 に戻して全ログを再送する退行を防止。変更箇所は `raft/rpc.go`（`checkLogConsistency`、`AppendEntries` の commit index 計算、`clampNextIndexIfStale`、`replicateToPeer`）。回帰テスト `tests/unit/appendentries_bounds_test.go`、`raft/appendentries_bounds_internal_test.go` |
 | R14 | Joint consensus・構成変更ログエントリ・新旧 quorum の二重確認は未実装。`network/discovery.go` の `ClusterManager` は HTTP レベルの参加/離脱のみで Raft レイヤーの安全なメンバーシップ変更ではない | P2 | ❌ UNFIXED | `raft/state.go:81-84`（peers は固定）。監査 §4 P2「R14」。TODO.md 3「Dynamic Cluster Membership」の計画対象 |
 | R15 | InstallSnapshot は `Data []byte` を一括転送するのみで offset/done によるチャンク転送・再送・中断からの再開がない。大容量 snapshot は一括メモリ確保・一括 RPC になる | P2 | ❌ UNFIXED | `raft/rpc.go:39-45`（`InstallSnapshotArgs`）。監査 §4 P2「R15」。`docs/log-compaction.md` Future Enhancements の Streaming 計画に対応 |
@@ -212,8 +218,10 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
    進捗の単調化（`499c4b8`）
 6. ✅ 完了 — B3（ordered applier、`f873d9b`）と shutdown lifecycle（R19・`7c96f14` /
    `13570d5`）
-7. ✅ 完了 — R13（AppendEntries の境界 term 照合・commit 上限、`f0b0ba9` / `4d81414` /
-   `ae33b52` / `87234ad`）。残る R9–R12（KV/client/API/RPC 細部）は未着手
+7. ✅ 完了 — R9（pending 登録順序、`29bf047`）、R10（client 直列化・`ErrResultUnknown`、
+   `73e744f`）、R11（batch を未実装として拒否、`e71926a`）、R12（`-join` fail-closed・
+   peers 検証、`9d411ba`）、R13（AppendEntries の境界 term 照合・commit 上限、`f0b0ba9` /
+   `4d81414` / `ae33b52` / `87234ad`）
 8. R15（chunk transfer）
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順）
 10. R16、R18（設定、examples、benchmark）

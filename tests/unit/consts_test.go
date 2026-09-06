@@ -6,6 +6,7 @@ const (
 	nodeID1   = "node1"
 	nodeID2   = "node2"
 	addrNode2 = "localhost:8081"
+	addrSelf  = "localhost:8080"
 
 	valValue1    = "value1"
 	valValue     = "value"

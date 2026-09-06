@@ -180,9 +180,10 @@ at the snapshot boundary, so those entries are re-applied from the log anyway.
 **Priority:** 🟡 Medium
 **Estimated Effort:** Large (3-4 weeks)
 **Status:** Not Started — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R14, joint consensus
-not implemented; R12, the existing `-join` flag is a fail-open HTTP-level notification,
-not a real membership mechanism, and its `ClusterManager` node list is not reflected
-in the Raft quorum)
+not implemented; R12, fixed in `9d411ba` — a non-empty `-join` now refuses to start
+instead of failing open, since dynamic membership isn't implemented, but the flag
+remains reserved and `ClusterManager`'s node list is still not reflected in the Raft
+quorum)
 
 **Description:**
 Allow adding and removing nodes from a running cluster without downtime.
@@ -365,9 +366,10 @@ Add multi-key transaction support with ACID guarantees.
 **Priority:** 🟢 Low
 **Estimated Effort:** Medium (2-3 weeks)
 **Status:** Not Started — note that a client-side `Batch`/`PutBatch`/`GetBatch` already
-exists in `kvstore/client.go` and silently misbehaves against the current server
-(no `/kv/batch` route; requests fall through to the plain PUT handler as an empty
-write) rather than being genuinely unimplemented-and-absent; see
+exists in `kvstore/client.go`; it used to silently misbehave against the server (no
+`/kv/batch` route; requests fell through to the plain PUT handler as an empty write),
+but as of R11 (fixed in `e71926a`) the client returns `ErrBatchNotImplemented` without
+sending a request, and the server returns 501 for any method on `/kv/batch`. See
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R11) before building a real batch endpoint.
 
 **Description:**
@@ -567,7 +569,7 @@ Create official client libraries for easy integration.
 - [x] Basic Raft implementation
 - [x] Key-value operations
 - [x] Persistence
-- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; the open items are R9-R16 and R18 from the 2026-09-06 re-audit)
+- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; R9-R12 also done; the open items are R13-R16 and R18 from the 2026-09-06 re-audit)
 - [x] Log compaction reworked and wired
 - [ ] Monitoring
 - [x] Documentation verified against code (2026-07 overhaul)

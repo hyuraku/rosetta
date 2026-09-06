@@ -1,6 +1,6 @@
 # API Documentation
 
-> Last verified: 2026-09-06 against commit `d370c72`.
+> Last verified: 2026-09-06 against commit `5404af7`.
 
 This document provides detailed information about the Rosetta HTTP API.
 
@@ -15,7 +15,7 @@ Example: `http://localhost:9080`
 ## Response Formats
 
 - **Success responses** are JSON (`Content-Type: application/json`).
-- **Error responses** are plain text (`Content-Type: text/plain; charset=utf-8`), produced by Go's `http.Error`. They are **not** JSON.
+- **Error responses** are plain text (`Content-Type: text/plain; charset=utf-8`), produced by Go's `http.Error`. They are **not** JSON, with one exception: the 501 rejection of `/kv/batch` (see "Batch Endpoint" below) is JSON, since it needs the same `{"success":false,"error":...}` shape client code already parses on other paths.
 
 ## Endpoints
 
@@ -45,8 +45,8 @@ Store or update a key-value pair in the distributed store.
 **Error Responses:**
 
 - **Code:** 400 Bad Request
-  - Invalid JSON in the request body. Missing fields are **not** validated; an empty body field is stored as an empty string.
-  - Body: plain-text JSON decode error message
+  - Invalid JSON in the request body, or an empty `key` field.
+  - Body: plain-text JSON decode error message, or `Key required` for an empty key. `value` is still not validated; an empty `value` is stored as an empty string. (The empty-key rejection was added to close R11: a misrouted batch request used to decode into `PutArgs{Key:"",Value:""}` and be stored as a silent, wrong success — see "No Batch Endpoint" below.)
 
 - **Code:** 503 Service Unavailable
   - Node is not the leader
@@ -231,15 +231,35 @@ curl http://localhost:9080/leader
 
 ---
 
-### No Batch Endpoint
+### 6. Batch Endpoint (Not Implemented)
 
-`kvstore/client.go`'s `Client.Batch`/`PutBatch`/`GetBatch` send `POST /kv/batch`,
-but the server registers no route for it. The request matches the `/kv/` prefix
-handler instead and is treated as a plain PUT: the batch's `operations` field is
-not a field of `PutArgs{Key,Value}`, so it decodes to an empty key/value and is
-stored as an empty-string PUT, returning `{"success":true}`. Batch operations are
-**not implemented** and silently do the wrong thing rather than failing loudly.
-See ../KNOWN_ISSUES.md (R11).
+**Endpoint:** any method on `/kv/batch`
+
+Batch operations are not implemented. `handleKV` rejects any request whose path
+is `/kv/batch` before dispatching on method:
+
+**Response:**
+- **Code:** 501 Not Implemented
+- **Content-Type:** `application/json` (unlike the plain-text errors elsewhere
+  in this document)
+- **Content:**
+```json
+{
+  "success": false,
+  "error": "batch operations are not implemented"
+}
+```
+
+`kvstore/client.go`'s `Client.Batch`/`PutBatch`/`GetBatch` do not send this
+request at all: they return the exported `kvstore.ErrBatchNotImplemented`
+locally.
+
+Before this was fixed, `Client.Batch` sent `POST /kv/batch`, which had no
+registered route and fell through to the `/kv/` prefix handler: the batch's
+`operations` field is not a field of `PutArgs{Key,Value}`, so it decoded to an
+empty key/value and was stored as an empty-key PUT, returning `{"success":true}`
+for a batch that never ran. `handlePut` now separately rejects an empty `key`
+with 400 regardless of how it got there. See ../KNOWN_ISSUES.md (R11, fixed).
 
 ---
 
@@ -249,13 +269,15 @@ See ../KNOWN_ISSUES.md (R11).
 
 | Code | Description | When it occurs |
 |------|-------------|----------------|
-| 400 | Bad Request | Invalid JSON body (PUT), or missing key in the URL path (GET/DELETE) |
+| 400 | Bad Request | Invalid JSON body or empty `key` (PUT), or missing key in the URL path (GET/DELETE) |
 | 404 | Not Found | Key doesn't exist (GET only) |
 | 405 | Method Not Allowed | Unsupported HTTP method on `/kv` |
 | 500 | Internal Server Error | Operation timeout (5s), leadership lost, internal failure |
+| 501 | Not Implemented | `/kv/batch` (any method) — see "Batch Endpoint" above |
 | 503 | Service Unavailable | Node is not leader |
 
-All error bodies are plain text, not JSON.
+All error bodies are plain text, not JSON, **except** the 501 batch rejection,
+which is JSON — see "Batch Endpoint" above.
 
 ### Leader Redirection
 
@@ -269,16 +291,23 @@ The leader is identified by its node ID only; clients must map node IDs to HTTP 
 
 > **Warning:** The duplicate-detection mechanism (`client_id`/`seq_num`) is wired
 > into the HTTP API (D4, fixed) and a write no longer returns a spurious
-> `leadership lost` after it was in fact committed (D5, fixed). But two caveats
-> remain: dedup only applies when the request carries a non-empty `client_id`
+> `leadership lost` after it was in fact committed (D5, fixed). One caveat
+> remains: dedup only applies when the request carries a non-empty `client_id`
 > (`kvstore/store.go:386`) — a request without one gets no duplicate protection,
-> so retrying it after a timeout can still apply the operation twice. And the
-> committed result is matched against a per-request `opID`
+> so retrying it after a timeout can still apply the operation twice.
+>
+> The committed result is matched against a per-request `opID`
 > (`kvstore/store.go:583`, `<nodeID>-<UnixNano>`) registered in `pendingOps`
-> *after* the entry is appended to the Raft log (`kvstore/store.go:598-614`); if
-> the entry is committed and applied before that registration completes, the
-> result is dropped and the client sees a timeout for an operation that in fact
-> succeeded. See ../KNOWN_ISSUES.md (D4, D5, R9).
+> *before* the entry is appended to the Raft log (`kvstore/store.go:598-614`),
+> specifically so that a commit+apply racing ahead of the registration can never
+> find the map empty and drop the result (R9, fixed).
+>
+> The `kvstore.Client` Go client (distinct from the illustrative example client
+> below) serializes `Put`/`Delete` per `Client` instance and, when every
+> configured server fails without a definitive response, returns an error
+> wrapping the exported `kvstore.ErrResultUnknown` rather than leaving the
+> caller unable to tell a confirmed failure from an uncertain one (R10, fixed).
+> See ../KNOWN_ISSUES.md (D4, D5, R9, R10).
 
 ## Client Implementation Pattern
 
