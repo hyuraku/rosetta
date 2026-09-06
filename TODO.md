@@ -52,11 +52,15 @@ suffix. All of that is fixed; compaction no longer has to be avoided for safety.
 - Integration coverage for automatic snapshot creation through the KV store and
   for recovery from a snapshot after restart is still missing
   (`docs/log-compaction.md`, Testing section).
-- R3, R4, R5 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (2026-09-06 re-audit): the
-  Raft-state boundary persist and the KV snapshot save are two non-atomic steps;
-  snapshot metadata and payload can be read from different generations on the
-  send path; and neither side guards against installing an older snapshot than
-  what has already been applied.
+- R3, R4, R5 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (2026-09-06 re-audit) are
+  fixed (`0695b95` / `f53617e` / `156510a`): the receive path persists the KV
+  payload before the Raft boundary and startup refuses an unrecoverable pair;
+  the send path ships one immutable (index, term, data) envelope; and both
+  receivers refuse a snapshot at or below what they have already applied.
+- R19 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): `RaftNode.Kill` closes `done`
+  without waiting for the run and replication goroutines, so a `kvs.Close()`
+  right after it can panic with `send on closed channel`. Best fixed with B3 /
+  item 2.5 below.
 - R15 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): `InstallSnapshotArgs` transfers the
   whole snapshot in one `Data []byte` field with no chunking/offset/resume
   support (see the "Streaming" item in `docs/log-compaction.md`'s Future

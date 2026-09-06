@@ -21,15 +21,25 @@ func NewRaftSnapshotter(storage Storage) *RaftSnapshotter {
 	return &RaftSnapshotter{storage: storage}
 }
 
-// ReadSnapshot returns the current persisted snapshot bytes, or (nil, nil) when
-// no snapshot has been taken yet. The leader calls this when sending an
-// InstallSnapshot RPC to a lagging follower.
-func (rs *RaftSnapshotter) ReadSnapshot() ([]byte, error) {
+// ReadSnapshot returns the current persisted snapshot as one immutable
+// (index, term, data) envelope, or (nil, nil) when no snapshot has been taken
+// yet. The leader calls this when sending an InstallSnapshot RPC to a lagging
+// follower.
+//
+// The three fields come out of a single snapshot.json read, and that file is
+// written atomically (write-then-rename), so the envelope is always one
+// generation: the bytes and the log position they were taken at cannot be
+// mismatched by a concurrent compaction (KNOWN_ISSUES.md R4).
+func (rs *RaftSnapshotter) ReadSnapshot() (*raft.SnapshotData, error) {
 	snapshot, err := rs.storage.LoadSnapshot()
 	if err != nil || snapshot == nil {
 		return nil, err
 	}
-	return snapshot.Data, nil
+	return &raft.SnapshotData{
+		LastIncludedIndex: snapshot.LastIncludedIndex,
+		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		Data:              snapshot.Data,
+	}, nil
 }
 
 // CreateSnapshot returns the state machine snapshot up to the given index. In
@@ -37,7 +47,11 @@ func (rs *RaftSnapshotter) ReadSnapshot() ([]byte, error) {
 // triggering log compaction, so the already-persisted bytes are the snapshot;
 // this returns them rather than re-marshaling the state machine.
 func (rs *RaftSnapshotter) CreateSnapshot(lastIncludedIndex, lastIncludedTerm int) ([]byte, error) {
-	return rs.ReadSnapshot()
+	snapshot, err := rs.ReadSnapshot()
+	if err != nil || snapshot == nil {
+		return nil, err
+	}
+	return snapshot.Data, nil
 }
 
 // InstallSnapshot persists a snapshot received from a leader. The production

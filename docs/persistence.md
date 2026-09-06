@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-09-06 against commit `d59bff3`.
+> Last verified: 2026-09-06 against commit `2a85ced`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -13,11 +13,13 @@ The persistence layer ensures that:
   the current-constraints warning below for what this does not cover
 
 > **Current constraint**: Raft state (`raft_state.json`) and the KV snapshot
-> (`snapshot.json`) are two separate files, saved in separate steps
-> (`raft/rpc.go:658-665` persists the Raft snapshot boundary; `kvstore/store.go:352-357`
-> saves the KV snapshot). Each file is atomically written on its own, but there is
-> **no atomicity across the two files** — a crash between the two saves can leave
-> them at different generations. See ../KNOWN_ISSUES.md (R3).
+> (`snapshot.json`) are two separate files. Each is atomically written on its own,
+> but there is still **no atomicity across the two files**. What makes that safe is
+> the order they are written in (R3, fixed in `0695b95`): on the InstallSnapshot
+> receive path the KV payload is made durable first, then the Raft boundary, then
+> the in-memory state machine is updated, so a crash can only leave the snapshot
+> *ahead* of the Raft state. Startup checks the pair and refuses the other
+> direction. See "Snapshot generation consistency" below and ../KNOWN_ISSUES.md (R3).
 
 ## Architecture
 
@@ -126,9 +128,12 @@ crash of that follower could lose a committed entry.
 persist one critical section (R1, fixed in `2c26b9a`), so a node demoted
 mid-append never writes a command under the new leader's term.
 
-The InstallSnapshot receive path is *not* yet covered by this discipline: a
-failed persist there leaves the in-memory log, snapshot boundary and volatile
-indices updated (KNOWN_ISSUES.md note 6, R3).
+The InstallSnapshot receive path follows the same discipline as of `0695b95`
+(R3): a failed boundary persist rolls the in-memory log, snapshot boundary,
+`CommitIndex` and `LastApplied` back to their pre-call values, so memory and disk
+still agree when the handler returns. `TruncateLogTo` does the same for the
+compaction path. The KV payload written before the boundary deliberately stays on
+disk — see "Snapshot generation consistency" below.
 
 KV store snapshots are saved automatically by the apply loop: after
 `max_raft_state` commands (default 1000) have been applied since the last
@@ -243,7 +248,7 @@ contain a plain `{"key": "value", ...}` map.
 4. **Resume Operation**: Node continues from recovered state
 
 Raft's volatile `CommitIndex`/`LastApplied` are restored from the snapshot boundary
-on restart (`raft/state.go:182-183`, `loadPersistentState`), so recovery does not
+on restart (`raft/state.go:191-192`, `loadPersistentState`), so recovery does not
 re-apply or misindex entries below the snapshot (A5, fixed).
 
 ### Recovery Guarantees
@@ -254,12 +259,52 @@ re-apply or misindex entries below the snapshot (A5, fixed).
 - **Ordering**: Log entries maintain correct order
 - **Idempotency**: Safe to restart multiple times
 
-A snapshot a follower receives via InstallSnapshot is now persisted to disk too:
-`installSnapshotFromApplyMsg` (`kvstore/store.go:354-357`) calls `saveSnapshot`
-whenever a snapshotter is configured, so a follower restart recovers state that
-arrived only via InstallSnapshot (A8, fixed). This still shares the cross-file
-caveat above (R3): the Raft-side boundary and the KV-side snapshot are saved in
-separate steps with no atomicity between them.
+A snapshot a follower receives via InstallSnapshot is persisted to disk too
+(A8, fixed). Since `0695b95` the write happens in the Raft handler, *before* the
+snapshot boundary is persisted, and the resulting `ApplyMsg` carries
+`SnapshotPersisted: true` so `installSnapshotFromApplyMsg`
+(`kvstore/store.go:348-395`) only updates memory instead of writing the same
+generation a second time. When no `raft.Snapshotter` is wired — memory-only
+configurations and most unit tests — the flag is false and the KV store still
+owns the write, as before.
+
+### Snapshot generation consistency
+
+`raft_state.json` and `snapshot.json` are written independently, so a crash lands
+between two writes and the two files can come back at different generations. The
+write order decides which mismatch is reachable (R3, fixed in `0695b95`).
+
+The InstallSnapshot receiver (`raft/rpc.go`, `RaftState.InstallSnapshot`) holds
+one ordering invariant, stated in its doc comment:
+
+1. the state machine payload becomes durable (`Snapshotter.InstallSnapshot`),
+2. the Raft snapshot boundary becomes durable (`persist`),
+3. the in-memory state machine is updated (the `applyCh` send).
+
+Only the "snapshot ahead of Raft" mismatch is therefore reachable, and it is
+recoverable: the node comes up on the older Raft boundary, replays the committed
+prefix from its log, and the KV apply loop drops every entry at or below the
+index its own snapshot already covers. The opposite mismatch — Raft compacted
+past what the state machine holds — is unrecoverable, because the discarded
+entries can never be delivered again.
+
+Startup enforces this. `persistence.VerifySnapshotConsistency`
+(`persistence/consistency.go`) compares the two boundaries and is called from
+`verifyDurableState` in `main.go` before either half is constructed:
+
+- Raft boundary **>** snapshot index → the process refuses to start, the same
+  fail-closed handling C4 gives an unreadable state file. Restore the node's data
+  directory from a peer.
+- snapshot index **>** Raft boundary → a compaction did not finish before the
+  last shutdown. Logged, then absorbed by the apply loop's monotonicity guard.
+
+The check lives in `persistence` rather than in `raft` or `kvstore` because those
+two are constructed independently in tests; only the caller that owns the shared
+`Storage` sees both files.
+
+Anything that moves the `applyCh` send off the handler goroutine — the eventual
+fix for B3 — must keep steps 1 and 2 in that order before the snapshot reaches
+the applier.
 
 ### Testing Recovery
 
@@ -357,10 +402,11 @@ chmod 600 ./data/node1/*
 - **Log Compaction**: Implemented. After a snapshot is saved, the Raft log is
   truncated up to the snapshot boundary and the compacted state is persisted.
 - **Snapshot Transfer (InstallSnapshot)**: The production binary wires a
-  `raft.Snapshotter` (`persistence.NewRaftSnapshotter`, `main.go:273`), so a
-  leader with a compacted log does send InstallSnapshot to lagging followers
-  (A6, fixed). See `docs/log-compaction.md` for the current constraints on this
-  path (R3–R5).
+  `raft.Snapshotter` (`persistence.NewRaftSnapshotter`), so a leader with a
+  compacted log does send InstallSnapshot to lagging followers (A6, fixed). The
+  snapshot it ships is one immutable `(index, term, data)` envelope read from a
+  single `snapshot.json` load (R4, fixed). See `docs/log-compaction.md` for what
+  is still open on this path (B3).
 
 ## Future Enhancements
 
@@ -402,9 +448,11 @@ automatically by the apply loop.
 The persistence feature provides durability for Rosetta's Raft state and KV
 snapshots, allowing nodes to recover from crashes along the normal log path.
 Follower-side snapshot durability (A8) and snapshot-transfer wiring (A6) are
-fixed. What remains is that the Raft-state file and the KV-snapshot file are
-written in separate steps with no cross-file atomicity (R3), snapshot metadata
-and payload can be read from different generations on the send path (R4), and
-there is no guard against an older snapshot rolling back committed KV state
-(R5) — see ../KNOWN_ISSUES.md before relying on recovery in compaction
-scenarios.
+fixed, and so are the three snapshot-path findings of the 2026-09-06 re-audit:
+generation-consistent persistence with a fail-closed startup check (R3), a single
+immutable envelope on the send path (R4), and monotonicity guards on both
+receivers (R5). The two files are still written separately — the guarantee comes
+from their order and from the startup check, not from cross-file atomicity — and
+the receive path still holds `rs.mu` across both the payload write and the
+`applyCh` send, which is a liveness problem (B3). See ../KNOWN_ISSUES.md before
+relying on recovery in compaction scenarios.

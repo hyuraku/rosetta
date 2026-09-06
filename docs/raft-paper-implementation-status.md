@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-06 / 対象 commit `d59bff3`
+> 最終検証: 2026-09-06 against commit `2a85ced`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -10,16 +10,16 @@
 |---------|------|------|
 | リーダー選挙 (Section 5.2) | ⚠️ 要修正あり | 基本動作は実装済み。当選時に current-term no-op を追記（D3 解消）。圧縮後の投票判定も絶対 index 化済み（A2 解消・commit `8ad5367`）。残る懸念は E1（ロック外 `ResetElectionTimer` の data race）と R6（降格経路が `ResetElectionTimer` を呼ばず選挙タイマーが再始動しない） |
 | ログ複製 (Section 5.3) | ⚠️ 要修正あり | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）は完了。ただし境界 term 検査・commit 上限の一部分岐が未検証（R13、`raft/rpc.go:153-163,191-194`） |
-| 安全性保証 (Section 5.4) | ❌ 要修正あり | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。ただし State Machine Safety は R3–R5（snapshot の世代不整合）が未修正 |
-| 永続化 (Figure 2) | ⚠️ 要修正あり | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`appendEntryLocked` 経由の `AppendLogEntry`/`Start`/当選時 no-op、`TruncateLogAfter`）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。AppendEntries 受信経路の未永続 merge も persist 失敗時にロールバックするようになった（R2 解消・commit `c362ae4`）。ただし InstallSnapshot 受信経路には同種の不一致が残る（注記 6・R3） |
-| ログコンパクション (Section 7) | ❌ 要修正あり | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。ただし 2026-09-06 再監査で新たに: Raft state と KV snapshot の世代整合性がない（R3）、snapshot のメタデータと実データが別世代になりうる（R4）、古い snapshot による KV 状態の後退を防ぐガードがない（R5）ことを確認。B3（`rs.mu` 保持下の `applyCh` 送信、liveness）も残る |
+| 安全性保証 (Section 5.4) | ⚠️ 要修正あり | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。State Machine Safety の R3–R5（snapshot の世代整合・古い snapshot の適用）も解消（`0695b95` / `f53617e` / `156510a`）。残る懸念は R13（境界 term 検査・commit 上限の未検証分岐）と E2 |
+| 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`appendEntryLocked` 経由の `AppendLogEntry`/`Start`/当選時 no-op、`TruncateLogAfter`）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。AppendEntries 受信経路の未永続 merge も persist 失敗時にロールバックするようになった（R2 解消・commit `c362ae4`）。InstallSnapshot 受信経路と `TruncateLogTo` も同じロールバック規律に揃えた（R3 解消・commit `0695b95`）。加えて raft_state.json と snapshot.json の世代整合を起動時に検証し、復旧不能な組み合わせでは起動を拒否する |
+| ログコンパクション (Section 7) | ⚠️ 要修正あり（liveness のみ） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）、受信側の §7 保持ルール（A7・`019d33e`）に加え、2026-09-06 再監査の 3 件も解消: 受信経路の世代整合と起動時検証（R3・`0695b95`）、メタデータとペイロードの同一世代化（R4・`f53617e`）、古い snapshot の適用禁止（R5・`156510a`）。安全性の未修正項目はない。B3（`rs.mu` 保持下での payload 書き込みと `applyCh` 送信、liveness）と R15（chunk 転送なし）が残る |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応（R14）。`-join` は失敗してもログのみで起動を続ける fail-open（R12） |
 | クライアント相互作用 (Section 8) | ⚠️ 条件付きで配線済み | 重複検知（ClientID/SeqNum）を実 API 経路へ配線（D4 解消・commit `52afd48`）。ただし dedup は `ClientID` を指定した場合のみ発動する条件付きで（`kvstore/store.go:386`）、無条件の at-most-once ではない。committed 済みの結果解決は log index ではなく opID ベースで、pending 登録のタイミング競合（R9）がある。batch API は実装されておらず空 PUT として黙って成功する（R11） |
 | 読み取り専用クエリ最適化 | ✅ 線形化実装 | ReadIndex プロトコル + 当選時 no-op で linearizable read を実装。旧リース方式は撤去（D1〜D3 解消） |
 
-（A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
+（A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID、R19 以降はその修正作業中に見つかった ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま applyCh へブロッキング送信 = liveness）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）に加え、2026-09-06 再監査で確認されたグループ R のうち R3–R6, R9–R16, R18（計 13 件）。R1（Log Matching）と R2（Leader Completeness/永続化）は解消したが（`2c26b9a` / `c362ae4`）、R3–R5（State Machine Safety・snapshot 世代整合）は Raft の安全性そのものに関わる確認済みの問題として残っており、「論文の安全性性質を破る既知の経路は残っていない」とは言えない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま payload 書き込みと applyCh 送信を行う = liveness）・E1（ロック外 `ResetElectionTimer` の data race）・E2（送信エントリの backing array をロック外 marshal 中に書き換えうる data race）に加え、グループ R のうち R6, R9–R16, R18, R19（計 11 件）。監査が P0 とした R1–R5 はすべて解消した（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）。ただし R13（AppendEntries の境界 term 検査・commit 上限）や E2 のように安全性に触れうる未修正項目が残るため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -130,7 +130,7 @@ type AppendEntriesReply struct {
 
 ---
 
-### 3. 安全性保証 (Section 5.4) ❌ 要修正あり（R3–R5）
+### 3. 安全性保証 (Section 5.4) ⚠️ 要修正あり（R13, E2）
 
 #### 論文の要件
 - **選挙安全性**: 各任期で最大1人のリーダー
@@ -158,11 +158,11 @@ if args.LastLogTerm > lastLogTerm ||
 - **リーダー追記のみ**: `RaftState.Start`（`raft/log.go:148-165`）が leader 判定・term stamp・persist を 1 回の `rs.mu` の中で行うため、降格後に command が追記されることはありません（R1 解消・`2c26b9a`）
 - **ログ一致 (Log Matching)**: AppendEntries の切り詰めは §5.3 step 3 準拠に修正済み（B2 解消・`7151e77`）。InstallSnapshot 受信側の分岐 suffix 保持も §7 の保持ルール実装で解消（A7・`019d33e`）。2026-09-06 再監査で指摘された R1（`RaftNode.Start` が leader/term の確認と durable append を別の `rs.mu` 臨界区間で行い、間に降格が挟まると非 leader が新 term の command を追記しうる）は `2c26b9a` で解消した。`RaftNode.Start` は `RaftState.Start` へ委譲するだけになり、role 確認から persist・失敗時ロールバックまでが単一の `rs.mu` 臨界区間に収まっている
 - **リーダー完全性 (Leader Completeness)**: 選挙制限が絶対 index でスナップショットメタデータを考慮するようになり（A2 解消・commit `8ad5367`）、圧縮後もコミット済みエントリを持たないノードは当選しません。加えて当選時 no-op の追記（`becomeLeader`、D3 解消、commit `60fd631`）により、前任 term のコミット済みエントリは選挙直後に advance されます。2026-09-06 再監査の R2（persist に失敗した AppendEntries の再送が `mergeLogEntries` の「既に一致」判定で persist をスキップし `Success=true` を返し、未永続のエントリが `MatchIndex` に反映されうる）は `c362ae4` で解消した。persist 失敗時に merge 前のログへロールバックするため、再送も改めて merge → persist を通り、成功するまで `Success=false` が返る
-- **状態機械安全性**: R1・R2 の解消後も、R3–R5（Raft state と KV snapshot の世代不整合、snapshot メタデータ/ペイロードの別世代化、古い snapshot による KV 状態の後退）が発火しない限りで成立
+- **状態機械安全性**: R1・R2 に続き、snapshot 経路の R3–R5 も解消しました。受信経路は「KV payload を durable 化 → Raft 境界を durable 化 → メモリ適用」の順序不変条件を守り（R3・`0695b95`、`RaftState.InstallSnapshot` の doc comment に明記）、crash は必ず復旧可能な側（snapshot が Raft より新しい）に倒れます。復旧不能な組み合わせは起動時に `persistence.VerifySnapshotConsistency` が拒否します。送信側は index/term/data を 1 つの envelope として扱い（R4・`f53617e`）、受信側は Raft も KV も適用済みインデックス以下の snapshot を無視します（R5・`156510a`）。ただし R13（AppendEntries の境界 term 検査と commit 上限の未検証分岐）と E2（送信 slice の data race）は未修正のため、無条件に成立するとは言えません
 
 ---
 
-### 4. 永続化 (Figure 2) ⚠️ 要修正あり（R3）
+### 4. 永続化 (Figure 2) ✅ 実装済み（ロールバック規律・世代検証まで）
 
 #### 論文の要件
 - `currentTerm`, `votedFor`, `log[]` は永続化必須
@@ -200,11 +200,16 @@ type Persister interface {
 - 追記本体は `appendEntryLocked`（`rs.mu` 保持が前提）に切り出されている。persist に失敗したら追記をロールバックし（メモリとディスクを一致させる）、エラーを返す（`raft/log.go:100-118`）。`AppendLogEntry`（`:120-129`）はこれをロック取得付きで包んだもの
 - `TruncateLogAfter` は `error` を返す。persist に失敗したら切り詰め前のログを復元する（`raft/log.go:215-232`）
 - 当選時 no-op（`appendNoOpLocked`）も同じ `appendEntryLocked` を使い、persist 失敗時はロールバック。no-op を失っても安全側で、current-term のエントリがコミットされるまで読み取りが `ErrNoCurrentTermCommit` を返し続けるだけ（`raft/noop.go:48-54`）
-- `RaftNode.Start` はエラーを返し、KV 層はタイムアウトを待たずに操作を失敗させる（`raft/node.go:94-119`, `kvstore/store.go:598-609`）。leader 判定と追記は `RaftState.Start` の単一 `rs.mu` 臨界区間で行われる（R1 解消・`2c26b9a`）
+- `RaftNode.Start` はエラーを返し、KV 層はタイムアウトを待たずに操作を失敗させる（`raft/node.go:94-119`）。leader 判定と追記は `RaftState.Start` の単一 `rs.mu` 臨界区間で行われる（R1 解消・`2c26b9a`）
+
+**snapshot 経路のロールバックと世代検証**（commit `0695b95` で R3 を解消）:
+- `InstallSnapshot` 受信側は persist に失敗したら Log／`LastIncludedIndex`／`LastIncludedTerm`／`CommitIndex`／`LastApplied` をすべて呼び出し前の値へ戻す。`TruncateLogTo` も同様（`raft/snapshot.go`）。これで AppendEntries と同じ「ハンドラを抜けた時点でメモリとディスクが一致する」不変条件が snapshot 経路にも適用される
+- `raft_state.json` と `snapshot.json` の間にファイル跨ぎの atomicity はないため、代わりに書き込み順序で保証する: KV payload → Raft 境界 → メモリ適用。crash は必ず「snapshot が Raft より新しい」復旧可能な側に倒れる
+- 起動時に `persistence.VerifySnapshotConsistency`（`persistence/consistency.go`）が 2 ファイルの境界を比較し、Raft 境界が snapshot より進んでいれば起動を拒否する（C4 と同じ fail-closed）。逆向きは applyLoop の単調性ガードが吸収する
 
 ---
 
-### 5. ログコンパクション / スナップショット (Section 7) ❌ 要修正あり（R3–R5 の safety、B3 の liveness）
+### 5. ログコンパクション / スナップショット (Section 7) ⚠️ 要修正あり（B3 の liveness、R15 の chunk 転送）
 
 #### 論文の要件
 - スナップショットで状態機械の状態をキャプチャ
@@ -241,10 +246,12 @@ type ApplyMsg struct {
     SnapshotIndex int
     SnapshotTerm  int
     SnapshotData  []byte
+    // Raft 層が payload を先に永続化済みかどうか（R3）
+    SnapshotPersisted bool
 }
 ```
 
-RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`）・リーダー送信側のインデックス変換に加え、受信・投票・コミット・適用の各経路、本番配線、フォロワー側永続化、受信側の §7 保持ルールがすべて解消されました。**グループ A に未修正の安全性課題はありません**が、2026-09-06 の再監査でこの経路に新たな安全性課題（R3–R5）が見つかっています:
+RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`）・リーダー送信側のインデックス変換に加え、受信・投票・コミット・適用の各経路、本番配線、フォロワー側永続化、受信側の §7 保持ルールがすべて解消されました。**グループ A に未修正の安全性課題はありません**。2026-09-06 の再監査がこの経路に見つけた R3–R5 も解消済みです:
 
 - **受信ハンドラの圧縮後 index 対応 (A1・✅ 解消)**: `AppendEntries` ハンドラは `PrevLogIndex` を `LastIncludedIndex` オフセットに合わせて絶対 index として扱うようになりました。修正 commit `8ad5367`
 - **投票経路の絶対 index 化 (A2・✅ 解消)**: `RequestVote`/`startElection` が `LastIncludedIndex/Term` を含む絶対 index で候補者ログの新しさを評価します。修正 commit `8ad5367`
@@ -255,14 +262,14 @@ RPC 構造体・スナップショット取得（`TakeSnapshot`/`TruncateLogTo`�
 - **受信側の §7 保持ルール (A7・✅ 解消)**: `InstallSnapshot` ハンドラは `logAfterSnapshot`（`raft/log.go`）を通し、自ログの `LastIncludedIndex` が index/term ともにスナップショットと一致するときだけ以降を保持し、不一致（および照合対象を持たないほど遅れている場合）はログを全破棄します。論文 §7 Figure 13 の受信ルール 6/7 準拠。修正 commit `019d33e`
 - **フォロワー側スナップショットの永続化 (A8・✅ 解消)**: `installSnapshotFromApplyMsg` が `saveSnapshot` でフォロワー側スナップショットをディスクに永続化します。修正 commit `c516f54`
 
-see ../KNOWN_ISSUES.md (A1〜A8)。ただし残る問題として:
+see ../KNOWN_ISSUES.md (A1〜A8)。2026-09-06 再監査分の解消状況:
 
-- **R3（未修正）Raft state と KV snapshot の世代不整合**: Raft 側の境界 persist（`raft/rpc.go:658-665`）と KV 側の `saveSnapshot`（`kvstore/store.go:352-357`）は別段階で行われ、2 ファイル間の世代整合性（atomicity）がありません。片方だけ保存できた状態で crash すると不整合が残ります
-- **R4（未修正）snapshot メタデータとペイロードの別世代化**: leader 送信側で `LastIncludedIndex`/`LastIncludedTerm`（`raft/rpc.go:379-406`、ロック内）と実データ（`:502-512` の `snapshotter.ReadSnapshot()`、ロック外）を別々のタイミングで読むため、両者が別世代になりえます
-- **R5（未修正）古い snapshot による KV 状態の後退**: Raft 側は新旧を `LastIncludedIndex` としか比較せず（`raft/rpc.go:635-637`）、KV 側 `installSnapshotFromApplyMsg` は適用済みインデックスとの比較なしに無条件で state を置換します（`kvstore/store.go:340-344`）。遅延・重複配送された古い snapshot が KV 状態を後退させうるガードの欠如です
-- B3（受信ハンドラが `rs.mu` 保持のまま `applyCh` へブロッキング送信）は安全性ではなく liveness の課題として残ります
+- **R3（✅ 解消・`0695b95`）Raft state と KV snapshot の世代整合**: 受信ハンドラは「①KV payload を `Snapshotter.InstallSnapshot` で durable 化 → ②Raft 境界を persist → ③`applyCh` でメモリ適用」の順序不変条件を守ります（`RaftState.InstallSnapshot` の doc comment に明記）。2 ファイル間の atomicity は依然ありませんが、この順序により crash は必ず「snapshot が Raft より新しい」復旧可能な側に倒れます。①②いずれの失敗でもメモリはロールバックされ、`ApplyMsg.SnapshotPersisted` で KV 側の二重書きを抑止します。起動時は `persistence.VerifySnapshotConsistency` が復旧不能な組み合わせ（Raft 境界 > snapshot）で起動を拒否します
+- **R4（✅ 解消・`f53617e`）snapshot メタデータとペイロードの同一世代化**: `Snapshotter.ReadSnapshot` が `*raft.SnapshotData`（index/term/data）の immutable envelope を返し、`sendSnapshotToPeer` は `InstallSnapshotArgs` と follower の `MatchIndex`/`NextIndex` をその envelope だけから組み立てます。ロック内で読んだ境界は「snapshot を送るべきか」の判定にのみ使います
+- **R5（✅ 解消・`156510a`）古い snapshot による状態の後退**: Raft 側は `args.LastIncludedIndex <= volatile.LastApplied` の snapshot を無視し（term 更新と election timer reset は有効な leader 通信として行う）、KV 側 `installSnapshotFromApplyMsg` も `msg.SnapshotIndex <= lastAppliedIndex` を無視する単調性ガードを持ちます
+- B3（受信ハンドラが `rs.mu` 保持のまま payload を書き、`applyCh` へブロッキング送信する）は安全性ではなく liveness の課題として残ります。R15（chunk 転送なし）も未実装です
 
-なお `MaxRaftState=0`（圧縮無効）は設定として指定できません（`Config.Validate` が正数を強制）。詳細は KNOWN_ISSUES.md グループ R（R3, R4, R5）を参照。
+なお `MaxRaftState=0`（圧縮無効）は設定として指定できません（`Config.Validate` が正数を強制）。詳細は KNOWN_ISSUES.md グループ R を参照。
 
 ---
 
@@ -408,7 +415,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 
 ### 2026-07-07 報告書分（解消済み）
 1. ✅ **AppendEntries step 3 の一致確認**（解消済み） — 既存エントリと index/term が一致する場合は切り詰めない conflict ベース切り詰めを実装（B2・commit `7151e77`）
-2. ✅ **ログコンパクション（グループ A）** — 絶対/相対インデックスの統一・投票/コミット/適用経路・`raft.Snapshotter` の本番配線・フォロワー側スナップショット永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。**グループ A に未修正項目なし**（ただし 2026-09-06 再監査で同じ経路に R3–R5 の新規安全性課題が見つかっている）
+2. ✅ **ログコンパクション（グループ A）** — 絶対/相対インデックスの統一・投票/コミット/適用経路・`raft.Snapshotter` の本番配線・フォロワー側スナップショット永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）に加え、受信側の §7 保持ルール（A7・`019d33e`）も解消。**グループ A に未修正項目なし**（同じ経路に 2026-09-06 再監査が見つけた R3–R5 も解消済み）
 3. ✅ **当選時 no-op の導入とリース設計の見直し**（解消済み） — 当選時 no-op（`becomeLeader`、commit `60fd631`）と ReadIndex 方式（`b3b21a4`）を実装し、旧リース機構を撤去（D1〜D3）
 4. ✅ **重複検知の実配線**（解消済み・条件付き） — HTTP API 経路への ClientID/SeqNum の受け渡し（D4・commit `52afd48`）と、"leadership lost" spurious エラーの解消（D5・commit `16a9b31`）を実装。ただし dedup は ClientID 指定時のみで、opID ベースの結果解決には R9 が残る
 
@@ -417,9 +424,9 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 2. ✅ 完了 — CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go` の
    timeout `break` を修正（R17、`19bdb37`/`91b0f7c`）
 3. ✅ 完了 — R1（`Start` の leader 判定と append の原子化、`2c26b9a`）、R2（未永続 merge のロールバックによる durable ACK、`c362ae4`）
-4. R3–R5（snapshot の世代整合・復旧・適用順序） — P0
+4. ✅ 完了 — R3（世代整合・順序不変条件・起動時検証、`0695b95`）、R4（payload/metadata の同一世代化、`f53617e`）、R5（古い snapshot の適用禁止、`156510a`）
 5. R6、E1/E2、peer replication worker（タイマー・リーダー参照の統一） — P1
-6. B3（受信ハンドラの `rs.mu` 保持下ブロッキング送信）の ordered applier と shutdown lifecycle
+6. B3（受信ハンドラの `rs.mu` 保持下での payload 書き込みとブロッキング送信）の ordered applier と shutdown lifecycle。R19（`Kill` が goroutine の終了を待たない）も同時に
 7. R9–R13（KV/client/API/RPC 細部） — P1
 8. R15（chunk transfer） — P2
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順） — P2

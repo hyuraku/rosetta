@@ -80,6 +80,63 @@ func TestInstallSnapshotFromApplyMsgV1BackwardCompat(t *testing.T) {
 	}
 }
 
+// TestInstallSnapshotFromApplyMsgIsMonotonic is the R5 regression test for the
+// state machine's own guard. Raft rejects stale snapshots on its side, but this
+// store is also fed after a restart in which snapshot.json was ahead of
+// raft_state.json, so it must refuse anything at or below what it has already
+// folded in. Replacing state with an older snapshot loses committed writes with
+// no error anywhere.
+func TestInstallSnapshotFromApplyMsgIsMonotonic(t *testing.T) {
+	const installed = "at-10"
+
+	kvs := NewKVStore(0)
+	defer kvs.Close()
+
+	install := func(index, term int, data map[string]string) {
+		t.Helper()
+		raw, err := json.Marshal(&SnapshotData{KVData: data})
+		if err != nil {
+			t.Fatalf("marshal snapshot: %v", err)
+		}
+		kvs.installSnapshotFromApplyMsg(&raft.ApplyMsg{
+			SnapshotValid: true,
+			SnapshotIndex: index,
+			SnapshotTerm:  term,
+			SnapshotData:  raw,
+		})
+	}
+
+	install(10, 3, map[string]string{"k": installed})
+	if got := kvs.GetSnapshot()["k"]; got != installed {
+		t.Fatalf("setup: k = %q, want %q", got, installed)
+	}
+
+	// Strictly older: ignored.
+	install(6, 2, map[string]string{"k": "at-6"})
+	if got := kvs.GetSnapshot()["k"]; got != installed {
+		t.Fatalf("snapshot at index 6 rolled the store back: k = %q, want %q", got, installed)
+	}
+
+	// Same index (a duplicate delivery): ignored.
+	install(10, 3, map[string]string{"k": "duplicate"})
+	if got := kvs.GetSnapshot()["k"]; got != installed {
+		t.Fatalf("duplicate snapshot at index 10 replaced the store: k = %q, want %q", got, installed)
+	}
+
+	kvs.mu.RLock()
+	idx := kvs.lastAppliedIndex
+	kvs.mu.RUnlock()
+	if idx != 10 {
+		t.Fatalf("lastAppliedIndex = %d after ignored snapshots, want 10", idx)
+	}
+
+	// Newer: installed.
+	install(11, 4, map[string]string{"k": "at-11"})
+	if got := kvs.GetSnapshot()["k"]; got != "at-11" {
+		t.Fatalf("newer snapshot at index 11 was not installed: k = %q, want %q", got, "at-11")
+	}
+}
+
 // TestApplyLoopUpdatesLastAppliedTerm verifies that applying a committed command
 // advances both lastAppliedIndex and lastAppliedTerm using the absolute term
 // carried on ApplyMsg.CommandTerm. A correct lastAppliedTerm is required so that

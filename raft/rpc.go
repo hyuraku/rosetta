@@ -433,7 +433,11 @@ func (rs *RaftState) replicateToPeer(
 	rs.mu.RUnlock()
 
 	if sendSnapshot {
-		rs.sendSnapshotToPeer(transport, peerID, currentTerm, lastIncludedIndex, lastIncludedTerm, snapshotter)
+		// Only nextIndex is carried across: it says what the follower still
+		// needs. The boundary we sampled under the lock must not become the
+		// RPC's LastIncludedIndex/LastIncludedTerm — those come from the
+		// snapshot envelope itself (KNOWN_ISSUES.md R4).
+		rs.sendSnapshotToPeer(transport, peerID, currentTerm, nextIndex, snapshotter)
 		return
 	}
 
@@ -516,26 +520,45 @@ func (rs *RaftState) handleReplicationConflict(peerID string, reply *AppendEntri
 // sendSnapshotToPeer ships the current snapshot to a follower whose required
 // entries have been compacted away, then advances that follower's match/next
 // index on success. Intended to run in its own goroutine.
+//
+// nextIndex is the follower's nextIndex as sampled by replicateToPeer; it is
+// used only to decide whether the snapshot we can actually read is new enough
+// to help. Everything the RPC asserts about the snapshot — its index, its term
+// and its bytes — comes from the single envelope returned by ReadSnapshot.
+// Sampling the boundary under rs.mu and the payload outside it (the previous
+// behavior) let a concurrent compaction or InstallSnapshot rewrite snapshot.json
+// in between, so the follower could be told that generation B's bytes belonged
+// at generation A's (index, term) — a state machine silently installed under
+// the wrong log position (KNOWN_ISSUES.md R4).
 func (rs *RaftState) sendSnapshotToPeer(
 	transport RPCTransport,
 	peerID string,
-	currentTerm, lastIncludedIndex, lastIncludedTerm int,
+	currentTerm, nextIndex int,
 	snapshotter Snapshotter,
 ) {
 	if snapshotter == nil {
 		// Log compaction not wired up; nothing to send.
 		return
 	}
-	data, err := snapshotter.ReadSnapshot()
-	if err != nil || data == nil {
+	snapshot, err := snapshotter.ReadSnapshot()
+	if err != nil || snapshot == nil {
+		return
+	}
+	// A snapshot that ends before the entry this follower already has cannot
+	// move it forward, and installing it would drag its match index backwards.
+	// This means our own snapshot file is behind the boundary we compacted to,
+	// so wait for the next generation rather than shipping a useless payload.
+	if snapshot.LastIncludedIndex < nextIndex-1 {
+		rs.logger.Printf("sendSnapshotToPeer: snapshot at index %d is older than %s's nextIndex %d; not sending",
+			snapshot.LastIncludedIndex, peerID, nextIndex)
 		return
 	}
 	snapArgs := &InstallSnapshotArgs{
 		Term:              currentTerm,
 		LeaderID:          rs.nodeID,
-		LastIncludedIndex: lastIncludedIndex,
-		LastIncludedTerm:  lastIncludedTerm,
-		Data:              data,
+		LastIncludedIndex: snapshot.LastIncludedIndex,
+		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		Data:              snapshot.Data,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), installSnapshotTimeout)
 	defer cancel()
@@ -559,9 +582,11 @@ func (rs *RaftState) sendSnapshotToPeer(
 	if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
 		return
 	}
-	// Follower has now installed the snapshot up to lastIncludedIndex.
-	rs.leader.MatchIndex[peerID] = lastIncludedIndex
-	rs.leader.NextIndex[peerID] = lastIncludedIndex + 1
+	// Follower has now installed the snapshot we actually shipped, so its match
+	// index follows that envelope's boundary — not the boundary we happened to
+	// read from our own state before the send.
+	rs.leader.MatchIndex[peerID] = snapshot.LastIncludedIndex
+	rs.leader.NextIndex[peerID] = snapshot.LastIncludedIndex + 1
 }
 
 func (rs *RaftState) updateCommitIndex() {
@@ -628,7 +653,28 @@ func DeserializeAppendEntriesReply(data []byte) (*AppendEntriesReply, error) {
 	return &reply, err
 }
 
-// InstallSnapshot RPC handler
+// InstallSnapshot RPC handler (paper §7, Figure 13 receiver rules).
+//
+// Durability ordering invariant — do not reorder these three steps:
+//
+//  1. the state machine payload becomes durable (Snapshotter.InstallSnapshot),
+//  2. the Raft snapshot boundary becomes durable (persist),
+//  3. the in-memory state machine is updated (the applyCh send).
+//
+// The two files have no cross-file atomicity, so a crash always lands between
+// two of these steps and the order decides which way the inconsistency falls
+// (KNOWN_ISSUES.md R3). With payload first, a crash can only leave snapshot.json
+// ahead of raft_state.json, which is recoverable: the node comes up with the
+// older Raft boundary, replays the log, and the state machine ignores everything
+// at or below the index its snapshot already covers. The previous order —
+// boundary first, payload later on the apply path — produced the opposite and
+// unrecoverable state: raft_state.json claimed CommitIndex/LastApplied = N with
+// its log discarded below N, while the state machine on disk was still at some
+// index < N and could never be sent those entries again.
+//
+// The same invariant has to hold once the applyCh send moves off this goroutine
+// (KNOWN_ISSUES.md B3): steps 1 and 2 must still complete, in that order, before
+// the snapshot is handed to the applier.
 func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -658,10 +704,48 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 	rs.currentLeader = args.LeaderID
 	rs.ResetElectionTimer()
 
-	// Don't install older snapshots
-	if args.LastIncludedIndex <= rs.persistent.LastIncludedIndex {
+	// Refuse any snapshot that would move this node backwards. Comparing only
+	// against LastIncludedIndex (the previous behavior) let a delayed or
+	// duplicated RPC carrying an old snapshot through whenever this node had
+	// applied past that index without compacting to it: the log was then cut
+	// back to the stale boundary and the payload was handed to the state
+	// machine, which replaced already-applied state with an earlier version
+	// (KNOWN_ISSUES.md R5). LastApplied is never below LastIncludedIndex on the
+	// normal paths, but both are checked because TruncateLogTo can advance the
+	// boundary independently.
+	if args.LastIncludedIndex <= rs.volatile.LastApplied ||
+		args.LastIncludedIndex <= rs.persistent.LastIncludedIndex {
+		rs.logger.Printf("InstallSnapshot: ignoring snapshot at index %d (lastApplied=%d, lastIncluded=%d)",
+			args.LastIncludedIndex, rs.volatile.LastApplied, rs.persistent.LastIncludedIndex)
 		return
 	}
+
+	// Step 1: make the state machine payload durable first. Until this write
+	// lands, nothing about our Raft state may change — a boundary recorded
+	// against a payload that is not on disk is the unrecoverable direction.
+	// With no snapshotter wired (memory-only configurations, and tests) the
+	// state machine still owns the write and gets told so via the ApplyMsg.
+	snapshotPersisted := false
+	if rs.snapshotter != nil {
+		if err := rs.snapshotter.InstallSnapshot(
+			args.Data, args.LastIncludedIndex, args.LastIncludedTerm,
+		); err != nil {
+			rs.logger.Printf("InstallSnapshot: persisting the snapshot payload failed, "+
+				"leaving raft state untouched: %v", err)
+			return
+		}
+		snapshotPersisted = true
+	}
+
+	// Step 2: advance the Raft boundary and make it durable. Everything the
+	// persist covers is saved first so a failed write can be undone exactly:
+	// logAfterSnapshot only re-slices (or drops) the log, so restoring the slice
+	// header restores the entries, and rs.mu is held throughout.
+	prevLog := rs.persistent.Log
+	prevLastIncludedIndex := rs.persistent.LastIncludedIndex
+	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
+	prevCommitIndex := rs.volatile.CommitIndex
+	prevLastApplied := rs.volatile.LastApplied
 
 	// Replace the log per the paper's §7 retention rule: entries the snapshot
 	// covers always go, and the suffix above the boundary survives only when
@@ -682,24 +766,32 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		rs.volatile.LastApplied = args.LastIncludedIndex
 	}
 
-	// Persist the new snapshot boundary before handing the data to the state
-	// machine. If this fails, do not apply: letting the state machine advance
-	// past a snapshot index we did not durably record would leave the state
-	// machine ahead of our Raft metadata after a crash.
 	if err := rs.persist(); err != nil {
-		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed: %v", err)
+		// Roll the whole install back so memory and disk still agree when this
+		// handler returns, the same discipline AppendEntries follows for a
+		// failed merge (KNOWN_ISSUES.md R2). The payload we already wrote stays
+		// on disk; that only leaves snapshot.json ahead of raft_state.json,
+		// which the startup check and the state machine's monotonicity guard
+		// absorb. The leader retries and the install completes then.
+		rs.persistent.Log = prevLog
+		rs.persistent.LastIncludedIndex = prevLastIncludedIndex
+		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
+		rs.volatile.CommitIndex = prevCommitIndex
+		rs.volatile.LastApplied = prevLastApplied
+		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed, rolled back: %v", err)
 		return
 	}
 
-	// Send snapshot data to apply channel for state machine to install
+	// Step 3: hand the snapshot to the state machine for its in-memory update.
 	rs.applyCh <- ApplyMsg{
-		CommandValid:  false,
-		Command:       args.Data,
-		CommandIndex:  args.LastIncludedIndex,
-		SnapshotValid: true,
-		SnapshotIndex: args.LastIncludedIndex,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotData:  args.Data,
+		CommandValid:      false,
+		Command:           args.Data,
+		CommandIndex:      args.LastIncludedIndex,
+		SnapshotValid:     true,
+		SnapshotIndex:     args.LastIncludedIndex,
+		SnapshotTerm:      args.LastIncludedTerm,
+		SnapshotData:      args.Data,
+		SnapshotPersisted: snapshotPersisted,
 	}
 }
 

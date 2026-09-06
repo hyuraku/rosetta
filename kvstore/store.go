@@ -253,6 +253,21 @@ func (kvs *KVStore) applyLoop() {
 			continue
 		}
 
+		// Ignore anything this state machine has already folded in. Raft is
+		// allowed to replay a committed prefix: after a crash between the KV
+		// snapshot write and the log truncation that follows it, snapshot.json
+		// is ahead of raft_state.json, so the recovered node re-applies entries
+		// this store already covers (KNOWN_ISSUES.md R3). Without the guard
+		// lastAppliedIndex would jump backwards, which would let a later
+		// snapshot be labeled with an index far below the data it contains and
+		// would stall ReadIndex waits.
+		kvs.mu.RLock()
+		alreadyApplied := applyMsg.CommandIndex <= kvs.lastAppliedIndex
+		kvs.mu.RUnlock()
+		if alreadyApplied {
+			continue
+		}
+
 		// A no-op entry (appended by a newly elected leader, Raft §6.4) carries
 		// no state-machine command. We must still advance lastAppliedIndex over
 		// it — both the log-compaction accounting and the ReadIndex catch-up in
@@ -331,6 +346,21 @@ func (kvs *KVStore) applyLoop() {
 // the new snapshot boundary, so failing to persist the state machine here would
 // leave a restarted follower with neither data nor log.
 func (kvs *KVStore) installSnapshotFromApplyMsg(msg *raft.ApplyMsg) {
+	// Monotonicity guard (KNOWN_ISSUES.md R5). Raft rejects stale snapshots on
+	// its side too, but this store is also fed by the apply loop after a restart
+	// in which the snapshot on disk was ahead of the Raft state, so it must
+	// enforce its own rule: nothing at or below what has already been folded in
+	// may replace the state machine. Without it a delayed or replayed snapshot
+	// silently rolls committed data back.
+	kvs.mu.RLock()
+	applied := kvs.lastAppliedIndex
+	kvs.mu.RUnlock()
+	if msg.SnapshotIndex <= applied {
+		kvs.logger.Printf("Ignoring snapshot at index %d: state machine has already applied through %d",
+			msg.SnapshotIndex, applied)
+		return
+	}
+
 	snapshotData, err := parseSnapshotBytes(msg.SnapshotData)
 	if err != nil {
 		kvs.logger.Printf("Failed to unmarshal snapshot data: %v", err)
@@ -349,9 +379,12 @@ func (kvs *KVStore) installSnapshotFromApplyMsg(msg *raft.ApplyMsg) {
 		kvs.sessionMu.Unlock()
 	}
 
-	// Persist the received snapshot so a follower restart recovers this state.
-	// A nil snapshotter keeps the memory-only behavior for tests.
-	if kvs.snapshotter != nil {
+	// Persist the received snapshot so a follower restart recovers this state —
+	// unless the Raft layer already wrote the payload before it persisted the
+	// snapshot boundary (SnapshotPersisted, KNOWN_ISSUES.md R3). Writing it
+	// again here would be a redundant disk write of the same generation. A nil
+	// snapshotter keeps the memory-only behavior for tests.
+	if !msg.SnapshotPersisted && kvs.snapshotter != nil {
 		if err := kvs.saveSnapshot(msg.SnapshotIndex, msg.SnapshotTerm); err != nil {
 			kvs.logger.Printf("Failed to persist installed snapshot: %v", err)
 		}

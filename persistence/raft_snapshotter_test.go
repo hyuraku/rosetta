@@ -30,17 +30,24 @@ func TestRaftSnapshotterReadReturnsV2Bytes(t *testing.T) {
 	}
 
 	raftSnap := NewRaftSnapshotter(storage)
-	data, err := raftSnap.ReadSnapshot()
+	snapshot, err := raftSnap.ReadSnapshot()
 	if err != nil {
 		t.Fatalf("ReadSnapshot: %v", err)
 	}
-	if data == nil {
+	if snapshot == nil {
 		t.Fatalf("ReadSnapshot returned nil after a snapshot was saved")
+	}
+
+	// The envelope must carry the boundary the payload was taken at, so the
+	// leader can put both on the wire as one generation (R4).
+	if snapshot.LastIncludedIndex != 9 || snapshot.LastIncludedTerm != 3 {
+		t.Fatalf("envelope boundary = (%d, %d), want (9, 3)",
+			snapshot.LastIncludedIndex, snapshot.LastIncludedTerm)
 	}
 
 	// The bytes must round-trip back into a V2 SnapshotData with sessions intact.
 	var parsed kvstore.SnapshotData
-	if err := json.Unmarshal(data, &parsed); err != nil {
+	if err := json.Unmarshal(snapshot.Data, &parsed); err != nil {
 		t.Fatalf("ReadSnapshot bytes are not valid V2 JSON: %v", err)
 	}
 	if parsed.KVData["k"] != "v" {
@@ -62,11 +69,11 @@ func TestRaftSnapshotterReadNoSnapshot(t *testing.T) {
 	}
 
 	raftSnap := NewRaftSnapshotter(storage)
-	data, err := raftSnap.ReadSnapshot()
+	snapshot, err := raftSnap.ReadSnapshot()
 	if err != nil {
 		t.Fatalf("ReadSnapshot: %v", err)
 	}
-	if data != nil {
-		t.Fatalf("expected nil bytes when no snapshot exists, got %d bytes", len(data))
+	if snapshot != nil {
+		t.Fatalf("expected a nil envelope when no snapshot exists, got %+v", snapshot)
 	}
 }

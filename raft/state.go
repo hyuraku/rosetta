@@ -121,6 +121,15 @@ type ApplyMsg struct {
 	SnapshotIndex int
 	SnapshotTerm  int
 	SnapshotData  []byte
+
+	// SnapshotPersisted reports that SnapshotData has already been written to
+	// stable storage by the Raft layer, before the snapshot boundary was
+	// persisted (see the ordering invariant on RaftState.InstallSnapshot). The
+	// state machine must then only update its in-memory state and must not save
+	// the payload a second time. It is false when no Snapshotter is wired (a
+	// memory-only configuration), in which case persisting the payload is still
+	// the state machine's job.
+	SnapshotPersisted bool
 }
 
 func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftState {
