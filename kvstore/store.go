@@ -628,7 +628,29 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value, clientI
 		return Result{Value: "", Err: err}
 	}
 
+	// Register the pendingOps entry BEFORE calling Start, not after. Start's
+	// entry can commit and reach applyLoop as soon as it returns -- a
+	// single-node cluster commits on the very next heartbeat tick, with no
+	// dependency on this goroutine doing anything else first -- and applyLoop
+	// silently drops the result when it finds no pendingOps entry for opID
+	// (KNOWN_ISSUES.md R9, fixed here). Registering first guarantees the
+	// channel exists before any apply that could reference this opID is even
+	// possible, so a commit can never race ahead of the registration meant to
+	// receive it. If Start reports we are not the leader, or the append could
+	// not be made durable, the registration is removed immediately below so it
+	// cannot leak: nothing will ever be applied for an opID that was never
+	// durably appended.
+	resultCh := make(chan Result, 1)
+	kvs.opMu.Lock()
+	kvs.pendingOps[opID] = resultCh
+	kvs.opMu.Unlock()
+
 	_, _, isLeader, err := kvs.raft.Start(string(cmdBytes))
+	if !isLeader || err != nil {
+		kvs.opMu.Lock()
+		delete(kvs.pendingOps, opID)
+		kvs.opMu.Unlock()
+	}
 	if !isLeader {
 		return Result{Value: "", Err: fmt.Errorf("not leader")}
 	}
@@ -640,11 +662,6 @@ func (kvs *KVStore) executeOperationWithResult(op Operation, key, value, clientI
 	if err != nil {
 		return Result{Value: "", Err: fmt.Errorf("failed to append command to raft log: %w", err)}
 	}
-
-	resultCh := make(chan Result, 1)
-	kvs.opMu.Lock()
-	kvs.pendingOps[opID] = resultCh
-	kvs.opMu.Unlock()
 
 	return kvs.awaitOperationResult(resultCh, opID)
 }

@@ -26,6 +26,11 @@ import (
 const (
 	// kvPath is the base path (without trailing slash) for key-value endpoints.
 	kvPath = "/kv"
+	// kvBatchPath is the batch endpoint clients historically sent to even though
+	// no route was ever registered for it (KNOWN_ISSUES.md R11); it must be
+	// rejected explicitly rather than falling through to the "/kv/" prefix
+	// handler and being silently misread as a plain PUT.
+	kvBatchPath = "/kv/batch"
 	// minPeerParts is the minimum number of colon-separated fields in a peer spec (id:addr).
 	minPeerParts = 2
 	// httpShutdownTimeout bounds how long a graceful shutdown waits for the
@@ -77,6 +82,16 @@ func (hs *HTTPServer) Shutdown(ctx context.Context) error {
 }
 
 func (hs *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
+	// Batch operations are not implemented (KNOWN_ISSUES.md R11). Without this
+	// check the request falls through to the "/kv/" prefix handler below and
+	// handlePut silently misreads BatchArgs{Operations} as PutArgs{Key:"",
+	// Value:""}, returning {"success":true} for a batch that never ran. Reject
+	// loudly instead, for any method.
+	if r.URL.Path == kvBatchPath {
+		writeJSONError(w, http.StatusNotImplemented, "batch operations are not implemented")
+		return
+	}
+
 	switch r.Method {
 	case "PUT", "POST":
 		hs.handlePut(w, r)
@@ -89,10 +104,32 @@ func (hs *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// writeJSONError writes a JSON error body of the shape {"success":false,
+// "error":"<msg>"}, for endpoints (like the batch rejection above) that need a
+// structured body rather than the plain-text bodies http.Error produces
+// elsewhere in this file (documented in docs/api.md's Response Formats
+// section).
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
 func (hs *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 	var req kvstore.PutArgs
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// An empty key is the direct symptom of the R11 batch misrouting (a
+	// BatchArgs body decodes to PutArgs{Key:"",Value:""}), but it is rejected
+	// unconditionally here: an empty key was never a meaningful PUT on its own.
+	if req.Key == "" {
+		http.Error(w, "Key required", http.StatusBadRequest)
 		return
 	}
 
@@ -194,6 +231,23 @@ func (hs *HTTPServer) handleLeader(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"leader": leader,
 	})
+}
+
+// validateJoinFlag rejects a non-empty -join value. Dynamic membership is not
+// implemented (KNOWN_ISSUES.md R12/R14): ClusterManager's node bookkeeping
+// (network/discovery.go) is HTTP-level only and is never reflected in the Raft
+// quorum, so honoring -join would let an operator believe a node had safely
+// joined the cluster when it had not. The flag is kept -- reserved, not
+// removed -- so that a caller who still passes it gets this explicit rejection
+// instead of "flag provided but not defined", and can retire the flag from
+// their tooling deliberately. Until real membership changes exist, every node
+// must be started with the same fixed -peers list.
+func validateJoinFlag(join string) error {
+	if join == "" {
+		return nil
+	}
+	return fmt.Errorf("dynamic membership is not implemented (KNOWN_ISSUES.md R12/R14); " +
+		"run every node with the same fixed -peers list instead of -join")
 }
 
 func parsePeers(peers string) map[string]string {
@@ -306,9 +360,14 @@ func main() {
 		listenAddr = flag.String("listen", "localhost:8080", "Listen address for Raft")
 		httpAddr   = flag.String("http", "localhost:9080", "HTTP server address")
 		peers      = flag.String("peers", "", "Comma-separated list of peer addresses (format: id:addr,id:addr)")
-		join       = flag.String("join", "", "Join existing cluster by connecting to this address")
+		join       = flag.String("join", "", "Reserved: dynamic membership is not implemented "+
+			"(KNOWN_ISSUES.md R12/R14); a non-empty value refuses to start")
 	)
 	flag.Parse()
+
+	if err := validateJoinFlag(*join); err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	cfg := resolveConfig(*configFile, *nodeID, *listenAddr, *httpAddr, *peers)
 
@@ -352,15 +411,13 @@ func main() {
 		log.Fatalf("Failed to start transport: %v", err)
 	}
 
+	// validateJoinFlag above already refuses to start when -join is set, so
+	// there is no HTTP join attempt here (KNOWN_ISSUES.md R12): ClusterManager
+	// is used only for the fixed -peers bookkeeping and for LeaveCluster on
+	// shutdown, not for joining a running cluster.
 	clusterManager := network.NewClusterManager(cfg.NodeID, cfg.ListenAddr)
 	for id, addr := range cfg.Peers {
 		clusterManager.AddNode(id, addr)
-	}
-
-	if *join != "" {
-		if err := clusterManager.JoinCluster(*join); err != nil {
-			log.Printf("Failed to join cluster: %v", err)
-		}
 	}
 
 	httpServer := NewHTTPServer(kvs, raftNode, cfg)

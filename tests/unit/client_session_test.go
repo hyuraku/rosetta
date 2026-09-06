@@ -2,6 +2,7 @@ package unit
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,13 @@ import (
 // out strictly unique, contiguous sequence numbers even when Put is called
 // concurrently, and that all requests carry the same ClientID. This is the
 // invariant that makes server-side duplicate detection reliable.
+//
+// It also verifies the seq numbers arrive at the server in the exact order they
+// were allocated (KNOWN_ISSUES.md R10): Put serializes seqNum allocation with
+// the request that carries it, so two concurrent Put calls can never have their
+// requests race each other and arrive out of allocation order -- which would
+// make the server's checkDuplicateRequest reject the later-numbered request
+// that arrives first as stale.
 func TestClientSeqNumMonotonicUnderConcurrency(t *testing.T) {
 	const numRequests = 50
 
@@ -60,7 +68,7 @@ func TestClientSeqNumMonotonicUnderConcurrency(t *testing.T) {
 	}
 
 	seen := make(map[int]bool, numRequests)
-	for _, s := range seqs {
+	for i, s := range seqs {
 		if s < 1 || s > numRequests {
 			t.Errorf("sequence number %d out of expected range [1,%d]", s, numRequests)
 		}
@@ -68,6 +76,12 @@ func TestClientSeqNumMonotonicUnderConcurrency(t *testing.T) {
 			t.Errorf("duplicate sequence number %d handed out", s)
 		}
 		seen[s] = true
+
+		// Arrival order must equal allocation order: the i-th request the
+		// server saw must carry seqNum i+1.
+		if s != i+1 {
+			t.Errorf("request arrived out of allocation order: position %d carried seqNum %d, want %d", i, s, i+1)
+		}
 	}
 
 	if len(clientIDs) != 1 {
@@ -129,5 +143,32 @@ func TestClientRetryReusesSeqNum(t *testing.T) {
 	}
 	if firstSeqs[0] != secondSeqs[0] {
 		t.Errorf("retry must reuse the same SeqNum: first=%d second=%d", firstSeqs[0], secondSeqs[0])
+	}
+}
+
+// TestClientAllServersFailReturnsErrResultUnknown verifies that when every
+// configured server is unreachable, Put reports the uncertainty explicitly via
+// ErrResultUnknown (KNOWN_ISSUES.md R10) instead of a plain, unwrapped error the
+// caller cannot distinguish from a definite failure.
+func TestClientAllServersFailReturnsErrResultUnknown(t *testing.T) {
+	// Start two servers, then close them immediately: their addresses are
+	// well-formed but nothing is listening, so every request fails with a
+	// connection error, exactly like an all-servers-unreachable outage.
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	firstHost := strings.TrimPrefix(first.URL, "http://")
+	secondHost := strings.TrimPrefix(second.URL, "http://")
+	first.Close()
+	second.Close()
+
+	client := kvstore.NewClient([]string{firstHost, secondHost})
+	defer client.Close()
+
+	err := client.Put("k", "v")
+	if err == nil {
+		t.Fatal("expected an error when every server is unreachable")
+	}
+	if !errors.Is(err, kvstore.ErrResultUnknown) {
+		t.Fatalf("expected error to wrap kvstore.ErrResultUnknown, got %v", err)
 	}
 }

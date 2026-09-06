@@ -124,6 +124,26 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("max_raft_state must be positive")
 	}
 
+	// The following checks guard the fixed-peers cluster model that R12 falls
+	// back on until dynamic membership (R14) exists: with -join rejected,
+	// every node must be started with a consistent, correct -peers list, and a
+	// malformed one would otherwise silently produce a wrong-sized quorum or a
+	// node that can never reach a peer.
+	if _, selfInPeers := c.Peers[c.NodeID]; selfInPeers {
+		return fmt.Errorf("peers must not include this node's own node_id (%s)", c.NodeID)
+	}
+
+	seenAddrs := make(map[string]string, len(c.Peers))
+	for id, addr := range c.Peers {
+		if addr == c.ListenAddr {
+			return fmt.Errorf("peer %s has the same address as listen_addr (%s)", id, addr)
+		}
+		if otherID, exists := seenAddrs[addr]; exists {
+			return fmt.Errorf("peers %s and %s both have address %s", otherID, id, addr)
+		}
+		seenAddrs[addr] = id
+	}
+
 	return nil
 }
 
