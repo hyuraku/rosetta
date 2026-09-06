@@ -322,6 +322,14 @@ func (rs *RaftState) IsVoter() bool {
 	return rs.isVoterLocked()
 }
 
+// configAtIndex is configAtIndexLocked for callers that hold no lock (the
+// snapshot send path). It returns a value safe to hand to the transport.
+func (rs *RaftState) configAtIndex(idx int) *ClusterConfig {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.configAtIndexLocked(idx).Clone()
+}
+
 // GetClusterConfig returns a copy of the configuration currently in effect.
 func (rs *RaftState) GetClusterConfig() *ClusterConfig {
 	rs.mu.RLock()

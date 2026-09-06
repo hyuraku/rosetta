@@ -377,6 +377,11 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 		}
 	}
 
+	// Seed the cluster configuration from the peer list when the state file
+	// carried none — either because this is a fresh node or because the file
+	// predates dynamic membership. A file that does carry one wins: it is the
+	// configuration this node last agreed to, and the -peers flag may well be
+	// stale by then (KNOWN_ISSUES.md R14).
 	if rs.persistent.SnapshotConfig == nil {
 		rs.persistent.SnapshotConfig = NewClusterConfig(peers)
 	}

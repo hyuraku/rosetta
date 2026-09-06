@@ -61,6 +61,19 @@ type InstallSnapshotArgs struct {
 	Data []byte `json:"data"`
 	// Done marks the final chunk of this snapshot.
 	Done bool `json:"done,omitempty"`
+	// Config is the cluster configuration in effect at LastIncludedIndex.
+	//
+	// A snapshot subsumes the log entries below its boundary, configuration
+	// entries included, so a follower that installs one would otherwise lose
+	// every trace of the configuration it is meant to be part of — and, having
+	// discarded that prefix, could never be told again (paper §6/§7: a snapshot
+	// carries the latest configuration). It is sent on every chunk and read from
+	// the final one; all chunks of a transfer describe the same envelope, so
+	// which one is read does not matter.
+	//
+	// Nil from a sender that predates dynamic membership, in which case the
+	// receiver keeps the configuration it already has.
+	Config *ClusterConfig `json:"config,omitempty"`
 }
 
 // InstallSnapshotReply answers one chunk.
@@ -801,7 +814,14 @@ func (rs *RaftState) sendSnapshotToPeer(
 			snapshot.LastIncludedIndex, peerID, nextIndex)
 		return
 	}
-	if !rs.streamSnapshotToPeer(transport, peerID, currentTerm, snapshot) {
+	// The configuration to ship is the one in effect at the envelope's boundary,
+	// not the leader's current one: the follower will replay every entry above
+	// that boundary, configuration entries included, and would otherwise be
+	// seeded with a configuration newer than the log position it is being placed
+	// at (KNOWN_ISSUES.md R14). configAtIndex answers for exactly the index the
+	// envelope names, so the pairing stays one generation the way R4 requires.
+	boundaryConfig := rs.configAtIndex(snapshot.LastIncludedIndex)
+	if !rs.streamSnapshotToPeer(transport, peerID, currentTerm, snapshot, boundaryConfig) {
 		return
 	}
 
@@ -855,6 +875,7 @@ func (rs *RaftState) streamSnapshotToPeer(
 	peerID string,
 	currentTerm int,
 	snapshot *SnapshotData,
+	config *ClusterConfig,
 ) bool {
 	chunkSize := rs.getSnapshotChunkSize()
 
@@ -874,7 +895,7 @@ func (rs *RaftState) streamSnapshotToPeer(
 			return false
 		}
 
-		reply, err := rs.sendSnapshotChunk(transport, peerID, currentTerm, snapshot, offset, end, done)
+		reply, err := rs.sendSnapshotChunk(transport, peerID, currentTerm, snapshot, config, offset, end, done)
 		if err != nil {
 			rs.logger.Printf("sendSnapshotToPeer: chunk at offset %d of the snapshot at index %d "+
 				"failed for %s, abandoning this round: %v",
@@ -911,6 +932,7 @@ func (rs *RaftState) sendSnapshotChunk(
 	peerID string,
 	currentTerm int,
 	snapshot *SnapshotData,
+	config *ClusterConfig,
 	offset, end int,
 	done bool,
 ) (*InstallSnapshotReply, error) {
@@ -922,6 +944,7 @@ func (rs *RaftState) sendSnapshotChunk(
 		Offset:            offset,
 		Data:              snapshot.Data[offset:end],
 		Done:              done,
+		Config:            config,
 	}
 
 	// The timeout bounds one chunk, which is the point of chunking: a slow link
@@ -1143,55 +1166,8 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		snapshotPersisted = true
 	}
 
-	// Step 2: advance the Raft boundary and make it durable. Everything the
-	// persist covers is saved first so a failed write can be undone exactly:
-	// logAfterSnapshot only re-slices (or drops) the log, so restoring the slice
-	// header restores the entries, and rs.mu is held throughout.
-	prevLog := rs.persistent.Log
-	prevLastIncludedIndex := rs.persistent.LastIncludedIndex
-	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
-	prevCommitIndex := rs.volatile.CommitIndex
-	prevLastApplied := rs.volatile.LastApplied
-	prevConfig := rs.persistent.Config
-
-	// Replace the log per the paper's §7 retention rule: entries the snapshot
-	// covers always go, and the suffix above the boundary survives only when
-	// our entry at LastIncludedIndex agrees with the snapshot's term. Must run
-	// before LastIncludedIndex is advanced below — the rule is evaluated
-	// against the log we still hold.
-	rs.persistent.Log = rs.logAfterSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
-
-	// Update snapshot metadata
-	rs.persistent.LastIncludedIndex = args.LastIncludedIndex
-	rs.persistent.LastIncludedTerm = args.LastIncludedTerm
-
-	// Re-derive the configuration from whatever the §7 retention rule left of the
-	// log; with the log emptied, SnapshotConfig is what remains. Carrying the
-	// sender's boundary configuration in the RPC itself comes later.
-	rs.recomputeConfigLocked()
-
-	// Update commit index and last applied
-	if rs.volatile.CommitIndex < args.LastIncludedIndex {
-		rs.volatile.CommitIndex = args.LastIncludedIndex
-	}
-	if rs.volatile.LastApplied < args.LastIncludedIndex {
-		rs.volatile.LastApplied = args.LastIncludedIndex
-	}
-
-	if err := rs.persist(); err != nil {
-		// Roll the whole install back so memory and disk still agree when this
-		// handler returns, the same discipline AppendEntries follows for a
-		// failed merge (KNOWN_ISSUES.md R2). The payload we already wrote stays
-		// on disk; that only leaves snapshot.json ahead of raft_state.json,
-		// which the startup check and the state machine's monotonicity guard
-		// absorb. The leader retries and the install completes then.
-		rs.persistent.Log = prevLog
-		rs.persistent.LastIncludedIndex = prevLastIncludedIndex
-		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
-		rs.volatile.CommitIndex = prevCommitIndex
-		rs.volatile.LastApplied = prevLastApplied
-		rs.persistent.Config = prevConfig
-		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed, rolled back: %v", err)
+	// Step 2: advance the Raft boundary and make it durable.
+	if !rs.adoptSnapshotBoundaryLocked(args) {
 		return
 	}
 
@@ -1215,6 +1191,72 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		SnapshotPersisted: snapshotPersisted,
 	}
 	rs.notifyApplierLocked()
+}
+
+// adoptSnapshotBoundaryLocked is step 2 of InstallSnapshot's durability
+// ordering: it moves the log, the snapshot boundary, the cluster configuration
+// and the volatile indices to the snapshot's generation and makes them durable,
+// reporting whether the write succeeded. Callers must hold rs.mu and must
+// already have made the payload durable (step 1).
+//
+// Everything the persist covers is saved first so a failed write can be undone
+// exactly: logAfterSnapshot only re-slices (or drops) the log, so restoring the
+// slice header restores the entries, and rs.mu is held throughout.
+func (rs *RaftState) adoptSnapshotBoundaryLocked(args *InstallSnapshotArgs) bool {
+	prevLog := rs.persistent.Log
+	prevLastIncludedIndex := rs.persistent.LastIncludedIndex
+	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
+	prevCommitIndex := rs.volatile.CommitIndex
+	prevLastApplied := rs.volatile.LastApplied
+	prevConfig := rs.persistent.Config
+	prevSnapshotConfig := rs.persistent.SnapshotConfig
+
+	// Replace the log per the paper's §7 retention rule: entries the snapshot
+	// covers always go, and the suffix above the boundary survives only when
+	// our entry at LastIncludedIndex agrees with the snapshot's term. Must run
+	// before LastIncludedIndex is advanced below — the rule is evaluated
+	// against the log we still hold.
+	rs.persistent.Log = rs.logAfterSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
+
+	// Update snapshot metadata
+	rs.persistent.LastIncludedIndex = args.LastIncludedIndex
+	rs.persistent.LastIncludedTerm = args.LastIncludedTerm
+
+	// Adopt the configuration the boundary was taken under, then re-derive the
+	// one in effect: any configuration entry that survived the §7 retention rule
+	// above still wins, and if none did, the snapshot's is what is left
+	// (KNOWN_ISSUES.md R14). A sender that did not send one leaves both alone.
+	if args.Config != nil {
+		rs.persistent.SnapshotConfig = args.Config.Clone()
+	}
+	rs.recomputeConfigLocked()
+
+	// Update commit index and last applied
+	if rs.volatile.CommitIndex < args.LastIncludedIndex {
+		rs.volatile.CommitIndex = args.LastIncludedIndex
+	}
+	if rs.volatile.LastApplied < args.LastIncludedIndex {
+		rs.volatile.LastApplied = args.LastIncludedIndex
+	}
+
+	if err := rs.persist(); err != nil {
+		// Roll the whole install back so memory and disk still agree when the
+		// handler returns, the same discipline AppendEntries follows for a
+		// failed merge (KNOWN_ISSUES.md R2). The payload already written stays
+		// on disk; that only leaves snapshot.json ahead of raft_state.json,
+		// which the startup check and the state machine's monotonicity guard
+		// absorb. The leader retries and the install completes then.
+		rs.persistent.Log = prevLog
+		rs.persistent.LastIncludedIndex = prevLastIncludedIndex
+		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
+		rs.volatile.CommitIndex = prevCommitIndex
+		rs.volatile.LastApplied = prevLastApplied
+		rs.persistent.Config = prevConfig
+		rs.persistent.SnapshotConfig = prevSnapshotConfig
+		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed, rolled back: %v", err)
+		return false
+	}
+	return true
 }
 
 // acceptSnapshotChunkLocked implements Figure 13's receiver rules 2-4 against
