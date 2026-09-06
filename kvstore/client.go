@@ -21,6 +21,19 @@ const (
 	defaultHTTPTimeout = 5 * time.Second
 )
 
+// Client is an HTTP client for a Rosetta cluster with leader-following retry
+// and at-most-once write semantics keyed on (ClientID, SeqNum) (Raft paper
+// Section 8).
+//
+// Writes are serialized per Client: Put and Delete hold mu from seqNum
+// allocation through the end of sendRequest, so only one write from a given
+// Client is ever in flight at a time. This is deliberate (KNOWN_ISSUES.md R10):
+// without it, concurrent callers could allocate seqNums out of the order their
+// requests actually arrive in, and the server's checkDuplicateRequest rejects a
+// later-numbered request that arrives before an earlier-numbered one as a stale
+// request. If you want concurrent writes, use a separate Client per concurrent
+// writer -- ClientID scopes deduplication, so distinct Clients don't interfere
+// with each other. Get carries no SeqNum and is not serialized.
 type Client struct {
 	servers []string
 	leader  int
@@ -29,8 +42,16 @@ type Client struct {
 	// Duplicate detection (Raft paper Section 8)
 	clientID string     // Unique client identifier
 	seqNum   int        // Monotonically increasing sequence number
-	mu       sync.Mutex // Protects seqNum
+	mu       sync.Mutex // Serializes Put/Delete: seqNum allocation through sendRequest
 }
+
+// ErrResultUnknown is returned, wrapped, when sendRequest exhausts every
+// configured server without a definitive success or leader-redirect response
+// (KNOWN_ISSUES.md R10) -- for example every server timed out or refused the
+// connection. In this case the caller cannot tell whether the operation was
+// applied by the cluster before the failure: see the Put and Delete doc
+// comments for what that means for retrying.
+var ErrResultUnknown = errors.New("result unknown: operation may or may not have been applied")
 
 type PutArgs struct {
 	Key      string `json:"key"`
@@ -77,8 +98,25 @@ func NewClient(servers []string) *Client {
 	}
 }
 
+// Put stores a key-value pair, retrying against other servers on a leader
+// redirect or a network failure. It serializes with any other Put/Delete call
+// on the same Client (see the Client doc comment): seqNum allocation and the
+// request that carries it happen under the same lock.
+//
+// If every server fails without a definitive response, Put returns an error
+// wrapping ErrResultUnknown: the operation may or may not have been applied.
+// Calling Put again on the same Client afterward allocates a new seqNum, so the
+// server's duplicate detection will not recognize it as a retry of the
+// uncertain operation -- it can end up applied twice. This is safe to do only
+// if the caller has some other way to tell the two apart (e.g. the value is
+// idempotent). sendRequest's own internal retries -- the same request sent to a
+// different server after a 503 or a network error -- are not affected: they
+// reuse the same seqNum, so the server's at-most-once guarantee still holds for
+// those.
 func (c *Client) Put(key, value string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.seqNum++
 	args := PutArgs{
 		Key:      key,
@@ -86,7 +124,6 @@ func (c *Client) Put(key, value string) error {
 		ClientID: c.clientID,
 		SeqNum:   c.seqNum,
 	}
-	c.mu.Unlock()
 
 	return c.sendRequest("PUT", "/kv", args, nil)
 }
@@ -104,15 +141,18 @@ func (c *Client) Get(key string) (string, error) {
 	return reply.Value, nil
 }
 
+// Delete removes a key, with the same serialization, retry, and
+// ErrResultUnknown contract as Put -- see its doc comment.
 func (c *Client) Delete(key string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.seqNum++
 	args := DeleteArgs{
 		Key:      key,
 		ClientID: c.clientID,
 		SeqNum:   c.seqNum,
 	}
-	c.mu.Unlock()
 
 	return c.sendRequest("DELETE", "/kv/"+key, args, nil)
 }
@@ -176,7 +216,7 @@ func (c *Client) sendRequest(method, path string, args, reply interface{}) error
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	return errors.New("no available servers")
+	return fmt.Errorf("%w: no server accepted the request after %d attempt(s)", ErrResultUnknown, len(c.servers))
 }
 
 func (c *Client) SetServers(servers []string) {
