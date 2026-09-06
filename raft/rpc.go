@@ -133,38 +133,9 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	reply.Term = rs.persistent.CurrentTerm
 
 	// Fast rollback optimization: handle log consistency check against the
-	// (possibly compacted) log. All indices here are absolute.
-	lastIdx := rs.lastAbsLogIndex()
-	lii := rs.persistent.LastIncludedIndex
-	switch {
-	case args.PrevLogIndex > lastIdx:
-		// Log is too short - return the absolute end so the leader can jump back.
-		reply.ConflictTerm = -1
-		reply.ConflictIndex = lastIdx + 1
+	// (possibly compacted) log. See checkLogConsistency for the cases.
+	if !rs.checkLogConsistency(args, reply) {
 		return
-	case args.PrevLogIndex == lii:
-		// PrevLogIndex sits exactly on our snapshot boundary (or the origin when
-		// lii == 0). Its term is LastIncludedTerm by construction, so a mismatch
-		// would mean the leader's committed prefix disagrees with our snapshot,
-		// which Raft safety forbids. Nothing to verify; fall through to merge.
-	case args.PrevLogIndex < lii:
-		// PrevLogIndex refers to an entry our snapshot already subsumes. We can
-		// no longer read that entry's term, but every index up to
-		// LastIncludedIndex is committed and identical on all nodes, so the
-		// prefix trivially matches. Accept and let mergeLogEntries skip the
-		// entries that predate the boundary.
-	default: // lii < PrevLogIndex <= lastIdx
-		if rs.logTermAt(args.PrevLogIndex) != args.PrevLogTerm {
-			// Term mismatch - find first index of the conflicting term, never
-			// walking below the snapshot boundary (compacted terms are unknown).
-			reply.ConflictTerm = rs.logTermAt(args.PrevLogIndex)
-			conflictIndex := args.PrevLogIndex
-			for conflictIndex > lii+1 && rs.logTermAt(conflictIndex-1) == reply.ConflictTerm {
-				conflictIndex--
-			}
-			reply.ConflictIndex = conflictIndex
-			return
-		}
 	}
 
 	// Only persist/acknowledge if the merge actually changed the log; a delayed
@@ -205,6 +176,87 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 
 	reply.Success = true
 	reply.Term = rs.persistent.CurrentTerm
+}
+
+// checkLogConsistency implements the AppendEntries log consistency check
+// (§5.3, receiver rule 2) against the (possibly compacted) log. All indices
+// here are absolute. On a mismatch it fills in reply.ConflictTerm/ConflictIndex
+// and returns false; a caller must treat false as "return without merging or
+// advancing commit index". Callers must hold rs.mu.
+func (rs *RaftState) checkLogConsistency(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	lastIdx := rs.lastAbsLogIndex()
+	lii := rs.persistent.LastIncludedIndex
+	switch {
+	case args.PrevLogIndex > lastIdx:
+		// Log is too short - return the absolute end so the leader can jump back.
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = lastIdx + 1
+		return false
+	case args.PrevLogIndex == lii:
+		// PrevLogIndex sits exactly on our snapshot boundary (or the origin when
+		// lii == 0). Its term is fixed at LastIncludedTerm by construction: every
+		// node agrees on the term of a committed index, and everything up to and
+		// including LastIncludedIndex is committed. A mismatch here is therefore
+		// not an ordinary log divergence the fast-rollback optimization can walk
+		// back through — it means the leader's committed prefix disagrees with
+		// the one this node's snapshot was built from, a violation of Raft's
+		// safety properties (State Machine Safety / Leader Completeness)
+		// somewhere upstream of this handler. There is no repair available on
+		// this receive path: forcing an InstallSnapshot would not help either,
+		// since the R5 monotonicity guard (`args.LastIncludedIndex <=
+		// LastIncludedIndex`, InstallSnapshot below) would refuse a snapshot at
+		// an index we have already compacted to, so the leader could never push
+		// one through. This rejects and keeps rejecting on every retry — a
+		// follower stuck at this boundary is the safe failure mode; silently
+		// accepting a history that disagrees with our own committed prefix is
+		// not.
+		if args.PrevLogTerm != rs.persistent.LastIncludedTerm {
+			rs.logger.Printf("AppendEntries: leader's PrevLogTerm %d at our snapshot "+
+				"boundary %d disagrees with our LastIncludedTerm %d; refusing "+
+				"(committed-prefix mismatch, not routine log divergence, KNOWN_ISSUES.md R13-1)",
+				args.PrevLogTerm, lii, rs.persistent.LastIncludedTerm)
+			reply.ConflictTerm = -1
+			reply.ConflictIndex = lii + 1
+			return false
+		}
+		// Term matches; fall through to merge.
+		return true
+	case args.PrevLogIndex < lii:
+		// PrevLogIndex refers to an entry our snapshot already subsumes. We can
+		// no longer read that entry's term, but every index up to
+		// LastIncludedIndex is committed and identical on all nodes, so the
+		// prefix trivially matches — except when the leader's own Entries slice
+		// happens to carry the boundary entry itself (absolute index == lii):
+		// that term is directly comparable, and it must agree with
+		// LastIncludedTerm for the same committed-prefix reason as the case
+		// above.
+		if boundaryOffset := lii - args.PrevLogIndex - 1; boundaryOffset >= 0 && boundaryOffset < len(args.Entries) {
+			if boundaryTerm := args.Entries[boundaryOffset].Term; boundaryTerm != rs.persistent.LastIncludedTerm {
+				rs.logger.Printf("AppendEntries: leader's entry at our snapshot "+
+					"boundary %d carries term %d, disagreeing with our LastIncludedTerm %d; "+
+					"refusing (committed-prefix mismatch, KNOWN_ISSUES.md R13-1)",
+					lii, boundaryTerm, rs.persistent.LastIncludedTerm)
+				reply.ConflictTerm = -1
+				reply.ConflictIndex = lii + 1
+				return false
+			}
+		}
+		// Accept; mergeLogEntries skips the entries that predate the boundary.
+		return true
+	default: // lii < PrevLogIndex <= lastIdx
+		if rs.logTermAt(args.PrevLogIndex) != args.PrevLogTerm {
+			// Term mismatch - find first index of the conflicting term, never
+			// walking below the snapshot boundary (compacted terms are unknown).
+			reply.ConflictTerm = rs.logTermAt(args.PrevLogIndex)
+			conflictIndex := args.PrevLogIndex
+			for conflictIndex > lii+1 && rs.logTermAt(conflictIndex-1) == reply.ConflictTerm {
+				conflictIndex--
+			}
+			reply.ConflictIndex = conflictIndex
+			return false
+		}
+		return true
+	}
 }
 
 // mergeLogEntries merges the leader's entries into the follower's log following
