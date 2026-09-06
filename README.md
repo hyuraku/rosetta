@@ -12,10 +12,10 @@ A distributed key-value store implementation using the Raft consensus algorithm,
 
 ## Features
 
-- **Raft Consensus**: Leader election with randomized timeouts, log replication with consistency checks, and heartbeats
+- **Raft Consensus**: Leader election with randomized timeouts, log replication with consistency checks, and heartbeats. A 2026-09-06 re-audit found that the leader's own append path checks leadership and durably appends in two separate critical sections, so a demotion in between can let a stale leader append a command (R1), and a retried AppendEntries can be ACKed after a failed persist (R2) — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (Group R)
 - **Distributed KV Store**: PUT/GET/DELETE over an HTTP API, with leader-only writes and follower redirects
-- **Persistence**: Crash recovery with atomic file writes; state is persisted before RPC replies
-- **Log Compaction / InstallSnapshot**: Absolute indexing (A1–A5), production snapshotter wiring (A6), follower snapshot persistence (A8), and the §7 receiver retention rule (A7) are all fixed — group A has no open safety issue. A liveness gap remains on the same receive path (B3) — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+- **Persistence**: Crash recovery with atomic file writes *per file*; state is persisted before RPC replies. There is no cross-file atomicity between the Raft state file and the KV snapshot file — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R3)
+- **Log Compaction / InstallSnapshot**: Absolute indexing (A1–A5), production snapshotter wiring (A6), follower snapshot persistence (A8), and the §7 receiver retention rule (A7) are all fixed — group A has no open safety issue. A liveness gap remains on the same receive path (B3), and the 2026-09-06 re-audit found further open safety gaps in this area: no cross-file snapshot/state generation atomicity (R3), snapshot metadata and payload can be read from different generations (R4), and there is no guard against an older snapshot rolling back committed KV state (R5) — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
 - **Read Optimization**: Linearizable reads via the ReadIndex protocol (leader no-op on election + heartbeat-quorum confirmation), replacing the earlier lease-based reads — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (D1–D3, fixed)
 - **Testing Suite**: Unit and integration tests using a deterministic in-memory mock transport
 
@@ -120,7 +120,9 @@ Implemented in [`raft/state.go`](raft/state.go). Randomized election timeouts pr
 
 - **network/**: Network communication layer
   - HTTP-based RPC transport
-  - Cluster membership and discovery
+  - `ClusterManager` tracks node join/leave over HTTP, but this bookkeeping is not
+    wired into the Raft quorum — the cluster is effectively fixed-peer. See
+    [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R12, R14)
 
 - **config/**: Configuration management
 
@@ -170,7 +172,12 @@ Command line options:
 - `-http`: HTTP API listen address
 - `-peers`: Comma-separated list of peer nodes (format: `id:addr,id:addr`)
 - `-config`: Configuration file path
-- `-join`: Join an existing cluster by connecting to this address
+- `-join`: Attempt to notify an existing cluster member over HTTP that this node
+  exists. This is **not a real membership-join mechanism**: on failure it only
+  logs and continues starting (fail-open), and even on success the peer list it
+  exchanges is not reflected in the Raft quorum. Run clusters with a fixed,
+  matching `-peers` list on every node instead. See
+  [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R12)
 
 Cluster sizing: Raft needs a majority to commit, so run an odd number of nodes —
 3 nodes tolerate 1 failure, 5 tolerate 2. Adding nodes does not make writes faster.
