@@ -59,7 +59,7 @@ func (r *reorderTransport) SendInstallSnapshot(
 
 // newLeaderWithLog builds a leader at the given term whose log holds entryCount
 // current-term entries and which believes peerID needs everything from index 1.
-func newLeaderWithLog(t *testing.T, peerID string, term, entryCount int) (*RaftState, func()) {
+func newLeaderWithLog(t *testing.T, peerID string, term, entryCount int) (rs *RaftState, stop func()) {
 	t.Helper()
 
 	// The drainer stops on its own channel and never closes applyCh: a
@@ -78,7 +78,7 @@ func newLeaderWithLog(t *testing.T, peerID string, term, entryCount int) (*RaftS
 		}
 	}()
 
-	rs := NewRaftState("n1", []string{"n1", peerID}, applyCh)
+	rs = NewRaftState("n1", []string{"n1", peerID}, applyCh)
 	rs.mu.Lock()
 	rs.persistent.CurrentTerm = term
 	rs.mu.Unlock()

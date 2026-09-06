@@ -92,7 +92,7 @@ func TestReplicatedEntriesAreCopiedBeforeSending(t *testing.T) {
 	// The mutating side. Appending and then truncating the same tail position over
 	// and over is what actually collides with a send in flight: the truncation
 	// only moves the slice header, so the next append rewrites a slot that a
-	// sender still has inside its own (longer) slice and is marshalling right now.
+	// sender still has inside its own (longer) slice and is marshaling right now.
 	go func() {
 		defer wg.Done()
 		for i := 0; i < writeRounds; i++ {

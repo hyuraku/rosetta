@@ -407,7 +407,7 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 // This is the one place a leader spawns replication work. Keeping the spawn and
 // the release together here is deliberate: when shutdown learns to wait for its
 // goroutines (KNOWN_ISSUES.md R19, roadmap step 6) this is the single site that
-// has to join a WaitGroup and honour the node's done signal.
+// has to join a WaitGroup and honor the node's done signal.
 func (rs *RaftState) replicatePeerOnce(
 	transport RPCTransport,
 	peerID string,
