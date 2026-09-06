@@ -189,21 +189,19 @@ type snapshotTransferFixture struct {
 	follower  *chunkReceiver
 	transport *relayTransport
 	payload   []byte
-	chunkSize int
 }
 
 const transferPeerID = "n2"
 
 // newSnapshotTransferFixture builds a leader in term 4 whose snapshot at index
-// 40 takes `chunks` RPCs to ship, and a follower ready to receive it.
-func newSnapshotTransferFixture(t *testing.T, chunkSize, chunks int) *snapshotTransferFixture {
+// 40 takes several RPCs to ship, and a follower ready to receive it.
+func newSnapshotTransferFixture(t *testing.T) *snapshotTransferFixture {
 	t.Helper()
 
-	payload := bigPayload(chunkSize, chunks)
-	return newSnapshotTransferFixtureWithPayload(t, chunkSize, payload)
+	return newSnapshotTransferFixtureWithPayload(t, bigPayload())
 }
 
-func newSnapshotTransferFixtureWithPayload(t *testing.T, chunkSize int, payload []byte) *snapshotTransferFixture {
+func newSnapshotTransferFixtureWithPayload(t *testing.T, payload []byte) *snapshotTransferFixture {
 	t.Helper()
 
 	// The follower is a separate RaftState; the leader reaches it through the
@@ -211,7 +209,7 @@ func newSnapshotTransferFixtureWithPayload(t *testing.T, chunkSize int, payload 
 	follower := newChunkReceiver(t, 1)
 
 	leader := newLeaderWithBoundary(t, transferPeerID, 4, 40, 4, 5)
-	leader.setSnapshotChunkSize(chunkSize)
+	leader.setSnapshotChunkSize(snapshotTestChunkSize)
 	leader.SetSnapshotter(&generationSnapshotter{
 		current: &SnapshotData{LastIncludedIndex: 40, LastIncludedTerm: 4, Data: payload},
 	})
@@ -221,7 +219,6 @@ func newSnapshotTransferFixtureWithPayload(t *testing.T, chunkSize int, payload 
 		follower:  follower,
 		transport: &relayTransport{follower: follower.rs},
 		payload:   payload,
-		chunkSize: chunkSize,
 	}
 }
 
@@ -245,15 +242,14 @@ func (f *snapshotTransferFixture) matchIndex(t *testing.T) int {
 // than the chunk size goes out as a contiguous series of RPCs, only the last of
 // which is marked done, and the follower ends up holding the leader's bytes.
 func TestSendSnapshotSplitsIntoChunks(t *testing.T) {
-	const chunkSize = 64
-	fixture := newSnapshotTransferFixture(t, chunkSize, 6)
+	fixture := newSnapshotTransferFixture(t)
 
 	fixture.replicate()
 
 	chunks := fixture.transport.chunks()
 	if len(chunks) < 5 {
 		t.Fatalf("snapshot went out in %d RPCs, want at least 5 for a %d byte payload at chunk size %d",
-			len(chunks), len(fixture.payload), chunkSize)
+			len(chunks), len(fixture.payload), snapshotTestChunkSize)
 	}
 
 	offset := 0
@@ -261,8 +257,9 @@ func TestSendSnapshotSplitsIntoChunks(t *testing.T) {
 		if chunk.Offset != offset {
 			t.Fatalf("chunk %d: Offset = %d, want %d (chunks must be contiguous)", i, chunk.Offset, offset)
 		}
-		if len(chunk.Data) > chunkSize {
-			t.Fatalf("chunk %d carries %d bytes, above the %d byte chunk size", i, len(chunk.Data), chunkSize)
+		if len(chunk.Data) > snapshotTestChunkSize {
+			t.Fatalf("chunk %d carries %d bytes, above the %d byte chunk size",
+				i, len(chunk.Data), snapshotTestChunkSize)
 		}
 		if chunk.LastIncludedIndex != 40 || chunk.LastIncludedTerm != 4 {
 			t.Fatalf("chunk %d describes (%d, %d), want every chunk to name the one envelope (40, 4)",
@@ -294,8 +291,7 @@ func TestSendSnapshotSplitsIntoChunks(t *testing.T) {
 // exactly as it was, the leader must not credit it with the snapshot, and the
 // next round must start over from offset 0 and complete.
 func TestSendSnapshotAbandonsRoundWhenAChunkFails(t *testing.T) {
-	const chunkSize = 64
-	fixture := newSnapshotTransferFixture(t, chunkSize, 6)
+	fixture := newSnapshotTransferFixture(t)
 
 	fixture.transport.setHook(func(n int, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
 		if n == 3 {
@@ -336,7 +332,7 @@ func TestSendSnapshotAbandonsRoundWhenAChunkFails(t *testing.T) {
 // zero-byte snapshot still describes a boundary the follower must install, so it
 // travels as a single empty chunk rather than as no RPC at all.
 func TestSendSnapshotSendsEmptyPayloadAsOneChunk(t *testing.T) {
-	fixture := newSnapshotTransferFixtureWithPayload(t, 64, nil)
+	fixture := newSnapshotTransferFixtureWithPayload(t, nil)
 
 	fixture.replicate()
 
@@ -360,8 +356,7 @@ func TestSendSnapshotSendsEmptyPayloadAsOneChunk(t *testing.T) {
 // node no longer holds, and the follower must not be credited with a snapshot it
 // never assembled.
 func TestSendSnapshotStepsDownMidTransfer(t *testing.T) {
-	const chunkSize = 64
-	fixture := newSnapshotTransferFixture(t, chunkSize, 6)
+	fixture := newSnapshotTransferFixture(t)
 
 	fixture.transport.setHook(func(n int, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
 		if n == 2 {
@@ -394,8 +389,7 @@ func TestSendSnapshotStepsDownMidTransfer(t *testing.T) {
 // Run under -race, this also covers the chunk loop reading state the shutdown
 // path writes.
 func TestSendSnapshotStopsWhenKilled(t *testing.T) {
-	const chunkSize = 64
-	fixture := newSnapshotTransferFixture(t, chunkSize, 6)
+	fixture := newSnapshotTransferFixture(t)
 
 	firstChunkSent := make(chan struct{})
 	release := make(chan struct{})

@@ -28,6 +28,17 @@ type durabilityLog struct {
 	writes []string
 }
 
+// The two kinds of durable write a receiver makes, in the order the ordering
+// invariant requires them.
+const (
+	writePayload  = "payload"
+	writeBoundary = "boundary"
+)
+
+// snapshotTestChunkSize is the chunk size these tests run at: small enough that
+// a modest payload spans several RPCs without building a 64 KiB one.
+const snapshotTestChunkSize = 64
+
 func (d *durabilityLog) record(what string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -53,7 +64,7 @@ func (r *recordingSnapshotter) CreateSnapshot(int, int) ([]byte, error) { return
 func (r *recordingSnapshotter) InstallSnapshot(data []byte, idx, term int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.log.record("payload")
+	r.log.record(writePayload)
 	r.current = &SnapshotData{
 		LastIncludedIndex: idx,
 		LastIncludedTerm:  term,
@@ -89,7 +100,7 @@ type recordingPersister struct {
 func (p *recordingPersister) SaveRaftState(state *PersistentState) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.log.record("boundary")
+	p.log.record(writeBoundary)
 	saved := *state
 	p.saved = &saved
 	return nil
@@ -185,7 +196,7 @@ func (c *chunkReceiver) assertUntouched(t *testing.T, when string) {
 	// here is that no *payload* was written and the boundary on disk has not
 	// moved — never that the node wrote nothing at all.
 	for _, write := range c.durability.order() {
-		if write == "payload" {
+		if write == writePayload {
 			t.Fatalf("%s: a snapshot payload was written before the transfer finished", when)
 		}
 	}
@@ -210,12 +221,11 @@ func chunkArgs(rpcTerm, index, snapTerm, offset int, data []byte, done bool) *In
 	}
 }
 
-// splitPayload cuts payload into chunks of at most size bytes, the way the
-// leader does.
-func splitPayload(payload []byte, size int) [][]byte {
-	chunks := make([][]byte, 0, len(payload)/size+1)
-	for offset := 0; ; offset += size {
-		end := min(offset+size, len(payload))
+// splitPayload cuts payload into chunks the way the leader does.
+func splitPayload(payload []byte) [][]byte {
+	chunks := make([][]byte, 0, len(payload)/snapshotTestChunkSize+1)
+	for offset := 0; ; offset += snapshotTestChunkSize {
+		end := min(offset+snapshotTestChunkSize, len(payload))
 		chunks = append(chunks, payload[offset:end])
 		if end == len(payload) {
 			return chunks
@@ -223,15 +233,47 @@ func splitPayload(payload []byte, size int) [][]byte {
 	}
 }
 
-// bigPayload builds a payload that splits into at least the requested number of
-// chunks at the given chunk size, with position-dependent bytes so a
-// mis-assembled buffer cannot pass byte comparison.
-func bigPayload(chunkSize, chunks int) []byte {
-	payload := make([]byte, 0, chunkSize*chunks)
-	for i := 0; len(payload) < chunkSize*chunks; i++ {
+// snapshotTestChunkCount is how many chunks the test payload spans — enough to
+// have a genuine middle, so a transfer can be interrupted somewhere that is
+// neither the first RPC nor the last.
+const snapshotTestChunkCount = 6
+
+// bigPayload builds a payload that spans several chunks, with
+// position-dependent bytes so a mis-assembled buffer cannot pass a byte
+// comparison.
+func bigPayload() []byte {
+	const size = snapshotTestChunkSize * snapshotTestChunkCount
+	payload := make([]byte, 0, size)
+	for i := 0; len(payload) < size; i++ {
 		payload = append(payload, fmt.Sprintf("entry-%04d;", i)...)
 	}
 	return payload
+}
+
+// deliverAsserting sends every chunk of the snapshot at index 40 in term 2 and,
+// after each non-final one, checks the two things a chunk in the middle of a
+// transfer must be true of: the receiver still shows no sign of the snapshot,
+// and the reply names the next byte it wants.
+func (c *chunkReceiver) deliverAsserting(t *testing.T, chunks [][]byte) {
+	t.Helper()
+
+	offset := 0
+	for i, chunk := range chunks {
+		done := i == len(chunks)-1
+		reply := c.send(chunkArgs(2, 40, 2, offset, chunk, done))
+		if reply.Term != 2 {
+			t.Fatalf("chunk %d: reply.Term = %d, want 2", i, reply.Term)
+		}
+		offset += len(chunk)
+		if done {
+			return
+		}
+		c.assertUntouched(t, fmt.Sprintf("after chunk %d of %d", i+1, len(chunks)))
+		if reply.Offset != offset {
+			t.Fatalf("chunk %d: reply.Offset = %d, want %d (the next byte the receiver needs)",
+				i, reply.Offset, offset)
+		}
+	}
 }
 
 // TestInstallSnapshotAssemblesChunkedTransfer is the large-snapshot case: a
@@ -239,32 +281,15 @@ func bigPayload(chunkSize, chunks int) []byte {
 // change anything. The assembled payload must be the leader's byte for byte, and
 // the two durable writes must happen once each, payload before boundary.
 func TestInstallSnapshotAssemblesChunkedTransfer(t *testing.T) {
-	const chunkSize = 64
 	receiver := newChunkReceiver(t, 2)
 
-	payload := bigPayload(chunkSize, 6)
-	chunks := splitPayload(payload, chunkSize)
+	payload := bigPayload()
+	chunks := splitPayload(payload)
 	if len(chunks) < 5 {
 		t.Fatalf("test needs at least 5 chunks, got %d", len(chunks))
 	}
 
-	offset := 0
-	for i, chunk := range chunks {
-		done := i == len(chunks)-1
-		reply := receiver.send(chunkArgs(2, 40, 2, offset, chunk, done))
-		if reply.Term != 2 {
-			t.Fatalf("chunk %d: reply.Term = %d, want 2", i, reply.Term)
-		}
-		offset += len(chunk)
-		if done {
-			break
-		}
-		receiver.assertUntouched(t, fmt.Sprintf("after chunk %d of %d", i+1, len(chunks)))
-		if reply.Offset != offset {
-			t.Fatalf("chunk %d: reply.Offset = %d, want %d (the next byte the receiver needs)",
-				i, reply.Offset, offset)
-		}
-	}
+	receiver.deliverAsserting(t, chunks)
 
 	// The final chunk installs the whole payload, exactly once.
 	if idx, term := receiver.rs.GetSnapshotMetadata(); idx != 40 || term != 2 {
@@ -280,8 +305,8 @@ func TestInstallSnapshotAssemblesChunkedTransfer(t *testing.T) {
 
 	// R3's ordering, and nothing extra: one payload write, then one boundary
 	// write. A receiver that wrote per chunk would show several of either.
-	if got := receiver.durability.order(); len(got) != 2 || got[0] != "payload" || got[1] != "boundary" {
-		t.Fatalf("durable writes = %v, want exactly [payload boundary]", got)
+	if got := receiver.durability.order(); len(got) != 2 || got[0] != writePayload || got[1] != writeBoundary {
+		t.Fatalf("durable writes = %v, want exactly [%s %s]", got, writePayload, writeBoundary)
 	}
 
 	select {
@@ -302,11 +327,10 @@ func TestInstallSnapshotAssemblesChunkedTransfer(t *testing.T) {
 // crashed). Nothing on the receiver may reflect the half-arrived snapshot, and
 // the next round — which starts again from offset 0 — must complete normally.
 func TestInstallSnapshotInterruptedTransferChangesNothing(t *testing.T) {
-	const chunkSize = 64
 	receiver := newChunkReceiver(t, 2)
 
-	payload := bigPayload(chunkSize, 6)
-	chunks := splitPayload(payload, chunkSize)
+	payload := bigPayload()
+	chunks := splitPayload(payload)
 
 	offset := 0
 	for i := 0; i < 3; i++ {
@@ -341,11 +365,10 @@ func TestInstallSnapshotInterruptedTransferChangesNothing(t *testing.T) {
 // arrives, its remaining chunks are stale and must not be able to complete an
 // install under the old leader's authority.
 func TestInstallSnapshotHigherTermDiscardsPartialTransfer(t *testing.T) {
-	const chunkSize = 64
 	receiver := newChunkReceiver(t, 2)
 
-	payload := bigPayload(chunkSize, 6)
-	chunks := splitPayload(payload, chunkSize)
+	payload := bigPayload()
+	chunks := splitPayload(payload)
 
 	offset := 0
 	for i := 0; i < 3; i++ {
@@ -396,11 +419,10 @@ func TestInstallSnapshotHigherTermDiscardsPartialTransfer(t *testing.T) {
 // duplicate bytes, so it is refused — and the reply names the offset that fits,
 // which is what lets the leader carry on without restarting.
 func TestInstallSnapshotRejectsOffsetMismatch(t *testing.T) {
-	const chunkSize = 64
 	receiver := newChunkReceiver(t, 2)
 
-	payload := bigPayload(chunkSize, 6)
-	chunks := splitPayload(payload, chunkSize)
+	payload := bigPayload()
+	chunks := splitPayload(payload)
 
 	receiver.send(chunkArgs(2, 40, 2, 0, chunks[0], false))
 
