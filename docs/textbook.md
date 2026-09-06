@@ -38,7 +38,7 @@ style: |
 作成日: 2026-07-19
 情報源: リポジトリの実ソースコード（main ブランチ、commit 9a90cf5 時点）
 最終検証: 2026-07-22 / 対象 commit `d1838d5`（+ 本ブランチの ReadIndex 化）— 読み取り経路・no-op・グループ D の節のみ現行コードに追随
-追加更新: 2026-09-06 / 対象 commit `d370c72` — 第7章「safety-review-2026-07-07.md の現在値」の 💡 要約のみ、2026-09-06 再監査（グループ R）を反映して更新。他章は上記の 2026-07-22 時点のまま
+追加更新: 2026-09-06 against commit `3018c96` — 第7章「safety-review-2026-07-07.md の現在値」の表と 💡 要約、および E1/E2/R6 に触れていた「選挙まわりの既知の問題」「複製の注意点」「MockTransport の仕組み」の各節のみ現行コードに追随。他章は上記の 2026-07-22 時点のまま
 
 > ⚠️ **2026-07-21 追記 / 2026-07-22 更新**: 本書は元々 commit 9a90cf5 時点のスナップショット
 > （凍結扱い）です。**本文（各章の解説・コード断片・「やさしく言うと」）は 9a90cf5 当時の記述の
@@ -285,11 +285,11 @@ for {
 
 ## 選挙まわりの既知の問題
 
-- `ResetElectionTimer` を**ロック外**で呼んでいる（`rpc.go`）
-  → `electionTimeout` フィールドへのデータレース（safety-review E1、未修正・未検証）
+- ~~`ResetElectionTimer` を**ロック外**で呼んでいる（`rpc.go`）→ `electionTimeout` フィールドへのデータレース~~ → ✅ **解消済み**（commit `c5fdc0f`、E1）。内部経路は `rs.mu` 保持前提の `resetElectionTimerLocked`、公開 `ResetElectionTimer` は自分でロックを取る形に分離
+- ~~降格経路が選挙タイマーを再始動しない~~ → ✅ **解消済み**（commit `ac93fcb`、R6）。follower へ落ちる経路はすべて `becomeFollowerLocked`（`raft/state.go`）を通り、`becomeLeader` が停止したタイマーを再始動する
 - ~~当選時に no-op エントリを積まない~~ → ✅ **解消済み**（commit `60fd631`）。当選処理は `becomeLeader`（`raft/noop.go`）に集約され、リーダー遷移時に current-term の no-op（`NoOpCommand`）を追記する。`startElection` / `requestVoteFromPeer` の当選経路も `becomeLeader` 呼び出しに置換。これで前任 term のコミット済みエントリを advance でき、ReadIndex（§6.4）の前提も満たす（後述「read の線形化」）
 
-> 💡 **やさしく言うと**: かつては 2 つの小さな抜けがありました。1 つは複数人が同時に同じメモ帳に書き込める状態（これは今も残る）。もう 1 つ「新リーダーが就任のあいさつ（空の一筆）を帳簿に書かない」問題は解消され、いまは就任時に必ず空の一筆を書きます。
+> 💡 **やさしく言うと**: かつては小さな抜けがいくつかありました。「複数人が同時に同じメモ帳に書き込める状態」も、「リーダーの座を降りた人が目覚まし時計を止めたまま二度と起きない」問題も、いまは解消済みです。「新リーダーが就任のあいさつ（空の一筆）を帳簿に書かない」問題も解消され、いまは就任時に必ず空の一筆を書きます。
 
 ---
 
@@ -371,13 +371,13 @@ rosetta には「空のハートビート」という概念が実質なく、**5
 
 ---
 
-## 複製の注意点（静的読解・未検証）
+## 複製の注意点
 
-- 送信エントリは `rs.persistent.Log` のスライスを**そのまま**渡す（`rpc.go:327`）
-- HTTP 経由なら JSON 化（コピー）されるので実害はないが、**MockTransport では送信側と受信側が同じメモリ（backing array）を共有**したまま処理が進む（safety-review E2）
-- テストと本番で挙動が変わり得る点として覚えておく
+- ~~送信エントリは `rs.persistent.Log` のスライスを**そのまま**渡す~~ → ✅ **解消済み**（commit `7e3eb61`、E2）。`replicateToPeer` はロック内で新しいスライスへコピーしてから transport に渡す
+- ロック外の marshal 中に `mergeLogEntries`／`TruncateLogAfter`／`TruncateLogTo` が同じ backing array を書き換えうる、というのが問題の本体だった（HTTP 経由でも JSON 化はロックの外で走るため実害があった）
+- 複製 RPC は peer ごとに直列化され、成功応答で `MatchIndex`/`NextIndex` が後退しない（commit `499c4b8`）
 
-> 💡 **やさしく言うと**: 本番では書類をコピーして郵送しますが、テスト環境では原本をそのまま手渡ししています。テストでだけ「同じ紙に 2 人が同時に書き込む」事故が起き得ます。
+> 💡 **やさしく言うと**: 以前は書類の原本をそのまま郵便屋に渡していたので、郵便屋が読んでいる最中に別の人が同じ紙に書き足せてしまいました。いまは必ずコピーを渡します。
 
 ---
 
@@ -957,7 +957,7 @@ CLAUDE.md の主張:
 - `nodes map[string]*RaftNode` を持つだけの登録簿。RPC 送信 = **対象ノードのハンドラメソッドを直接呼ぶ**（`node.go:199, 213, 227`）
 - 未登録ノード宛は `context.DeadlineExceeded` を返す（`node.go:194-196`）— これが「ネットワーク到達不能」の模擬
 - 障害・パーティション = `RemoveNode` で外す、回復 = 再登録
-- 直列化を経ないため、引数のポインタ・スライスは送受で**メモリ共有**される（第1章 E2 の背景）
+- 直列化を経ないため、引数のポインタ・スライスは送受で**メモリ共有**される（第1章 E2 の背景。送信側のコピーは `7e3eb61` で入ったが、MockTransport が共有渡しである性質自体は変わらない）
 
 > 💡 **やさしく言うと**: テスト用の「なんちゃってネットワーク」です。実際の通信はせず、名簿を引いて相手の関数を直接呼びます。名簿から消せば「通信不能」を演じられるので、故障の実験が自在にできます。
 
@@ -1038,11 +1038,12 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
 | C1/C2/C4 | 投票・term 更新の persist 欠如、ロード失敗時の起動継続 | ✅ **修正済み**（`2a35ce9`） |
 | C3 | persist() のエラー無視 | ✅ **修正済み**（RPC 応答経路は `2a35ce9`。リーダー自身の `AppendLogEntry`/`TruncateLogAfter`/当選時 no-op は `ffc2926` でロールバック＋エラー通知） |
 | D1–D5 | lease 期間・起点、no-op 不在（D1–D3）、重複検出未配線（D4）、spurious leadership lost（D5） | ✅ **修正済み**（D1/D2 `b3b21a4`、D3 `60fd631`、D4 `52afd48`、D5 `16a9b31`） |
-| E1–E2 | ロック外タイマーリセット、スライス共有 | ❌ 未修正 |
+| E1–E2 | ロック外タイマーリセット、スライス共有 | ✅ **修正済み**（E1 `c5fdc0f`、E2 `7e3eb61`） |
+| R6 | 降格経路が選挙タイマーを再始動しない（降格した元 leader が二度と立候補しない） | ✅ **修正済み**（`ac93fcb`、`becomeFollowerLocked` に一本化） |
 | R1 | `Start` の leader 判定と durable append が別の `rs.mu` 臨界区間（Log Matching 違反） | ✅ **修正済み**（`2c26b9a`、`RaftState.Start` で 1 回のロックに統合） |
 | R2 | persist 失敗後の同一 AppendEntries 再送を `Success=true` で ACK（Leader Completeness 違反） | ✅ **修正済み**（`c362ae4`、persist 失敗時に merge をロールバック） |
 
-> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです（同期時点: 2026-09-06 / commit `2a85ced`）。B1・B2・A1–A8・C1–C4・D1–D5 はすべて別 PR で修正済みで、2026-09-06 の再監査（`docs/raft-audit-2026-09-06.md`）で見つかった P0 の R1（Log Matching）・R2（Leader Completeness/永続化）・R3–R5（snapshot の世代整合・payload/metadata の同一世代化・古い snapshot の適用禁止）も修正済みです。ただし R13（AppendEntries の境界 term 検査）や E2 のように安全性に触れうる項目が残るため、「Raft の安全性そのものを破る既知の経路は残っていない」とはまだ言えません。未修正は B3（payload 書き込みと applyCh 送信を rs.mu 保持下で行う liveness 問題）・E1・E2（data race）に加え、グループ R の R6, R9–R16, R18, R19 です。詳細は `KNOWN_ISSUES.md` を参照してください。**本文の第 12 章「InstallSnapshot RPC 受信側」にある A7 の指摘は 9a90cf5 当時の記述であり、現在は解消済み**です。
+> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです（同期時点: 2026-09-06 / commit `3018c96`）。B1・B2・A1–A8・C1–C4・D1–D5 はすべて別 PR で修正済みで、2026-09-06 の再監査（`docs/raft-audit-2026-09-06.md`）で見つかった P0 の R1（Log Matching）・R2（Leader Completeness/永続化）・R3–R5（snapshot の世代整合・payload/metadata の同一世代化・古い snapshot の適用禁止）、P1 の R6（降格時のタイマー再始動）と data race 2 件（E1/E2）も修正済みです。ただし R13（AppendEntries の境界 term 検査）のように安全性に触れうる項目が残るため、「Raft の安全性そのものを破る既知の経路は残っていない」とはまだ言えません。未修正は B3（payload 書き込みと applyCh 送信を rs.mu 保持下で行う liveness 問題）に加え、グループ R の R9–R16, R18, R19 です。詳細は `KNOWN_ISSUES.md` を参照してください。**本文の第 12 章「InstallSnapshot RPC 受信側」にある A7 の指摘は 9a90cf5 当時の記述であり、現在は解消済み**です。
 
 ---
 
