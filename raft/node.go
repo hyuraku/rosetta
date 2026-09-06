@@ -134,8 +134,10 @@ func (rn *RaftNode) GetLeader() string {
 		return rn.state.nodeID
 	}
 
-	// Return the tracked current leader
-	return rn.state.currentLeader
+	// Return the tracked current leader. Read through the accessor: currentLeader
+	// is written under rs.mu by the follower transition and the election paths,
+	// and rn.mu orders nothing against it.
+	return rn.state.GetCurrentLeader()
 }
 
 func (rn *RaftNode) Kill() {

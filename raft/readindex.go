@@ -143,17 +143,15 @@ func (rs *RaftState) confirmLeadership(
 }
 
 // stepDown reverts this node to a follower at newTerm when newTerm is newer than
-// the current term, persisting the change. It self-locks via rs.mu and mirrors
-// the higher-term handling used throughout the RPC paths.
+// the current term, persisting the change. It self-locks via rs.mu and defers to
+// becomeFollowerLocked, the single follower transition shared with the RPC paths
+// — including the election timer re-arm a demoted leader needs (KNOWN_ISSUES.md
+// R6). A failed persist is only logged: no RPC response depends on it here.
 func (rs *RaftState) stepDown(newTerm int) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if newTerm > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = newTerm
-		rs.persistent.VotedFor = nil
-		rs.state = Follower
-		rs.currentLeader = ""
-		if err := rs.persist(); err != nil {
+		if err := rs.becomeFollowerLocked(newTerm, ""); err != nil {
 			rs.logger.Printf("stepDown: persist failed: %v", err)
 		}
 	}

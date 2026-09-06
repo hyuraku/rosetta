@@ -65,14 +65,19 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 		return
 	}
 
-	// Track whether we mutated persistent state (term or vote) so we can flush
-	// it to stable storage before replying.
-	dirty := false
+	// Adopt a higher term through the common follower transition. It persists the
+	// term bump itself, so granting a vote below costs a second write; that only
+	// happens on the election path, and it keeps the "durable before responding"
+	// rule (Figure 2) in one place instead of spread across every caller.
+	//
+	// A failure here does not end the handler: the vote decision below still runs
+	// and its persist covers the whole persistent state (term and vote together),
+	// so a write that succeeds there makes both durable. The in-memory VotedFor
+	// it may set is the safe direction either way (KNOWN_ISSUES.md 注記 3).
 	if args.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = args.Term
-		rs.persistent.VotedFor = nil
-		rs.state = Follower
-		dirty = true
+		if err := rs.becomeFollowerLocked(args.Term, ""); err != nil {
+			rs.logger.Printf("RequestVote: persist of higher term failed: %v", err)
+		}
 	}
 
 	if rs.persistent.VotedFor == nil || *rs.persistent.VotedFor == args.CandidateID {
@@ -86,20 +91,18 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			rs.persistent.VotedFor = &args.CandidateID
 			reply.VoteGranted = true
-			rs.ResetElectionTimer()
-			dirty = true
-		}
-	}
+			rs.resetElectionTimerLocked()
 
-	// Persist the vote/term change before responding. If the write fails we must
-	// not tell the candidate we voted for it: the vote is not durable, so a crash
-	// here could let us vote again for a different candidate in the same term.
-	// The in-memory VotedFor stays set, which is the safe direction (it only
-	// prevents further votes this term); a later successful persist reconciles it.
-	if dirty {
-		if err := rs.persist(); err != nil {
-			reply.VoteGranted = false
-			rs.logger.Printf("RequestVote: refusing to grant vote, persist failed: %v", err)
+			// Persist the vote before responding. If the write fails we must not
+			// tell the candidate we voted for it: the vote is not durable, so a
+			// crash here could let us vote again for a different candidate in the
+			// same term. The in-memory VotedFor stays set, which is the safe
+			// direction (it only prevents further votes this term); a later
+			// successful persist reconciles it.
+			if err := rs.persist(); err != nil {
+				reply.VoteGranted = false
+				rs.logger.Printf("RequestVote: refusing to grant vote, persist failed: %v", err)
+			}
 		}
 	}
 
@@ -117,26 +120,15 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		return
 	}
 
-	termChanged := false
-	if args.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = args.Term
-		rs.persistent.VotedFor = nil
-		termChanged = true
-	}
-
-	rs.state = Follower
-	rs.currentLeader = args.LeaderID // Track who the current leader is
-	rs.ResetElectionTimer()
-
-	// A term bump must reach stable storage before we respond. On failure we
-	// leave Success=false and bail out rather than acknowledging under a term
-	// we have not durably recorded.
-	if termChanged {
-		if err := rs.persist(); err != nil {
-			rs.logger.Printf("AppendEntries: persist of term change failed: %v", err)
-			reply.Term = rs.persistent.CurrentTerm
-			return
-		}
+	// Accept this leader's authority through the common follower transition: it
+	// adopts the term, records the leader, and re-arms the election timer, which
+	// every valid AppendEntries must do. A term bump must reach stable storage
+	// before we respond, so on a persist failure we leave Success=false and bail
+	// out rather than acknowledging under a term we have not durably recorded.
+	if err := rs.becomeFollowerLocked(args.Term, args.LeaderID); err != nil {
+		rs.logger.Printf("AppendEntries: persist of term change failed: %v", err)
+		reply.Term = rs.persistent.CurrentTerm
+		return
 	}
 	reply.Term = rs.persistent.CurrentTerm
 
@@ -267,12 +259,16 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 		// Abort this election attempt; a later election timeout will retry once
 		// storage recovers, rather than campaigning under an unpersisted term.
 		rs.logger.Printf("startElection: persist failed, aborting election: %v", err)
-		rs.state = Follower
+		// Drop back to follower through the common transition, which re-arms the
+		// (already fired) election timer so we retry on the next timeout once
+		// storage recovers; otherwise this node would never campaign again until
+		// it hears from a leader. The term stays bumped in memory as on every
+		// other unpersisted term change, so becomeFollowerLocked is passed the
+		// term we already hold and writes nothing.
+		if ferr := rs.becomeFollowerLocked(rs.persistent.CurrentTerm, ""); ferr != nil {
+			rs.logger.Printf("startElection: follower transition after failed persist: %v", ferr)
+		}
 		rs.mu.Unlock()
-		// Re-arm the (already fired) election timer so we retry on the next
-		// timeout once storage recovers; otherwise this node would never
-		// campaign again until it hears from a leader.
-		rs.ResetElectionTimer()
 		return
 	}
 	currentTerm := rs.persistent.CurrentTerm
@@ -284,9 +280,12 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	// Use a vote counter that's protected by the RaftState mutex
 	votes := 1
 	votesNeeded := len(rs.peers)/quorumDivisor + 1
+	// Re-arm the (already fired) timer under the same lock the RPC handlers hold
+	// when they reset it, so this election's timeout does not race with an
+	// incoming AppendEntries (KNOWN_ISSUES.md E1). It also bounds this election:
+	// if it draws no quorum, the timeout starts the next one.
+	rs.resetElectionTimerLocked()
 	rs.mu.Unlock()
-
-	rs.ResetElectionTimer()
 
 	// If this is a single-node cluster, immediately become leader. becomeLeader
 	// appends the current-term no-op and stops the election timer.
@@ -342,10 +341,10 @@ func (rs *RaftState) requestVoteFromPeer(
 	}
 
 	if reply.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = reply.Term
-		rs.state = Follower
-		rs.persistent.VotedFor = nil
-		if err := rs.persist(); err != nil {
+		// Step down through the common transition, which also re-arms the election
+		// timer (KNOWN_ISSUES.md R6). A failed persist is only logged here: there
+		// is no RPC response riding on it, and the next election timeout retries.
+		if err := rs.becomeFollowerLocked(reply.Term, ""); err != nil {
 			rs.logger.Printf("requestVoteFromPeer: persist of higher term failed: %v", err)
 		}
 		return
@@ -366,31 +365,66 @@ func (rs *RaftState) requestVoteFromPeer(
 }
 
 func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
-	if rs.GetNodeState() != Leader {
+	rs.mu.Lock()
+	if rs.state != Leader || rs.leader == nil {
+		rs.mu.Unlock()
 		return
 	}
 
-	rs.mu.RLock()
 	currentTerm := rs.persistent.CurrentTerm
 	commitIndex := rs.volatile.CommitIndex
-	isSingleNode := len(rs.peers) == 1
-	rs.mu.RUnlock()
 
 	// For a single-node cluster the leader is its own majority, so it can commit
 	// outstanding entries directly.
-	if isSingleNode {
-		rs.mu.Lock()
+	if len(rs.peers) == 1 {
 		rs.updateCommitIndex()
 		rs.mu.Unlock()
 		return
 	}
 
+	// Claim each peer's replication slot before spawning, and skip the peers that
+	// still have a round outstanding. Claiming under the same lock that reads the
+	// term and commit index is what makes the serialization airtight: two ticks
+	// cannot both see a peer idle.
+	targets := make([]string, 0, len(rs.peers))
 	for _, peer := range rs.peers {
-		if peer == rs.nodeID {
+		if peer == rs.nodeID || rs.leader.inFlight[peer] {
 			continue
 		}
+		rs.leader.inFlight[peer] = true
+		targets = append(targets, peer)
+	}
+	rs.mu.Unlock()
 
-		go rs.replicateToPeer(transport, peer, currentTerm, commitIndex)
+	for _, peer := range targets {
+		go rs.replicatePeerOnce(transport, peer, currentTerm, commitIndex)
+	}
+}
+
+// replicatePeerOnce runs one replication round against peerID and releases that
+// peer's slot when it returns, so the next tick can schedule another round.
+//
+// This is the one place a leader spawns replication work. Keeping the spawn and
+// the release together here is deliberate: when shutdown learns to wait for its
+// goroutines (KNOWN_ISSUES.md R19, roadmap step 6) this is the single site that
+// has to join a WaitGroup and honor the node's done signal.
+func (rs *RaftState) replicatePeerOnce(
+	transport RPCTransport,
+	peerID string,
+	currentTerm, commitIndex int,
+) {
+	defer rs.releaseReplicationSlot(peerID)
+	rs.replicateToPeer(transport, peerID, currentTerm, commitIndex)
+}
+
+// releaseReplicationSlot marks peerID as idle again. A demotion in the meantime
+// drops the whole LeaderState, and a later election builds a fresh one, so there
+// is nothing to release in that case.
+func (rs *RaftState) releaseReplicationSlot(peerID string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.leader != nil {
+		delete(rs.leader.inFlight, peerID)
 	}
 }
 
@@ -404,6 +438,13 @@ func (rs *RaftState) replicateToPeer(
 	currentTerm, commitIndex int,
 ) {
 	rs.mu.RLock()
+	if rs.state != Leader || rs.leader == nil {
+		// Demoted between the tick that scheduled this round and now.
+		// becomeFollowerLocked drops the per-peer replication state, so this is
+		// also what keeps the read below from dereferencing a nil LeaderState.
+		rs.mu.RUnlock()
+		return
+	}
 	nextIndex := rs.leader.NextIndex[peerID]
 	lastIncludedIndex := rs.persistent.LastIncludedIndex
 	lastIncludedTerm := rs.persistent.LastIncludedTerm
@@ -425,9 +466,24 @@ func (rs *RaftState) replicateToPeer(
 		sendSnapshot = true
 	}
 
+	// Copy the entries out while still under the lock. The slice is handed to the
+	// transport after RUnlock and read there — the HTTP transport JSON-marshals
+	// it — while mergeLogEntries, TruncateLogAfter, TruncateLogTo and the
+	// InstallSnapshot receive path all mutate persistent.Log's backing array.
+	// Re-slicing alone is not enough: an append that fits in the spare capacity
+	// writes through the shared array, so the marshaller could read an entry
+	// mid-write (KNOWN_ISSUES.md E2). A shallow copy suffices — LogEntry.Command
+	// is an interface{} the receiver only reads, never writes through.
+	//
+	// The cost is one copy of the outstanding suffix per replication round. That
+	// suffix is unbounded today because there is no per-request entry cap;
+	// introducing one (maxEntriesPerAppend) is a separate change and out of scope
+	// here.
 	entries := make([]LogEntry, 0)
 	if nextIndex > lastIncludedIndex {
-		entries = rs.persistent.Log[nextIndex-lastIncludedIndex-1:]
+		src := rs.persistent.Log[nextIndex-lastIncludedIndex-1:]
+		entries = make([]LogEntry, len(src))
+		copy(entries, src)
 	}
 
 	rs.mu.RUnlock()
@@ -462,10 +518,10 @@ func (rs *RaftState) replicateToPeer(
 	defer rs.mu.Unlock()
 
 	if reply.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = reply.Term
-		rs.state = Follower
-		rs.persistent.VotedFor = nil
-		if err := rs.persist(); err != nil {
+		// Step down through the common transition, which also re-arms the election
+		// timer becomeLeader stopped. Without that, a leader demoted by a reply
+		// could never start an election again (KNOWN_ISSUES.md R6).
+		if err := rs.becomeFollowerLocked(reply.Term, ""); err != nil {
 			rs.logger.Printf("replicateToPeer: persist of higher term failed: %v", err)
 		}
 		return
@@ -476,8 +532,19 @@ func (rs *RaftState) replicateToPeer(
 	}
 
 	if reply.Success {
-		rs.leader.MatchIndex[peerID] = prevLogIndex + len(entries)
-		rs.leader.NextIndex[peerID] = rs.leader.MatchIndex[peerID] + 1
+		// MatchIndex is a high-water mark, so never let a reply move it back.
+		// Replies can still be processed out of order — a slow round answered
+		// after a later, larger one — and rewinding MatchIndex here would rewind
+		// NextIndex with it, re-sending entries the follower already acknowledged
+		// and stalling the commit index behind a quorum that has in fact been
+		// reached. The per-peer serialization above makes the reordering rare;
+		// this makes it harmless.
+		if matchIndex := prevLogIndex + len(entries); matchIndex > rs.leader.MatchIndex[peerID] {
+			rs.leader.MatchIndex[peerID] = matchIndex
+		}
+		if next := rs.leader.MatchIndex[peerID] + 1; next > rs.leader.NextIndex[peerID] {
+			rs.leader.NextIndex[peerID] = next
+		}
 		rs.updateCommitIndex()
 	} else {
 		rs.handleReplicationConflict(peerID, reply)
@@ -571,10 +638,9 @@ func (rs *RaftState) sendSnapshotToPeer(
 	defer rs.mu.Unlock()
 
 	if reply.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = reply.Term
-		rs.state = Follower
-		rs.persistent.VotedFor = nil
-		if err := rs.persist(); err != nil {
+		// Step down through the common transition, which also re-arms the election
+		// timer becomeLeader stopped (KNOWN_ISSUES.md R6).
+		if err := rs.becomeFollowerLocked(reply.Term, ""); err != nil {
 			rs.logger.Printf("sendSnapshotToPeer: persist of higher term failed: %v", err)
 		}
 		return
@@ -584,9 +650,15 @@ func (rs *RaftState) sendSnapshotToPeer(
 	}
 	// Follower has now installed the snapshot we actually shipped, so its match
 	// index follows that envelope's boundary — not the boundary we happened to
-	// read from our own state before the send.
-	rs.leader.MatchIndex[peerID] = snapshot.LastIncludedIndex
-	rs.leader.NextIndex[peerID] = snapshot.LastIncludedIndex + 1
+	// read from our own state before the send. Monotonic for the same reason as
+	// the AppendEntries path: a slow InstallSnapshot acknowledged after the
+	// follower has already been caught up further must not drag it back.
+	if snapshot.LastIncludedIndex > rs.leader.MatchIndex[peerID] {
+		rs.leader.MatchIndex[peerID] = snapshot.LastIncludedIndex
+	}
+	if next := rs.leader.MatchIndex[peerID] + 1; next > rs.leader.NextIndex[peerID] {
+		rs.leader.NextIndex[peerID] = next
+	}
 }
 
 func (rs *RaftState) updateCommitIndex() {
@@ -685,24 +757,18 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		return
 	}
 
-	// Update term if necessary
-	if args.Term > rs.persistent.CurrentTerm {
-		rs.persistent.CurrentTerm = args.Term
-		rs.persistent.VotedFor = nil
-		rs.state = Follower
-		if err := rs.persist(); err != nil {
-			rs.logger.Printf("InstallSnapshot: persist of term change failed: %v", err)
-			reply.Term = rs.persistent.CurrentTerm
-			return
-		}
+	// Accept this leader's authority through the common follower transition: it
+	// adopts the term, records the leader and resets the election timer (valid
+	// communication from a leader). A term bump must be durable before we answer,
+	// so a persist failure ends the handler before anything else is touched —
+	// which also keeps this ahead of the ordering invariant's step 1.
+	if err := rs.becomeFollowerLocked(args.Term, args.LeaderID); err != nil {
+		rs.logger.Printf("InstallSnapshot: persist of term change failed: %v", err)
+		reply.Term = rs.persistent.CurrentTerm
+		return
 	}
 
 	reply.Term = rs.persistent.CurrentTerm
-
-	// Reset election timer - valid communication from leader
-	rs.state = Follower
-	rs.currentLeader = args.LeaderID
-	rs.ResetElectionTimer()
 
 	// Refuse any snapshot that would move this node backwards. Comparing only
 	// against LastIncludedIndex (the previous behavior) let a delayed or
