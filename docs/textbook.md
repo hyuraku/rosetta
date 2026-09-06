@@ -1053,11 +1053,12 @@ safety-review の CONFIRMED 群のうち、テストで守られているもの�
 | R15 | InstallSnapshot が全量 1 RPC 転送のみで offset/done による chunk 転送・中断からの再開がない | ✅ **修正済み**（`c8c87d0` / `3ad0220` / `b3fbdbb`、Figure 13 の offset/done を実装。受信側は done まで Raft 状態・KV・ディスクを変更しない） |
 | R17 | CI が `./...` を `-race` 対象にしていない／`cluster_test.go` の timeout `break` が外側 for を抜けない（SA4011） | ✅ **修正済み**（`19bdb37` / `91b0f7c`） |
 | R19 | `Kill` が起動した goroutine の終了を待たず、閉じた applyCh への送信で panic しうる | ✅ **修正済み**（`7c96f14` / `13570d5`、`spawn`/`Stop` に一本化し停止順も整理） |
-| R14 | Joint consensus・構成変更ログエントリ・新旧 quorum の二重確認が未実装 | ❌ **未修正**（P2） |
+| R14 | Joint consensus・構成変更ログエントリ・新旧 quorum の二重確認が未実装 | ✅ **修正済み**（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`、構成をログエントリ化し追記時点で適用、joint は旧・新両方の過半数を要求、管理 API と snapshot 内構成を追加） |
 | R16 | `SnapshotInterval` が未使用で、`LoadConfig` がゼロ値のまま `Validate` に渡す | ❌ **未修正**（P3） |
 | R18 | `examples/benchmark` の read ワークロードが鍵不一致でヒットしない | ❌ **未修正**（P3） |
+| R20 | learner（non-voting member）の追いつき段階が未実装で、追加直後のサーバーが即 quorum に数えられる | ❌ **未修正**（P2、R14 の修正作業中に起票） |
 
-> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです（同期時点: 2026-09-06 / commit `c6ee4b4`）。B1・B2・A1–A8・C1–C4・D1–D5 はすべて別 PR で修正済みで、2026-09-06 の再監査（`docs/raft-audit-2026-09-06.md`）で見つかった P0 の R1（Log Matching）・R2（Leader Completeness/永続化）・R3–R5（snapshot の世代整合・payload/metadata の同一世代化・古い snapshot の適用禁止）、P1 の R6（降格時のタイマー再始動）と data race 2 件（E1/E2）も修正済みです。その後 R9–R13（KV/client/API の細部と AppendEntries の境界 term 検査・commit 上限）、R15（InstallSnapshot の chunk 転送）、R17（CI と SA4011）、R19（`Kill` の goroutine join）も修正され、B3（rs.mu 保持下での applyCh 送信という liveness 問題）は専用 applier goroutine への分離で解消しました。**未修正は R14（joint consensus）・R16（設定）・R18（benchmark）の 3 件**です。ただしそれは「修正済みの経路に問題が残っていないと確認できた」という意味ではないため、「Raft の安全性そのものを破る既知の経路は残っていない」とはまだ言えません。詳細は `KNOWN_ISSUES.md` を参照してください。**本文の第 12 章「InstallSnapshot RPC 受信側」にある A7 の指摘は 9a90cf5 当時の記述であり、現在は解消済み**です。
+> 💡 **やさしく言うと**: この表は本書の他の章と違い、現在の KNOWN_ISSUES.md に同期済みです（同期時点: 2026-09-06 / commit `e183622`）。B1・B2・A1–A8・C1–C4・D1–D5 はすべて別 PR で修正済みで、2026-09-06 の再監査（`docs/raft-audit-2026-09-06.md`）で見つかった P0 の R1（Log Matching）・R2（Leader Completeness/永続化）・R3–R5（snapshot の世代整合・payload/metadata の同一世代化・古い snapshot の適用禁止）、P1 の R6（降格時のタイマー再始動）と data race 2 件（E1/E2）も修正済みです。その後 R9–R13（KV/client/API の細部と AppendEntries の境界 term 検査・commit 上限）、R15（InstallSnapshot の chunk 転送）、R17（CI と SA4011）、R19（`Kill` の goroutine join）も修正され、B3（rs.mu 保持下での applyCh 送信という liveness 問題）は専用 applier goroutine への分離で解消しました。R14（joint consensus による動的メンバーシップ）も修正済みです。**未修正は R16（設定）・R18（benchmark）・R20（learner）の 3 件**です。ただしそれは「修正済みの経路に問題が残っていないと確認できた」という意味ではないため、「Raft の安全性そのものを破る既知の経路は残っていない」とはまだ言えません。詳細は `KNOWN_ISSUES.md` を参照してください。**本文の第 12 章「InstallSnapshot RPC 受信側」にある A7 の指摘は 9a90cf5 当時の記述であり、現在は解消済み**です。
 
 ---
 

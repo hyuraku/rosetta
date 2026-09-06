@@ -181,41 +181,51 @@ at the snapshot boundary, so those entries are re-applied from the log anyway.
 
 ## Medium Priority Features 🟡
 
-### 3. Dynamic Cluster Membership
+### 3. Dynamic Cluster Membership ✅ Complete
 **Priority:** 🟡 Medium
-**Estimated Effort:** Large (3-4 weeks)
-**Status:** Not Started — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R14, joint consensus
-not implemented; R12, fixed in `9d411ba` — a non-empty `-join` now refuses to start
-instead of failing open, since dynamic membership isn't implemented, but the flag
-remains reserved and `ClusterManager`'s node list is still not reflected in the Raft
-quorum)
+**Status:** Done — R14 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) is fixed
+(`9da332c` / `3a82a6a` / `49e513e` / `54fba63`). One follow-up remains: R20,
+below.
 
 **Description:**
-Allow adding and removing nodes from a running cluster without downtime.
+Nodes can be added to and removed from a running cluster without downtime,
+through joint consensus (Raft paper §6).
 
-**Requirements:**
-- Add node to running cluster
-- Remove node safely from cluster
-- Configuration change consensus (joint consensus approach)
-- API endpoints for membership management
-- Automatic peer discovery updates
-- Graceful node shutdown
+**Requirements:** (all met)
+- [x] Configuration change consensus (joint consensus): the configuration is a
+      log entry, takes effect when received rather than when committed, and
+      C_old,new → C_new needs a majority of *both* voter sets — `9da332c`,
+      `3a82a6a`
+- [x] Add node to running cluster — `POST /cluster/add`, `49e513e`
+- [x] Remove node safely from cluster, including the leader itself, which steps
+      down once C_new commits — `POST /cluster/remove`, `49e513e`
+- [x] API endpoints for membership management, plus `GET /cluster/config` —
+      `49e513e`
+- [x] Automatic peer discovery updates: addresses travel inside the
+      configuration entry and the transport's address book follows it, so no
+      node's flags need editing — `49e513e`
+- [x] Configuration survives truncation, compaction, `InstallSnapshot` and
+      restart — `9da332c`, `54fba63`
+- [x] Only one change at a time; a removed server cannot disrupt the cluster
+      (§6's RequestVote rule) — `3a82a6a`, `49e513e`
 
-**Implementation Steps:**
-1. Implement joint consensus for configuration changes
-2. Add membership change log entries
-3. Create `/admin/add-node` and `/admin/remove-node` endpoints
-4. Update peer tracking on all nodes
-5. Implement configuration propagation
-6. Add safety checks (quorum validation)
-7. Write tests for various membership change scenarios
+**Remaining (tracked separately):**
+- R20 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): no learner / non-voting catch-up
+  phase. An added server counts towards the quorum from the moment C_old,new
+  reaches a log, so adding one whose log is far behind slows commits until it
+  catches up. This is the availability gap §6 addresses with "new servers join
+  as non-voting members".
+- `-join` stays rejected (R12): joining is granted by the leader, not asserted
+  by the joining node. `ClusterManager`'s `/cluster/join|leave|nodes` in
+  `network/discovery.go` are untouched and still not reflected in the Raft
+  quorum.
 
 **Related Files:**
 - `raft/membership.go` (new)
-- `raft/config_change.go` (new)
-- `network/discovery.go` (update)
-- `main.go` (add admin endpoints)
-- `docs/membership.md` (new)
+- `raft/rpc.go`, `raft/readindex.go`, `raft/state.go`, `raft/node.go` (quorum
+  and configuration paths)
+- `main.go` (`/cluster/add`, `/cluster/remove`, `/cluster/config`)
+- [docs/api.md](docs/api.md) (endpoints and the procedure for adding a node)
 
 **References:**
 - Raft Paper Section 6: Cluster membership changes

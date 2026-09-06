@@ -101,15 +101,8 @@ func (c *testCluster) waitLeader() *RaftNode {
 	c.t.Helper()
 	var leader *RaftNode
 	c.waitFor("a single leader", func() bool {
-		leader = nil
-		count := 0
-		for _, node := range c.nodes {
-			if node.IsLeader() {
-				count++
-				leader = node
-			}
-		}
-		return count == 1
+		leader = c.currentLeader()
+		return leader != nil
 	})
 	return leader
 }
@@ -146,18 +139,63 @@ func (c *testCluster) waitConfig(voters ...string) {
 	})
 }
 
-// commitOne appends one command through the leader and waits for it to commit,
-// which is the end-to-end proof that the current configuration can still form a
-// quorum.
-func (c *testCluster) commitOne(leader *RaftNode, command string) {
+// commitOne appends one command through whichever node is currently the leader
+// and waits for it to commit, which is the end-to-end proof that the current
+// configuration can still form a quorum.
+//
+// The leader is re-resolved on every attempt rather than taken as an argument:
+// under load an election can land between "this node is the leader" and the
+// Start that follows, and a test that asserts a quorum still exists must not
+// fail because leadership moved while it was asking.
+func (c *testCluster) commitOne(command string) {
 	c.t.Helper()
-	index, _, isLeader, err := leader.Start(command)
-	if !isLeader || err != nil {
-		c.t.Fatalf("Start(%q): isLeader=%v err=%v", command, isLeader, err)
-	}
-	c.waitFor(fmt.Sprintf("index %d to commit", index), func() bool {
-		return leader.GetRaftState().GetCommitIndex() >= index
+
+	var (
+		committed bool
+		lastErr   error
+	)
+	c.waitFor(fmt.Sprintf("the command %q to commit", command), func() bool {
+		leader := c.currentLeader()
+		if leader == nil {
+			return false
+		}
+		index, _, isLeader, err := leader.Start(command)
+		if !isLeader || err != nil {
+			lastErr = fmt.Errorf("Start: isLeader=%v err=%w", isLeader, err)
+			return false
+		}
+		// Give this attempt its own bounded wait: if leadership moves before the
+		// entry commits, the next attempt starts over on the new leader.
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if leader.GetRaftState().GetCommitIndex() >= index {
+				committed = true
+				return true
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		lastErr = fmt.Errorf("index %d did not commit before leadership was re-checked", index)
+		return false
 	})
+	if !committed {
+		c.t.Fatalf("committing %q: %v", command, lastErr)
+	}
+}
+
+// currentLeader returns the single leader, or nil when there is not exactly one.
+func (c *testCluster) currentLeader() *RaftNode {
+	var leader *RaftNode
+	count := 0
+	for _, node := range c.nodes {
+		if node.IsLeader() {
+			count++
+			leader = node
+		}
+	}
+	if count != 1 {
+		return nil
+	}
+	return leader
 }
 
 // proposeWhenReady retries a configuration change until the leader is ready to
@@ -207,16 +245,22 @@ func TestAddNodeGrowsTheQuorum(t *testing.T) {
 	}
 	cluster.kill(victim)
 
-	leader = cluster.waitLeader()
-	cluster.commitOne(leader, "after-growth")
+	cluster.commitOne("after-growth")
 
-	state := leader.GetRaftState()
-	state.mu.RLock()
-	matchIndex := state.leader.MatchIndex["n4"]
-	state.mu.RUnlock()
-	if matchIndex == 0 {
-		t.Error("the newcomer's MatchIndex never advanced, so its acknowledgement was not what committed")
-	}
+	// Committing at all already proves it: three of the four servers have to
+	// agree and only three are alive. Asserting the leader's view of the
+	// newcomer's progress as well makes the failure legible if that ever stops
+	// being true.
+	cluster.waitFor("the newcomer's MatchIndex to advance on the leader", func() bool {
+		leader := cluster.currentLeader()
+		if leader == nil {
+			return false
+		}
+		state := leader.GetRaftState()
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		return state.leader != nil && state.leader.MatchIndex["n4"] > 0
+	})
 }
 
 // TestRemoveNodesShrinksTheQuorum is the 5 -> 3 case, removing two servers that
@@ -269,8 +313,7 @@ func TestRemoveNodesShrinksTheQuorum(t *testing.T) {
 	for _, id := range removed {
 		cluster.kill(id)
 	}
-	leader = cluster.waitLeader()
-	cluster.commitOne(leader, "after-shrink")
+	cluster.commitOne("after-shrink")
 }
 
 // TestRemovingTheLeaderStepsItDownAfterCNewCommits covers §6's rule for a leader
@@ -304,7 +347,7 @@ func TestRemovingTheLeaderStepsItDownAfterCNewCommits(t *testing.T) {
 		t.Fatal("the removed leader was elected again")
 	}
 	cluster.waitConfig(withoutID(all, leaderID)...)
-	cluster.commitOne(newLeader, "after-leader-removal")
+	cluster.commitOne("after-leader-removal")
 }
 
 func withoutID(ids []string, drop string) []string {

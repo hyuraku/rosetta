@@ -1,6 +1,6 @@
 # API Documentation
 
-> Last verified: 2026-09-06 against commit `5404af7`.
+> Last verified: 2026-09-06 against commit `e183622`.
 
 This document provides detailed information about the Rosetta HTTP API.
 
@@ -263,6 +263,124 @@ with 400 regardless of how it got there. See ../KNOWN_ISSUES.md (R11, fixed).
 
 ---
 
+### 7. Add a Server to the Cluster
+
+**Endpoint:** `POST /cluster/add`
+
+Starts a membership change that adds a server (Raft paper §6, KNOWN_ISSUES.md
+R14). Leader-only.
+
+**Request:**
+```json
+{
+  "node_id": "node4",
+  "addr": "localhost:8083"
+}
+```
+
+`addr` is the new server's **Raft** listen address (the `-listen` value), not its
+HTTP API address: it is what the other servers will use to reach it, and it is
+carried inside the configuration entry so every node — including the new one —
+learns it from the log.
+
+**Response:**
+- **Code:** 200 OK on success
+- **Content:**
+```json
+{
+  "success": true,
+  "config": {
+    "joint": true,
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082", "node4": "localhost:8083" },
+    "old_voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082" }
+  }
+}
+```
+
+A 200 means the **joint** configuration C_old,new has been appended and is in
+effect on the leader — not that the change is finished. The leader completes it
+on its own: once C_old,new commits it appends C_new, and once C_new commits the
+change is done. Poll `GET /cluster/config` until `joint` is `false`.
+
+**Adding a server, end to end:**
+
+1. Start the new node with the **existing** cluster's `-peers` list — the three
+   current members, not including itself:
+   ```bash
+   ./rosetta -id=node4 -listen=localhost:8083 -http=localhost:9083      -peers=node1:localhost:8080,node2:localhost:8081,node3:localhost:8082
+   ```
+   `config.Validate` rejects a `-peers` list containing the node's own ID, so
+   this is also the only form it accepts. The node comes up holding the existing
+   configuration, in which it is **not** a voter: it will not campaign, and it
+   accepts replication while it waits (§6's "the new server does not vote").
+2. Ask the leader to admit it:
+   ```bash
+   curl -X POST http://localhost:9080/cluster/add \
+     -H 'Content-Type: application/json' \
+     -d '{"node_id":"node4","addr":"localhost:8083"}'
+   ```
+3. Wait for `GET /cluster/config` to report `"joint": false` with `node4` among
+   the voters.
+
+> **Warning:** there is no learner / catch-up phase (KNOWN_ISSUES.md R20). The new
+> server counts towards the quorum from the moment C_old,new reaches a log, so
+> adding one whose log is far behind slows commits until it catches up. Add
+> servers when the cluster is healthy, not while it is already down a node.
+
+---
+
+### 8. Remove a Server from the Cluster
+
+**Endpoint:** `POST /cluster/remove`
+
+**Request:**
+```json
+{
+  "node_id": "node2"
+}
+```
+
+**Response:** the same shape as `/cluster/add`.
+
+Removing the current leader is allowed. It keeps serving until C_new commits —
+it is the only server that can get C_new committed — and steps down immediately
+afterwards, at which point the remaining servers elect a leader among
+themselves. Shut the removed process down once `GET /cluster/config` no longer
+lists it.
+
+The last remaining voter cannot be removed (400).
+
+---
+
+### 9. Current Cluster Configuration
+
+**Endpoint:** `GET /cluster/config`
+
+**Response:**
+```json
+{
+  "success": true,
+  "config": {
+    "joint": false,
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082" }
+  }
+}
+```
+
+Answered by **any** node, leader or not. A configuration takes effect as soon as
+its entry reaches a log, so what a follower reports is meaningful: it is the
+configuration that follower is itself using. `old_voters` is present only while
+`joint` is `true`.
+
+> These three endpoints are unrelated to the `/cluster/join`, `/cluster/leave`
+> and `/cluster/nodes` routes in `network/discovery.go`. Those are HTTP-level
+> bookkeeping that the Raft quorum never sees, are not served on a normal
+> startup, and are not part of this API. The `-join` flag remains rejected
+> (KNOWN_ISSUES.md R12): joining is something the leader grants, not something a
+> joining node can assert about itself.
+
+---
+
 ## Error Handling
 
 ### Common Error Codes
@@ -273,8 +391,15 @@ with 400 regardless of how it got there. See ../KNOWN_ISSUES.md (R11, fixed).
 | 404 | Not Found | Key doesn't exist (GET only) |
 | 405 | Method Not Allowed | Unsupported HTTP method on `/kv` |
 | 500 | Internal Server Error | Operation timeout (5s), leadership lost, internal failure |
+| 409 | Conflict | A membership change is already in progress, or the leader has not yet committed an entry in its own term (`/cluster/add`, `/cluster/remove`) |
 | 501 | Not Implemented | `/kv/batch` (any method) — see "Batch Endpoint" above |
 | 503 | Service Unavailable | Node is not leader |
+
+The membership endpoints return JSON error bodies of the shape
+`{"success":false,"error":"..."}`, like the 501 batch rejection. A membership
+request that does not make sense against the current configuration (adding a
+server that is already a voter at that address, removing one that is not a
+voter, removing the last voter) is a 400.
 
 All error bodies are plain text, not JSON, **except** the 501 batch rejection,
 which is JSON — see "Batch Endpoint" above.
