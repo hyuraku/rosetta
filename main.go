@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"rosetta/config"
 	"rosetta/kvstore"
@@ -26,6 +28,9 @@ const (
 	kvPath = "/kv"
 	// minPeerParts is the minimum number of colon-separated fields in a peer spec (id:addr).
 	minPeerParts = 2
+	// httpShutdownTimeout bounds how long a graceful shutdown waits for the
+	// client API's in-flight handlers before the rest of the stack is torn down.
+	httpShutdownTimeout = 5 * time.Second
 )
 
 type HTTPServer struct {
@@ -61,6 +66,14 @@ func NewHTTPServer(kvs *kvstore.KVStore, raftNode *raft.RaftNode, cfg *config.Co
 func (hs *HTTPServer) Start() error {
 	log.Printf("Starting HTTP server on %s", hs.config.HTTPServerAddr)
 	return hs.server.ListenAndServe()
+}
+
+// Shutdown stops accepting client requests and waits for the handlers that are
+// already running to finish, or for ctx to expire. It must complete before the
+// Raft node is killed: a GET in flight is inside ReadIndex or waiting for the
+// state machine to catch up, and both of those need the node still alive.
+func (hs *HTTPServer) Shutdown(ctx context.Context) error {
+	return hs.server.Shutdown(ctx)
 }
 
 func (hs *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +239,41 @@ func resolveConfig(configFile, nodeID, listenAddr, httpAddr, peers string) *conf
 	return cfg
 }
 
+// shutdown tears the node down from the outside in. Each step is only safe once
+// the one above it has stopped producing work for it (KNOWN_ISSUES.md R19):
+//
+//  1. the client API, so no new reads/writes enter and the in-flight ones finish
+//     while Raft and the state machine are still up — a GET in flight is inside
+//     ReadIndex or waiting for the state machine to catch up;
+//  2. inbound Raft RPCs — http.Server.Shutdown waits for the handlers already
+//     inside AppendEntries/InstallSnapshot, so none is left mid-handler;
+//  3. the Raft node, whose Kill joins its own goroutines, including the applier
+//     that is the only sender on applyCh;
+//  4. the state machine, which closes applyCh. Closing it any earlier is the
+//     "send on closed channel" panic this order exists to prevent.
+func shutdown(
+	httpServer *HTTPServer,
+	transport *network.HTTPTransport,
+	raftNode *raft.RaftNode,
+	kvs *kvstore.KVStore,
+	clusterManager *network.ClusterManager,
+) {
+	clusterManager.LeaveCluster()
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), httpShutdownTimeout)
+	defer cancelShutdown()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP API shutdown: %v", err)
+	}
+
+	if err := transport.Stop(); err != nil {
+		log.Printf("Raft transport shutdown: %v", err)
+	}
+
+	raftNode.Kill()
+	kvs.Close()
+}
+
 // verifyDurableState compares the two files this node recovers from before any
 // of them is opened for real.
 //
@@ -333,10 +381,7 @@ func main() {
 	<-sigCh
 	log.Println("Shutting down...")
 
-	clusterManager.LeaveCluster()
-	raftNode.Kill()
-	_ = transport.Stop()
-	kvs.Close()
+	shutdown(httpServer, transport, raftNode, kvs, clusterManager)
 
 	log.Println("Shutdown complete")
 }

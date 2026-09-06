@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-06 against commit `3018c96`
+> 最終検証: 2026-09-06 against commit `980f43d`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -12,14 +12,14 @@
 | ログ複製 (Section 5.3) | ⚠️ 要修正あり | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）は完了。ただし境界 term 検査・commit 上限の一部分岐が未検証（R13、`raft/rpc.go:153-163,191-194`） |
 | 安全性保証 (Section 5.4) | ⚠️ 要修正あり | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。State Machine Safety の R3–R5（snapshot の世代整合・古い snapshot の適用）も解消（`0695b95` / `f53617e` / `156510a`）。E2（送信エントリの backing array 共有）も送信前コピーで解消（`7e3eb61`）。残る懸念は R13（境界 term 検査・commit 上限の未検証分岐） |
 | 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`appendEntryLocked` 経由の `AppendLogEntry`/`Start`/当選時 no-op、`TruncateLogAfter`）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。AppendEntries 受信経路の未永続 merge も persist 失敗時にロールバックするようになった（R2 解消・commit `c362ae4`）。InstallSnapshot 受信経路と `TruncateLogTo` も同じロールバック規律に揃えた（R3 解消・commit `0695b95`）。加えて raft_state.json と snapshot.json の世代整合を起動時に検証し、復旧不能な組み合わせでは起動を拒否する |
-| ログコンパクション (Section 7) | ⚠️ 要修正あり（liveness のみ） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）、受信側の §7 保持ルール（A7・`019d33e`）に加え、2026-09-06 再監査の 3 件も解消: 受信経路の世代整合と起動時検証（R3・`0695b95`）、メタデータとペイロードの同一世代化（R4・`f53617e`）、古い snapshot の適用禁止（R5・`156510a`）。安全性の未修正項目はない。B3（`rs.mu` 保持下での payload 書き込みと `applyCh` 送信、liveness）と R15（chunk 転送なし）が残る |
+| ログコンパクション (Section 7) | ⚠️ 要修正あり（chunk 転送のみ） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）、受信側の §7 保持ルール（A7・`019d33e`）に加え、2026-09-06 再監査の 3 件も解消: 受信経路の世代整合と起動時検証（R3・`0695b95`）、メタデータとペイロードの同一世代化（R4・`f53617e`）、古い snapshot の適用禁止（R5・`156510a`）。安全性の未修正項目はない。B3（`rs.mu` 保持下での `applyCh` 送信、liveness）も専用 applier goroutine への分離で解消した（`f873d9b`）。残るのは R15（chunk 転送なし） |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応（R14）。`-join` は失敗してもログのみで起動を続ける fail-open（R12） |
 | クライアント相互作用 (Section 8) | ⚠️ 条件付きで配線済み | 重複検知（ClientID/SeqNum）を実 API 経路へ配線（D4 解消・commit `52afd48`）。ただし dedup は `ClientID` を指定した場合のみ発動する条件付きで（`kvstore/store.go:386`）、無条件の at-most-once ではない。committed 済みの結果解決は log index ではなく opID ベースで、pending 登録のタイミング競合（R9）がある。batch API は実装されておらず空 PUT として黙って成功する（R11） |
 | 読み取り専用クエリ最適化 | ✅ 線形化実装 | ReadIndex プロトコル + 当選時 no-op で linearizable read を実装。旧リース方式は撤去（D1〜D3 解消） |
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID、R19 以降はその修正作業中に見つかった ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: B3（InstallSnapshot が rs.mu 保持のまま payload 書き込みと applyCh 送信を行う = liveness）に加え、グループ R のうち R9–R16, R18, R19（計 10 件）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。ただし R13（AppendEntries の境界 term 検査・commit 上限）のように安全性に触れうる未修正項目が残るため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: グループ R のうち R9–R16, R18（計 9 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。ただし R13（AppendEntries の境界 term 検査・commit 上限）のように安全性に触れうる未修正項目が残るため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -219,7 +219,7 @@ type Persister interface {
 
 ---
 
-### 5. ログコンパクション / スナップショット (Section 7) ⚠️ 要修正あり（B3 の liveness、R15 の chunk 転送）
+### 5. ログコンパクション / スナップショット (Section 7) ⚠️ 要修正あり（R15 の chunk 転送）
 
 #### 論文の要件
 - スナップショットで状態機械の状態をキャプチャ
@@ -277,7 +277,7 @@ see ../KNOWN_ISSUES.md (A1〜A8)。2026-09-06 再監査分の解消状況:
 - **R3（✅ 解消・`0695b95`）Raft state と KV snapshot の世代整合**: 受信ハンドラは「①KV payload を `Snapshotter.InstallSnapshot` で durable 化 → ②Raft 境界を persist → ③`applyCh` でメモリ適用」の順序不変条件を守ります（`RaftState.InstallSnapshot` の doc comment に明記）。2 ファイル間の atomicity は依然ありませんが、この順序により crash は必ず「snapshot が Raft より新しい」復旧可能な側に倒れます。①②いずれの失敗でもメモリはロールバックされ、`ApplyMsg.SnapshotPersisted` で KV 側の二重書きを抑止します。起動時は `persistence.VerifySnapshotConsistency` が復旧不能な組み合わせ（Raft 境界 > snapshot）で起動を拒否します
 - **R4（✅ 解消・`f53617e`）snapshot メタデータとペイロードの同一世代化**: `Snapshotter.ReadSnapshot` が `*raft.SnapshotData`（index/term/data）の immutable envelope を返し、`sendSnapshotToPeer` は `InstallSnapshotArgs` と follower の `MatchIndex`/`NextIndex` をその envelope だけから組み立てます。ロック内で読んだ境界は「snapshot を送るべきか」の判定にのみ使います
 - **R5（✅ 解消・`156510a`）古い snapshot による状態の後退**: Raft 側は `args.LastIncludedIndex <= volatile.LastApplied` の snapshot を無視し（term 更新と election timer reset は有効な leader 通信として行う）、KV 側 `installSnapshotFromApplyMsg` も `msg.SnapshotIndex <= lastAppliedIndex` を無視する単調性ガードを持ちます
-- B3（受信ハンドラが `rs.mu` 保持のまま payload を書き、`applyCh` へブロッキング送信する）は安全性ではなく liveness の課題として残ります。R15（chunk 転送なし）も未実装です
+- **B3（✅ 解消・`f873d9b`）受信ハンドラのブロッキング送信**: ③のメモリ適用は専用の applier goroutine に引き渡すだけになり、`rs.mu` を保持したまま state machine を待つことはなくなりました。①②は従来どおりハンドラ内で、この順序のまま完了します。R15（chunk 転送なし）は未実装のまま残ります
 
 なお `MaxRaftState=0`（圧縮無効）は設定として指定できません（`Config.Validate` が正数を強制）。詳細は KNOWN_ISSUES.md グループ R を参照。
 
@@ -372,7 +372,7 @@ type KVStore struct {
 - クライアント側（`kvstore/client.go`）は `seqNum` を採番した後に送信 mutex を解放するため（`:80-91`）、並行呼び出しの到着順を保証しません。また timeout やネットワークエラー時に操作が実際に適用されたかどうかを呼び出し元に伝える契約がありません（R10）
 - `Client.Batch`（`kvstore/client.go:216-240`）が送る `POST /kv/batch` に対応するサーバー側ルートは存在せず、`/kv/` prefix ハンドラで空 PUT として処理され `success:true` を返します。batch は実装されていません（R11）
 
-このため、論文 Section 8 の重複検知要件は「ClientID を指定した場合の at-most-once」という条件付きで実 API 経路に配線されています。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。本プロジェクトは教育用途であり、B3 に加え R9〜R11 が残る点は変わりません。
+このため、論文 Section 8 の重複検知要件は「ClientID を指定した場合の at-most-once」という条件付きで実 API 経路に配線されています。読み取りは §8 の linearizability を ReadIndex で満たします（上記「8. 読み取り専用クエリ最適化」）。本プロジェクトは教育用途であり、R9〜R11 が残る点は変わりません。
 
 ---
 
@@ -413,7 +413,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 - リース方式にあったクロック依存・過半数喪失時の step-down 欠如がなくなりました。孤立した旧リーダーは `confirmLeadership` が過半数 ACK を得られず `ErrLeadershipNotConfirmed` を返し、stale 値を返しません。より高い term を見たら `stepDown` します。D1/D2 解消（commit `b3b21a4`）。see ../KNOWN_ISSUES.md (D1, D2)
 - 当選時 no-op（`becomeLeader`）により、新リーダーは前任 term のコミット済みエントリを advance してから読みを許可します。D3 解消（commit `60fd631`）。see ../KNOWN_ISSUES.md (D3)
 
-**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、B3（liveness）の未修正項目が残る点は変わりません。
+**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、グループ R の未修正項目（R9–R16, R18）が残る点は変わりません。
 
 ---
 
@@ -436,7 +436,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 3. ✅ 完了 — R1（`Start` の leader 判定と append の原子化、`2c26b9a`）、R2（未永続 merge のロールバックによる durable ACK、`c362ae4`）
 4. ✅ 完了 — R3（世代整合・順序不変条件・起動時検証、`0695b95`）、R4（payload/metadata の同一世代化、`f53617e`）、R5（古い snapshot の適用禁止、`156510a`）
 5. ✅ 完了 — R6（`becomeFollowerLocked` への降格統一、`ac93fcb`）、E1（選挙タイマーの mutex 統一、`c5fdc0f`）、E2（送信エントリのコピー、`7e3eb61`）、peer 単位の送信直列化と `MatchIndex`/`NextIndex` の単調化（`499c4b8`）
-6. B3（受信ハンドラの `rs.mu` 保持下での payload 書き込みとブロッキング送信）の ordered applier と shutdown lifecycle。R19（`Kill` が goroutine の終了を待たない）も同時に
+6. ✅ 完了 — B3 の ordered applier（`f873d9b`）と shutdown lifecycle（R19: `Kill` が自分の起動した goroutine を join し、`main.go` は HTTP API → transport → Kill → `kvs.Close()` の順で停止。`7c96f14` / `13570d5`）
 7. R9–R13（KV/client/API/RPC 細部） — P1
 8. R15（chunk transfer） — P2
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順） — P2

@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-09-06 against commit `2a85ced`.
+> Last verified: 2026-09-06 against commit `980f43d`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -302,9 +302,10 @@ The check lives in `persistence` rather than in `raft` or `kvstore` because thos
 two are constructed independently in tests; only the caller that owns the shared
 `Storage` sees both files.
 
-Anything that moves the `applyCh` send off the handler goroutine — the eventual
-fix for B3 — must keep steps 1 and 2 in that order before the snapshot reaches
-the applier.
+Moving the `applyCh` send off the handler goroutine (B3, `f873d9b`) kept steps 1
+and 2 exactly where they were: both still complete, in that order, under the
+handler's own `rs.mu` acquisition, and only then is the snapshot queued for the
+applier. Anything that touches this path again must preserve that.
 
 ### Testing Recovery
 
@@ -405,8 +406,9 @@ chmod 600 ./data/node1/*
   `raft.Snapshotter` (`persistence.NewRaftSnapshotter`), so a leader with a
   compacted log does send InstallSnapshot to lagging followers (A6, fixed). The
   snapshot it ships is one immutable `(index, term, data)` envelope read from a
-  single `snapshot.json` load (R4, fixed). See `docs/log-compaction.md` for what
-  is still open on this path (B3).
+  single `snapshot.json` load (R4, fixed). The receive path no longer blocks on
+  the state machine either (B3, fixed). What is still open on this path is
+  chunked transfer (R15) — see `docs/log-compaction.md`.
 
 ## Future Enhancements
 
@@ -452,7 +454,7 @@ fixed, and so are the three snapshot-path findings of the 2026-09-06 re-audit:
 generation-consistent persistence with a fail-closed startup check (R3), a single
 immutable envelope on the send path (R4), and monotonicity guards on both
 receivers (R5). The two files are still written separately — the guarantee comes
-from their order and from the startup check, not from cross-file atomicity — and
-the receive path still holds `rs.mu` across both the payload write and the
-`applyCh` send, which is a liveness problem (B3). See ../KNOWN_ISSUES.md before
+from their order and from the startup check, not from cross-file atomicity — but
+the receive path no longer holds `rs.mu` across the `applyCh` send, so a slow
+state machine cannot stall the node (B3, fixed). See ../KNOWN_ISSUES.md before
 relying on recovery in compaction scenarios.

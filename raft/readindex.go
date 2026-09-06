@@ -105,7 +105,11 @@ func (rs *RaftState) confirmLeadership(
 	// Buffered so no goroutine leaks if we return after reaching quorum early.
 	results := make(chan int, len(peers))
 	for _, peer := range peers {
-		go func(peer string) {
+		// Spawned through rs.spawn so Kill waits for these heartbeats
+		// (KNOWN_ISSUES.md R19). A refused spawn means shutdown has begun; it
+		// still has to answer for its slot in results, or the loop below would
+		// wait for a reply that is never coming.
+		started := rs.spawn(func() {
 			args := &AppendEntriesArgs{
 				Term:         currentTerm,
 				LeaderID:     rs.nodeID,
@@ -122,7 +126,10 @@ func (rs *RaftState) confirmLeadership(
 				return
 			}
 			results <- reply.Term
-		}(peer)
+		})
+		if !started {
+			results <- -1
+		}
 	}
 
 	acks := 1 // count ourselves

@@ -238,39 +238,6 @@ func (rs *RaftState) UpdateCommitIndex(leaderCommit int) {
 	newCommitIndex := min(leaderCommit, rs.lastAbsLogIndex())
 	if newCommitIndex > rs.volatile.CommitIndex {
 		rs.volatile.CommitIndex = newCommitIndex
-		rs.applyEntries()
-	}
-}
-
-func (rs *RaftState) applyEntries() {
-	for rs.volatile.LastApplied < rs.volatile.CommitIndex {
-		next := rs.volatile.LastApplied + 1
-		pos := rs.slicePos(next)
-		if pos < 0 || pos >= len(rs.persistent.Log) {
-			// The next entry to apply has been compacted away or is not yet
-			// present. This can only happen if LastApplied lags behind the
-			// snapshot boundary; refuse to index out of range and stop.
-			rs.logger.Printf("applyEntries: index %d outside live log (lastIncluded=%d, logLen=%d), stopping",
-				next, rs.persistent.LastIncludedIndex, len(rs.persistent.Log))
-			return
-		}
-		rs.volatile.LastApplied = next
-		entry := rs.persistent.Log[pos]
-
-		applyMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      entry.Command,
-			CommandIndex: next,
-			CommandTerm:  entry.Term,
-		}
-
-		// Block until the state machine consumes the entry. Dropping the
-		// message here (as a non-blocking send with a default case would)
-		// while LastApplied has already advanced would permanently skip a
-		// committed entry, violating the Raft state-machine safety property.
-		// The consumer (kvstore applyLoop) never acquires rs.mu synchronously,
-		// so this send always drains and cannot deadlock. This mirrors the
-		// blocking send already used on the InstallSnapshot apply path.
-		rs.applyCh <- applyMsg
+		rs.notifyApplierLocked()
 	}
 }
