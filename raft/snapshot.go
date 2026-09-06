@@ -5,7 +5,16 @@ import (
 	"log"
 )
 
-// SnapshotData represents a snapshot of the state machine
+// SnapshotData is one snapshot generation: the payload together with the log
+// position it was taken at. The three fields belong to each other and must
+// travel as a unit — the InstallSnapshot RPC promises the receiver that Data is
+// the state machine as of (LastIncludedIndex, LastIncludedTerm), and a receiver
+// that installs a payload under someone else's boundary corrupts its state
+// machine silently (KNOWN_ISSUES.md R4).
+//
+// Treat a *SnapshotData as immutable once returned: producers hand out a value
+// that no longer aliases their own storage, and consumers must not write to
+// Data.
 type SnapshotData struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
@@ -17,13 +26,19 @@ type Snapshotter interface {
 	// CreateSnapshot creates a snapshot of the state machine up to the given index
 	CreateSnapshot(lastIncludedIndex, lastIncludedTerm int) ([]byte, error)
 
-	// InstallSnapshot installs a snapshot into the state machine
+	// InstallSnapshot durably stores a snapshot received from a leader. On the
+	// InstallSnapshot receive path this is what makes the state machine payload
+	// durable, and it must succeed before the Raft snapshot boundary is
+	// persisted (see the ordering invariant on RaftState.InstallSnapshot).
 	InstallSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm int) error
 
-	// ReadSnapshot returns the current persisted snapshot bytes.
-	// The leader calls this when sending InstallSnapshot RPC to a lagging follower.
+	// ReadSnapshot returns the current persisted snapshot as a single immutable
+	// (index, term, data) envelope. The leader calls this when sending an
+	// InstallSnapshot RPC to a lagging follower and takes the RPC's
+	// LastIncludedIndex/LastIncludedTerm from the returned value, never from a
+	// separately sampled copy of the Raft boundary.
 	// Returns (nil, nil) when no snapshot has been taken yet.
-	ReadSnapshot() ([]byte, error)
+	ReadSnapshot() (*SnapshotData, error)
 }
 
 // TakeSnapshot creates a snapshot and truncates the log

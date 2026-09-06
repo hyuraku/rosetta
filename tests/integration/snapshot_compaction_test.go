@@ -34,7 +34,9 @@ func (f *fakeSnapshotter) InstallSnapshot(data []byte, idx, term int) error {
 	return nil
 }
 
-func (f *fakeSnapshotter) ReadSnapshot() ([]byte, error) {
+// ReadSnapshot returns the payload and the boundary it was seeded at as one
+// envelope, mirroring the production RaftSnapshotter (KNOWN_ISSUES.md R4).
+func (f *fakeSnapshotter) ReadSnapshot() (*raft.SnapshotData, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.data == nil {
@@ -42,7 +44,11 @@ func (f *fakeSnapshotter) ReadSnapshot() ([]byte, error) {
 	}
 	out := make([]byte, len(f.data))
 	copy(out, f.data)
-	return out, nil
+	return &raft.SnapshotData{
+		LastIncludedIndex: f.lastIncludedIndex,
+		LastIncludedTerm:  f.lastIncludedTerm,
+		Data:              out,
+	}, nil
 }
 
 func (f *fakeSnapshotter) snapshot() []byte {
@@ -120,10 +126,17 @@ func TestInstallSnapshotCatchUp(t *testing.T) {
 	//    In production kvstore would persist a snapshot first; here we seed
 	//    the snapshotter directly, then call TriggerSnapshot to truncate.
 	compactUpTo := numCmds - 5 // keep last 5 entries in the live log
+	// Seed the snapshot at the real term of the boundary entry: the leader now
+	// ships the envelope's own (index, term) rather than re-reading its raft
+	// boundary, so a wrong term here would be a wrong term on the wire (R4).
+	boundaryEntry := leader.GetRaftState().GetLogEntry(compactUpTo)
+	if boundaryEntry == nil {
+		t.Fatalf("leader has no log entry at index %d to compact to", compactUpTo)
+	}
 	snapshotters[leaderID].seed(
 		[]byte(fmt.Sprintf("kv-snapshot-up-to-%d", compactUpTo)),
 		compactUpTo,
-		1, // term will be 1 in a quiet cluster; not strictly checked
+		boundaryEntry.Term,
 	)
 	leader.TriggerSnapshot(compactUpTo)
 	time.Sleep(200 * time.Millisecond) // wait for async TruncateLogTo

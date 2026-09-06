@@ -433,7 +433,11 @@ func (rs *RaftState) replicateToPeer(
 	rs.mu.RUnlock()
 
 	if sendSnapshot {
-		rs.sendSnapshotToPeer(transport, peerID, currentTerm, lastIncludedIndex, lastIncludedTerm, snapshotter)
+		// Only nextIndex is carried across: it says what the follower still
+		// needs. The boundary we sampled under the lock must not become the
+		// RPC's LastIncludedIndex/LastIncludedTerm — those come from the
+		// snapshot envelope itself (KNOWN_ISSUES.md R4).
+		rs.sendSnapshotToPeer(transport, peerID, currentTerm, nextIndex, snapshotter)
 		return
 	}
 
@@ -516,26 +520,45 @@ func (rs *RaftState) handleReplicationConflict(peerID string, reply *AppendEntri
 // sendSnapshotToPeer ships the current snapshot to a follower whose required
 // entries have been compacted away, then advances that follower's match/next
 // index on success. Intended to run in its own goroutine.
+//
+// nextIndex is the follower's nextIndex as sampled by replicateToPeer; it is
+// used only to decide whether the snapshot we can actually read is new enough
+// to help. Everything the RPC asserts about the snapshot — its index, its term
+// and its bytes — comes from the single envelope returned by ReadSnapshot.
+// Sampling the boundary under rs.mu and the payload outside it (the previous
+// behavior) let a concurrent compaction or InstallSnapshot rewrite snapshot.json
+// in between, so the follower could be told that generation B's bytes belonged
+// at generation A's (index, term) — a state machine silently installed under
+// the wrong log position (KNOWN_ISSUES.md R4).
 func (rs *RaftState) sendSnapshotToPeer(
 	transport RPCTransport,
 	peerID string,
-	currentTerm, lastIncludedIndex, lastIncludedTerm int,
+	currentTerm, nextIndex int,
 	snapshotter Snapshotter,
 ) {
 	if snapshotter == nil {
 		// Log compaction not wired up; nothing to send.
 		return
 	}
-	data, err := snapshotter.ReadSnapshot()
-	if err != nil || data == nil {
+	snapshot, err := snapshotter.ReadSnapshot()
+	if err != nil || snapshot == nil {
+		return
+	}
+	// A snapshot that ends before the entry this follower already has cannot
+	// move it forward, and installing it would drag its match index backwards.
+	// This means our own snapshot file is behind the boundary we compacted to,
+	// so wait for the next generation rather than shipping a useless payload.
+	if snapshot.LastIncludedIndex < nextIndex-1 {
+		rs.logger.Printf("sendSnapshotToPeer: snapshot at index %d is older than %s's nextIndex %d; not sending",
+			snapshot.LastIncludedIndex, peerID, nextIndex)
 		return
 	}
 	snapArgs := &InstallSnapshotArgs{
 		Term:              currentTerm,
 		LeaderID:          rs.nodeID,
-		LastIncludedIndex: lastIncludedIndex,
-		LastIncludedTerm:  lastIncludedTerm,
-		Data:              data,
+		LastIncludedIndex: snapshot.LastIncludedIndex,
+		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		Data:              snapshot.Data,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), installSnapshotTimeout)
 	defer cancel()
@@ -559,9 +582,11 @@ func (rs *RaftState) sendSnapshotToPeer(
 	if rs.state != Leader || rs.persistent.CurrentTerm != currentTerm {
 		return
 	}
-	// Follower has now installed the snapshot up to lastIncludedIndex.
-	rs.leader.MatchIndex[peerID] = lastIncludedIndex
-	rs.leader.NextIndex[peerID] = lastIncludedIndex + 1
+	// Follower has now installed the snapshot we actually shipped, so its match
+	// index follows that envelope's boundary — not the boundary we happened to
+	// read from our own state before the send.
+	rs.leader.MatchIndex[peerID] = snapshot.LastIncludedIndex
+	rs.leader.NextIndex[peerID] = snapshot.LastIncludedIndex + 1
 }
 
 func (rs *RaftState) updateCommitIndex() {
