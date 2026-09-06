@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-06 against commit `bde6619`
+> 最終検証: 2026-09-06 against commit `c6ee4b4`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -12,14 +12,14 @@
 | ログ複製 (Section 5.3) | ✅ 実装済み | step 3 の conflict ベース切り詰め（B2 解消・commit `7151e77`）、受信側の圧縮後 index 対応（A1 解消・commit `8ad5367`）に加え、境界 term 検査・commit 上限の未検証分岐も解消（R13・`f0b0ba9`/`4d81414`/`ae33b52`/`87234ad`） |
 | 安全性保証 (Section 5.4) | ✅ 実装済み | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。State Machine Safety の R3–R5（snapshot の世代整合・古い snapshot の適用）も解消（`0695b95` / `f53617e` / `156510a`）。E2（送信エントリの backing array 共有）も送信前コピーで解消（`7e3eb61`）。境界 term 検査・commit 上限（R13）も解消し、AppendEntries 側の未検証分岐は残っていない |
 | 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`appendEntryLocked` 経由の `AppendLogEntry`/`Start`/当選時 no-op、`TruncateLogAfter`）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。AppendEntries 受信経路の未永続 merge も persist 失敗時にロールバックするようになった（R2 解消・commit `c362ae4`）。InstallSnapshot 受信経路と `TruncateLogTo` も同じロールバック規律に揃えた（R3 解消・commit `0695b95`）。加えて raft_state.json と snapshot.json の世代整合を起動時に検証し、復旧不能な組み合わせでは起動を拒否する |
-| ログコンパクション (Section 7) | ⚠️ 要修正あり（chunk 転送のみ） | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）、受信側の §7 保持ルール（A7・`019d33e`）に加え、2026-09-06 再監査の 3 件も解消: 受信経路の世代整合と起動時検証（R3・`0695b95`）、メタデータとペイロードの同一世代化（R4・`f53617e`）、古い snapshot の適用禁止（R5・`156510a`）。安全性の未修正項目はない。B3（`rs.mu` 保持下での `applyCh` 送信、liveness）も専用 applier goroutine への分離で解消した（`f873d9b`）。残るのは R15（chunk 転送なし） |
+| ログコンパクション (Section 7) | ✅ 実装済み | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）、受信側の §7 保持ルール（A7・`019d33e`）に加え、2026-09-06 再監査の 3 件も解消: 受信経路の世代整合と起動時検証（R3・`0695b95`）、メタデータとペイロードの同一世代化（R4・`f53617e`）、古い snapshot の適用禁止（R5・`156510a`）。安全性の未修正項目はない。B3（`rs.mu` 保持下での `applyCh` 送信、liveness）も専用 applier goroutine への分離で解消した（`f873d9b`）。R15（chunk 転送）も解消し、snapshot は `snapshotChunkSize`（既定 64 KiB）ごとの chunk で送られ、受信側は done まで何も変更しない（`c8c87d0`/`3ad0220`/`b3fbdbb`）。ただし両端のピークメモリは従来どおり payload 1 本分で、chunk 化が抑えるのは 1 RPC のサイズと所要時間 |
 | クラスタメンバーシップ変更 (Section 6) | ❌ 未実装 | Joint consensus未対応（R14）。`-join` は非空値を渡すと起動を拒否する fail-closed に変更済み（R12 解消・commit `9d411ba`）だが、Raft レイヤーでの安全なメンバーシップ変更そのものは依然未実装 |
 | クライアント相互作用 (Section 8) | ⚠️ 条件付きで配線済み | 重複検知（ClientID/SeqNum）を実 API 経路へ配線（D4 解消・commit `52afd48`）。ただし dedup は `ClientID` を指定した場合のみ発動する条件付きで（`kvstore/store.go:386`）、無条件の at-most-once ではない。committed 済みの結果解決の pending 登録タイミング競合（R9・commit `29bf047`）と client 側の並行書き込み・結果不明契約（R10・commit `73e744f`）は解消済み。batch API は未実装として明示的に 501/`ErrBatchNotImplemented` を返すようになった（R11 解消・commit `e71926a`） |
 | 読み取り専用クエリ最適化 | ✅ 線形化実装 | ReadIndex プロトコル + 当選時 no-op で linearizable read を実装。旧リース方式は撤去（D1〜D3 解消） |
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID、R19 以降はその修正作業中に見つかった ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: グループ R のうち R14–R16, R18（計 4 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）も解消した。ただし R14（joint consensus）や R15（chunk 転送）など残る項目があるため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: グループ R のうち R14, R16, R18（計 3 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）と、InstallSnapshot の chunk 転送（R15・`c8c87d0` / `3ad0220` / `b3fbdbb`）も解消した。ただし R14（joint consensus）など残る項目があるため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -220,7 +220,7 @@ type Persister interface {
 
 ---
 
-### 5. ログコンパクション / スナップショット (Section 7) ⚠️ 要修正あり（R15 の chunk 転送）
+### 5. ログコンパクション / スナップショット (Section 7) ✅ 実装済み
 
 #### 論文の要件
 - スナップショットで状態機械の状態をキャプチャ
@@ -231,13 +231,20 @@ type Persister interface {
 **ファイル**: `raft/snapshot.go`, `raft/rpc.go`
 
 ```go
-// raft/rpc.go:41-47 - InstallSnapshot RPC
+// raft/rpc.go - InstallSnapshot RPC（論文 §7 Figure 13 の引数一式）
 type InstallSnapshotArgs struct {
     Term              int    // リーダーの任期
     LeaderID          string
     LastIncludedIndex int    // スナップショットに含まれる最後のインデックス
     LastIncludedTerm  int    // そのエントリの任期
-    Data              []byte // スナップショットデータ
+    Offset            int    // この chunk が payload 全体のどこから始まるか
+    Data              []byte // payload 全体ではなく、この chunk 分のバイト列
+    Done              bool   // 最終 chunk かどうか
+}
+
+type InstallSnapshotReply struct {
+    Term   int
+    Offset int // 受信側が次に期待する offset
 }
 
 // raft/snapshot.go - スナップショット関連メソッド
@@ -278,7 +285,8 @@ see ../KNOWN_ISSUES.md (A1〜A8)。2026-09-06 再監査分の解消状況:
 - **R3（✅ 解消・`0695b95`）Raft state と KV snapshot の世代整合**: 受信ハンドラは「①KV payload を `Snapshotter.InstallSnapshot` で durable 化 → ②Raft 境界を persist → ③`applyCh` でメモリ適用」の順序不変条件を守ります（`RaftState.InstallSnapshot` の doc comment に明記）。2 ファイル間の atomicity は依然ありませんが、この順序により crash は必ず「snapshot が Raft より新しい」復旧可能な側に倒れます。①②いずれの失敗でもメモリはロールバックされ、`ApplyMsg.SnapshotPersisted` で KV 側の二重書きを抑止します。起動時は `persistence.VerifySnapshotConsistency` が復旧不能な組み合わせ（Raft 境界 > snapshot）で起動を拒否します
 - **R4（✅ 解消・`f53617e`）snapshot メタデータとペイロードの同一世代化**: `Snapshotter.ReadSnapshot` が `*raft.SnapshotData`（index/term/data）の immutable envelope を返し、`sendSnapshotToPeer` は `InstallSnapshotArgs` と follower の `MatchIndex`/`NextIndex` をその envelope だけから組み立てます。ロック内で読んだ境界は「snapshot を送るべきか」の判定にのみ使います
 - **R5（✅ 解消・`156510a`）古い snapshot による状態の後退**: Raft 側は `args.LastIncludedIndex <= volatile.LastApplied` の snapshot を無視し（term 更新と election timer reset は有効な leader 通信として行う）、KV 側 `installSnapshotFromApplyMsg` も `msg.SnapshotIndex <= lastAppliedIndex` を無視する単調性ガードを持ちます
-- **B3（✅ 解消・`f873d9b`）受信ハンドラのブロッキング送信**: ③のメモリ適用は専用の applier goroutine に引き渡すだけになり、`rs.mu` を保持したまま state machine を待つことはなくなりました。①②は従来どおりハンドラ内で、この順序のまま完了します。R15（chunk 転送なし）は未実装のまま残ります
+- **B3（✅ 解消・`f873d9b`）受信ハンドラのブロッキング送信**: ③のメモリ適用は専用の applier goroutine に引き渡すだけになり、`rs.mu` を保持したまま state machine を待つことはなくなりました。①②は従来どおりハンドラ内で、この順序のまま完了します
+- **R15（✅ 解消・`c8c87d0` / `3ad0220` / `b3fbdbb`）chunk 転送**: `InstallSnapshotArgs` に `Offset`/`Done` が加わり（`omitempty` なので offset 0・done true の 1 chunk は従来メッセージ相当）、leader は envelope を `snapshotChunkSize`（既定 64 KiB）ごとに分割して送ります。受信側は Figure 13 の受信ルール 2–4 に従い、途中の chunk はメモリ上のバッファに溜めるだけで **done が来るまで Raft 状態・KV・ディスクを一切変更しません**。したがって上の順序不変条件①②③は、組み立て済み payload に対して従来どおり 1 snapshot につき 1 回だけ走ります。中断した転送は途中状態を捨てるだけで後始末が要りません。`installSnapshotTimeout` は 1 chunk あたりの上限になり、chunk 間で停止シグナル・降格・応答 term・期待 offset を確認して中断できます。再開は実装せず、失敗した round は次の tick が offset 0 から envelope を読み直して送り直します。**残る制約**: 受信側は payload 全体をメモリに溜めてから 1 回で atomic write するため、両端のピークメモリは chunk 化では減りません
 
 なお `MaxRaftState=0`（圧縮無効）は設定として指定できません（`Config.Validate` が正数を強制）。詳細は KNOWN_ISSUES.md グループ R を参照。
 
@@ -451,7 +459,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
    `73e744f`）、R11（batch を未実装として拒否、`e71926a`）、R12（`-join` fail-closed・
    peers 検証、`9d411ba`）、R13（AppendEntries の境界 term 検査・commit 上限、
    `f0b0ba9`/`4d81414`/`ae33b52`/`87234ad`） — P1
-8. R15（chunk transfer） — P2
+8. ✅ 完了 — R15（chunk transfer、`c8c87d0` / `3ad0220` / `b3fbdbb`） — P2
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順） — P2
 10. R16、R18（設定、examples/benchmark） — P3
 

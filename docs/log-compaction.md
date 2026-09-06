@@ -1,10 +1,10 @@
 # Log Compaction and Snapshotting
 
-> Last verified: 2026-09-06 against commit `980f43d`.
+> Last verified: 2026-09-06 against commit `c6ee4b4`.
 
 This document describes the log compaction and snapshotting features in Rosetta, which are intended to prevent unbounded log growth and enable efficient operation over long periods.
 
-> **Status**: The index/wiring defects that made compaction unusable are fixed. Absolute-index handling is unified across the receive, vote, commit, and apply paths (A1-A5, `8ad5367`), the snapshotter is wired in the production binary and the V2 snapshot format parses (A6, `d0cbdc1`/`c516f54`), follower-side snapshots are persisted (A8, `c516f54`), and the InstallSnapshot receiver applies the paper's §7 retention rule instead of keeping a divergent suffix (A7, `019d33e`). The three **safety** gaps a 2026-09-06 re-audit (`docs/raft-audit-2026-09-06.md`, frozen) found on this same path are fixed too: the receive path now persists the KV payload before the Raft boundary and startup refuses an unrecoverable pair (R3, `0695b95`); the leader ships one immutable `(index, term, data)` envelope (R4, `f53617e`); and both receivers refuse a snapshot at or below what they have already applied (R5, `156510a`). The **liveness** gap on the same path (B3) is fixed as well (`f873d9b`): the handler still writes the payload under `rs.mu`, but it queues the snapshot for a dedicated applier goroutine instead of sending on `applyCh` with the lock held, so a slow state machine no longer stalls RPCs or the election timer. See ../KNOWN_ISSUES.md.
+> **Status**: The index/wiring defects that made compaction unusable are fixed. Absolute-index handling is unified across the receive, vote, commit, and apply paths (A1-A5, `8ad5367`), the snapshotter is wired in the production binary and the V2 snapshot format parses (A6, `d0cbdc1`/`c516f54`), follower-side snapshots are persisted (A8, `c516f54`), and the InstallSnapshot receiver applies the paper's §7 retention rule instead of keeping a divergent suffix (A7, `019d33e`). The three **safety** gaps a 2026-09-06 re-audit (`docs/raft-audit-2026-09-06.md`, frozen) found on this same path are fixed too: the receive path now persists the KV payload before the Raft boundary and startup refuses an unrecoverable pair (R3, `0695b95`); the leader ships one immutable `(index, term, data)` envelope (R4, `f53617e`); and both receivers refuse a snapshot at or below what they have already applied (R5, `156510a`). The **liveness** gap on the same path (B3) is fixed as well (`f873d9b`): the handler still writes the payload under `rs.mu`, but it queues the snapshot for a dedicated applier goroutine instead of sending on `applyCh` with the lock held, so a slow state machine no longer stalls RPCs or the election timer. Snapshots are now transferred in chunks rather than as one whole-payload RPC (R15, `c8c87d0`/`3ad0220`/`b3fbdbb`) — with the caveats under "Snapshot Transfer" below. See ../KNOWN_ISSUES.md.
 
 ## Overview
 
@@ -97,9 +97,22 @@ type InstallSnapshotArgs struct {
     LeaderID          string
     LastIncludedIndex int
     LastIncludedTerm  int
-    Data              []byte  // Serialized state machine
+    Offset            int     // Where Data belongs in the whole payload
+    Data              []byte  // This chunk's slice of the serialized state machine
+    Done              bool    // Set on the final chunk
+}
+
+type InstallSnapshotReply struct {
+    Term   int
+    Offset int  // The byte position the receiver expects next
 }
 ```
+
+`Offset` and `Done` are `omitempty`, so the single-chunk form (offset 0, done
+true, the whole payload in `Data`) is the pre-chunking message plus
+`"done":true` and behaves exactly as that message did. `Serialize*`/`Deserialize*`
+and the HTTP transport's `sendRPC` are plain JSON round-trips over the whole
+struct, so they needed no changes to carry the new fields.
 
 > **Note**: This RPC used to be dead code in the production binary — the leader-side send path (`sendSnapshotToPeer` in raft/rpc.go) needs a `raft.Snapshotter` and main.go never registered one. `d0cbdc1` wires `persistence.NewRaftSnapshotter` through `raftNode.SetSnapshotter` (main.go:255, 273), so the send fires in production (A6, fixed).
 
@@ -304,6 +317,12 @@ InstallSnapshot RPC is intended to be used when:
 
 > **Note**: `sendSnapshotToPeer` still returns immediately when no snapshotter is registered, but main.go registers one (`raftNode.SetSnapshotter`), so a leader with a compacted log does send to followers behind the boundary (A3, A6, fixed).
 >
+> **Chunked transfer** (R15, fixed in `c8c87d0`/`3ad0220`/`b3fbdbb`): the leader splits the envelope's payload into RPCs of at most `snapshotChunkSize` bytes (64 KiB by default, `raft/state.go`) and sends them in order, marking the last one `Done`. Every chunk names the same `(LastIncludedIndex, LastIncludedTerm)`, so the one-envelope rule (R4) is unaffected by the split. The receiver follows the paper's receiver rules 2-4: offset 0 starts a new (in-memory) buffer, each chunk is appended at its offset, and **nothing about the Raft state, the state machine or either file changes until the chunk carrying `Done` arrives**. A partial transfer is therefore invisible — an abandoned one is discarded by dropping a field, with nothing half-written to repair — and the durability ordering below still runs once per snapshot, over the assembled payload. A chunk that does not continue the buffer is refused and the reply names the offset the receiver expects; the buffer is discarded when the term or the leader changes (`becomeFollowerLocked`) and on `Stop`.
+>
+> `installSnapshotTimeout` (5s) now bounds one chunk rather than a whole transfer, and the leader checks the stop signal, its own role/term, the reply's term and the reply's expected offset between chunks, so a round is abandoned promptly instead of after a timeout. There is no resume: a failed chunk ends the round and the next tick starts again from offset 0 with a freshly read envelope, which may by then be a newer generation. The receiver's offset check is what makes restarting safe — a stray chunk from the abandoned round cannot continue the new one.
+>
+> **What chunking does not fix**: the receiver still buffers the whole payload in memory before installing it (installing must stay one atomic write), and the leader still reads the whole envelope, so peak memory on both sides is unchanged. What is bounded is the size and the duration of a single RPC — and with it how long that peer's in-flight replication slot is held by one message. The slot itself is still held for the whole transfer, so heartbeats to that follower are still paused while a snapshot ships (a PR #26 follow-up, not addressed here).
+>
 > Everything the RPC asserts about the snapshot comes from one envelope (R4, fixed in `f53617e`): `Snapshotter.ReadSnapshot` returns a `*raft.SnapshotData` holding `LastIncludedIndex`, `LastIncludedTerm` and `Data` from a single atomic `snapshot.json` read, and `sendSnapshotToPeer` builds `InstallSnapshotArgs` — and the follower's `MatchIndex`/`NextIndex` on success — from that value alone. The boundary `replicateToPeer` samples under `rs.mu.RLock` is used only to decide *whether* to send a snapshot; `nextIndex` is carried across so a snapshot ending before the entry the follower already has is skipped rather than shipped (it would drag that follower's match index backwards). Previously the boundary came from the sampled state and the bytes from a later, unlocked read, so a compaction in between produced an RPC claiming one generation's boundary for another's payload.
 
 ## Troubleshooting
@@ -336,10 +355,13 @@ Planned improvements:
 
 1. **Compression**: Compress snapshot data
 2. **Incremental Snapshots**: Only save changed data
-3. **Streaming**: Stream large snapshots in chunks. `InstallSnapshotArgs` currently
-   carries the whole snapshot in one `Data []byte` field with no offset/done
-   fields for chunking, resumption, or bounding memory use on large snapshots —
-   see ../KNOWN_ISSUES.md (R15)
+3. **Streaming**: ~~Stream large snapshots in chunks~~ — done (R15,
+   `c8c87d0`/`3ad0220`/`b3fbdbb`); see "Snapshot Transfer" above.
+   What remains of the original idea is bounding *memory*: both ends still hold
+   a whole snapshot payload, because the receiver assembles it before installing
+   it in one atomic write. Streaming it to a temporary file and renaming that
+   into place would remove that, and would also make resumption across a
+   restart possible
 4. **Background Creation**: Async snapshot without blocking
 5. **Configurable Triggers**: Time-based or size-based
 6. **Snapshot Verification**: Checksum validation
@@ -366,7 +388,7 @@ Tests (tests/unit/snapshot_test.go) cover:
 
 ### Integration Tests
 
-`TestInstallSnapshotCatchUp` (tests/integration/snapshot_compaction_test.go) covers leader-side log compaction (`TriggerSnapshot`/`TruncateLogTo`) and snapshot transfer to a late-joining follower, using a mock `raft.Snapshotter`. `tests/integration/snapshot_kvstore_wiring_test.go` covers the production wiring path that the mock used to bypass, and the receiver's §7 retention rule is covered by `TestInstallSnapshotDiscardsDivergentSuffix` and its siblings in raft/installsnapshot_internal_test.go. Automatic snapshot creation through the KV store and recovery from a snapshot after restart are still not covered by integration tests.
+`TestInstallSnapshotCatchUp` (tests/integration/snapshot_compaction_test.go) covers leader-side log compaction (`TriggerSnapshot`/`TruncateLogTo`) and snapshot transfer to a late-joining follower, using a mock `raft.Snapshotter`. `tests/integration/snapshot_kvstore_wiring_test.go` covers the production wiring path that the mock used to bypass, the receiver's §7 retention rule is covered by `TestInstallSnapshotDiscardsDivergentSuffix` and its siblings in raft/installsnapshot_internal_test.go, and chunked transfer is covered from both ends: `raft/snapshotchunks_internal_test.go` (assembly, interruption, term change, offset mismatch, the single-chunk and empty-payload forms) and `raft/sendsnapshot_internal_test.go` (splitting, abandoning a round on a failed chunk, stepping down mid-transfer, stopping on `Kill`). Automatic snapshot creation through the KV store and recovery from a snapshot after restart are still not covered by integration tests.
 
 ## Monitoring Metrics
 
@@ -383,4 +405,4 @@ Key metrics to track:
 
 ## Conclusion
 
-Log compaction through snapshotting is essential for long-term operation of a Raft system, and Rosetta implements it: snapshot persistence, log truncation, the InstallSnapshot RPC, unified absolute indexing, production wiring, follower-side persistence, and the §7 retention rule on the receiver (A1-A8, all fixed). The 2026-09-06 re-audit's three safety findings on this path are fixed as well (R3, R4, R5), and so is the liveness defect: the InstallSnapshot handler queues the snapshot for the applier goroutine rather than sending on `applyCh` under `rs.mu` (B3, `f873d9b`) — see ../KNOWN_ISSUES.md. What is still missing here is chunked transfer (R15). Rosetta is a learning-oriented implementation and is not production-ready.
+Log compaction through snapshotting is essential for long-term operation of a Raft system, and Rosetta implements it: snapshot persistence, log truncation, the InstallSnapshot RPC, unified absolute indexing, production wiring, follower-side persistence, and the §7 retention rule on the receiver (A1-A8, all fixed). The 2026-09-06 re-audit's three safety findings on this path are fixed as well (R3, R4, R5), and so is the liveness defect: the InstallSnapshot handler queues the snapshot for the applier goroutine rather than sending on `applyCh` under `rs.mu` (B3, `f873d9b`) — see ../KNOWN_ISSUES.md. Chunked transfer is implemented too (R15, `c8c87d0`/`3ad0220`/`b3fbdbb`), though it bounds the size of one RPC rather than either end's memory. Rosetta is a learning-oriented implementation and is not production-ready.

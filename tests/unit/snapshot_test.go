@@ -2,6 +2,7 @@ package unit
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,6 +78,7 @@ func TestInstallSnapshotRPC(t *testing.T) {
 		LastIncludedIndex: 10,
 		LastIncludedTerm:  3,
 		Data:              []byte("snapshot data"),
+		Done:              true,
 	}
 
 	var reply raft.InstallSnapshotReply
@@ -123,6 +125,7 @@ func TestInstallSnapshotDiscardsOldSnapshot(t *testing.T) {
 		LastIncludedIndex: 10,
 		LastIncludedTerm:  3,
 		Data:              []byte("snapshot 1"),
+		Done:              true,
 	}
 	var reply1 raft.InstallSnapshotReply
 	rs.InstallSnapshot(args1, &reply1)
@@ -137,6 +140,7 @@ func TestInstallSnapshotDiscardsOldSnapshot(t *testing.T) {
 		LastIncludedIndex: 5, // Older than current
 		LastIncludedTerm:  2,
 		Data:              []byte("snapshot 2"),
+		Done:              true,
 	}
 	var reply2 raft.InstallSnapshotReply
 	rs.InstallSnapshot(args2, &reply2)
@@ -163,6 +167,7 @@ func TestSnapshotSerializationDeserialization(t *testing.T) {
 		LastIncludedIndex: 100,
 		LastIncludedTerm:  4,
 		Data:              []byte("test snapshot data"),
+		Done:              true,
 	}
 
 	// Serialize
@@ -189,5 +194,74 @@ func TestSnapshotSerializationDeserialization(t *testing.T) {
 	}
 	if !bytes.Equal(deserialized.Data, args.Data) {
 		t.Errorf("Data mismatch")
+	}
+	if !deserialized.Done {
+		t.Error("Done was lost in the round trip")
+	}
+}
+
+// TestSnapshotChunkSerializationRoundTrip covers the chunk fields on the wire.
+// Serialize/Deserialize are plain json.Marshal/Unmarshal over the whole struct
+// (and so is the HTTP transport's sendRPC), so the fields need no work of their
+// own — this pins that, and pins the two encodings the `omitempty` tags produce:
+// a middle chunk carries "offset" and no "done", while the single-chunk form is
+// the pre-chunking message plus "done":true.
+func TestSnapshotChunkSerializationRoundTrip(t *testing.T) {
+	middle := &raft.InstallSnapshotArgs{
+		Term:              5,
+		LeaderID:          "leader1",
+		LastIncludedIndex: 100,
+		LastIncludedTerm:  4,
+		Offset:            4096,
+		Data:              []byte("a middle chunk"),
+	}
+
+	encoded, err := raft.SerializeInstallSnapshotArgs(middle)
+	if err != nil {
+		t.Fatalf("Failed to serialize: %v", err)
+	}
+	if strings.Contains(string(encoded), `"done"`) {
+		t.Errorf("a non-final chunk encoded a done field: %s", encoded)
+	}
+
+	decoded, err := raft.DeserializeInstallSnapshotArgs(encoded)
+	if err != nil {
+		t.Fatalf("Failed to deserialize: %v", err)
+	}
+	if decoded.Offset != middle.Offset {
+		t.Errorf("Offset mismatch: got %d, want %d", decoded.Offset, middle.Offset)
+	}
+	if decoded.Done {
+		t.Error("Done set on a chunk that did not carry it")
+	}
+	if !bytes.Equal(decoded.Data, middle.Data) {
+		t.Error("Data mismatch")
+	}
+
+	// The single-chunk form omits offset entirely, so it is the old whole-payload
+	// message plus "done":true.
+	single := &raft.InstallSnapshotArgs{
+		Term: 5, LeaderID: "leader1", LastIncludedIndex: 100, LastIncludedTerm: 4,
+		Data: []byte("whole snapshot"), Done: true,
+	}
+	encoded, err = raft.SerializeInstallSnapshotArgs(single)
+	if err != nil {
+		t.Fatalf("Failed to serialize: %v", err)
+	}
+	if strings.Contains(string(encoded), `"offset"`) {
+		t.Errorf("the single-chunk form encoded an offset field: %s", encoded)
+	}
+
+	// The reply's offset round-trips the same way.
+	replyData, err := raft.SerializeInstallSnapshotReply(&raft.InstallSnapshotReply{Term: 5, Offset: 4096})
+	if err != nil {
+		t.Fatalf("Failed to serialize reply: %v", err)
+	}
+	reply, err := raft.DeserializeInstallSnapshotReply(replyData)
+	if err != nil {
+		t.Fatalf("Failed to deserialize reply: %v", err)
+	}
+	if reply.Offset != 4096 {
+		t.Errorf("reply Offset mismatch: got %d, want 4096", reply.Offset)
 	}
 }

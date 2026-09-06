@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-09-06 against commit `980f43d`.
+> Last verified: 2026-09-06 against commit `c6ee4b4`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -407,8 +407,11 @@ chmod 600 ./data/node1/*
   compacted log does send InstallSnapshot to lagging followers (A6, fixed). The
   snapshot it ships is one immutable `(index, term, data)` envelope read from a
   single `snapshot.json` load (R4, fixed). The receive path no longer blocks on
-  the state machine either (B3, fixed). What is still open on this path is
-  chunked transfer (R15) — see `docs/log-compaction.md`.
+  the state machine either (B3, fixed). That envelope is shipped as a series of
+  chunks (R15, fixed), which changes nothing about what reaches disk: the
+  receiver assembles the payload in memory and only the final chunk triggers the
+  `snapshot.json` write, followed by the `raft_state.json` boundary write, in
+  that order — see `docs/log-compaction.md`.
 
 ## Future Enhancements
 

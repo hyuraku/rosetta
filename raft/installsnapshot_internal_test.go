@@ -67,6 +67,7 @@ func TestInstallSnapshotDiscardsDivergentSuffix(t *testing.T) {
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  5,
 		Data:              []byte(`{"kv_data":{}}`),
+		Done:              true,
 	}
 	reply := &InstallSnapshotReply{}
 	rs.InstallSnapshot(args, reply)
@@ -107,6 +108,7 @@ func TestInstallSnapshotRetainsMatchingSuffix(t *testing.T) {
 		LastIncludedIndex: 3,
 		LastIncludedTerm:  5,
 		Data:              []byte(`{"kv_data":{}}`),
+		Done:              true,
 	}
 	reply := &InstallSnapshotReply{}
 	rs.InstallSnapshot(args, reply)
@@ -142,6 +144,7 @@ func TestInstallSnapshotDiscardsLogEndingBeforeBoundary(t *testing.T) {
 		LastIncludedIndex: 7,
 		LastIncludedTerm:  5,
 		Data:              []byte(`{"kv_data":{}}`),
+		Done:              true,
 	}
 	reply := &InstallSnapshotReply{}
 	rs.InstallSnapshot(args, reply)

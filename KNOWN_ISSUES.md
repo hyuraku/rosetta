@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-09-06 against commit `bde6619`
+> 最終検証: 2026-09-06 against commit `c6ee4b4`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -23,9 +23,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 35（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R9, R10, R11, R12, R13, R17, R19） |
+| ✅ FIXED | 36（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R9, R10, R11, R12, R13, R15, R17, R19） |
 | 🟠 PARTIAL | 0 |
-| ❌ UNFIXED | 4（グループ R: R14–R16, R18） |
+| ❌ UNFIXED | 3（グループ R: R14, R16, R18） |
 
 **実用上の含意**: ログ圧縮（グループ A）の受信側 §7 保持ルール（A7）は解消済みで、圧縮を
 有効にしても分岐 suffix を無条件保持することはない。2026-09-06 の再監査で見つかった snapshot
@@ -50,8 +50,8 @@ goroutine（event loop・applier・replication・投票・ReadIndex heartbeat・
 append の原子化）と AppendEntries の duplicate ACK（R2: 未永続 merge のロールバック）は解消した
 （`2c26b9a` / `c362ae4`）。R3–R5 の解消により、監査が指摘した snapshot 経路の State Machine
 Safety 違反経路は塞がった。R9–R12（KV/client/API の細部）と、AppendEntries の境界 term 照合・
-commit 上限（R13）も解消したが、R14–R16・R18 をはじめ未修正の課題が残るため、
-「安全性違反なし」とは言えない。
+commit 上限（R13）、InstallSnapshot の chunk 転送（R15）も解消したが、R14・R16・R18 が
+未修正のまま残るため、「安全性違反なし」とは言えない。
 
 降格処理は `becomeFollowerLocked` に一本化され（R6・`ac93fcb`）、高 term を見て降格した元 leader も
 選挙タイマーが再始動して自力で立候補できる。既知の data race 2 件も解消した（E1・`c5fdc0f`、
@@ -125,7 +125,7 @@ seqNum 採番から `sendRequest` 完了まで同一 mutex を保持し、Client
 [docs/raft-audit-2026-09-06.md](docs/raft-audit-2026-09-06.md)（凍結・対象 commit `d370c72`）
 で新規に確認された問題（R1–R18）と、その修正作業中に見つかった問題（R19 以降。監査には存在しない）。
 R1–R18 はいずれも `go test ./...`／`go test -race ./...` が green のままで検出されない静的確認
-として起票された。修正済みの R1–R5・R17・R19 には障害注入・世代競合・停止順の決定的テストが
+として起票された。修正済みの R1–R5・R15・R17・R19 には障害注入・世代競合・停止順の決定的テストが
 付いているが、未修正の項目にはまだない。R19 は例外的に `-race` でも捕まる panic だったが、
 発火が停止時のタイミング依存だったため CI では不安定失敗としてしか現れていなかった。
 R7・R8 は監査に存在しない（欠番ではなく、そもそも採番されていない）。
@@ -144,7 +144,7 @@ R7・R8 は監査に存在しない（欠番ではなく、そもそも採番さ
 | R12 | `-join` 失敗はログ出力のみで起動は継続する（fail-open）。`ClusterManager` のノード一覧は HTTP レベルの参加/離脱を記録するだけで Raft quorum には反映されない。`StartDiscovery`（`network/discovery.go:99`）は通常起動経路から呼ばれない | P1 | ✅ FIXED | `9d411ba`（動的メンバーシップ（R14）が実装されるまでの暫定として、`validateJoinFlag` を新設し `-join` に非空値が渡されたら起動を拒否する fail-closed に変更。フラグ自体は予約として残し、`clusterManager.JoinCluster` の呼び出しは削除。`config.Validate` に (i) `Peers` に自ノードの `NodeID` を含めない、(ii) `Peers` 内でアドレスが重複しない、(iii) `Peers` のアドレスが自ノードの `ListenAddr` と重複しない、の 3 検査を追加し、`-join` を使わない固定 `-peers` 運用の設定不整合を起動時に検出できるようにした） |
 | R13 | AppendEntries の境界 term 検査・commit 上限が §5.3 の規律を完全にはカバーしない: `PrevLogIndex` が snapshot 境界と一致・それ以下のケースでは term を検証せずに素通りする分岐がある（`:153-163`）。commit index は `min(args.LeaderCommit, rs.lastAbsLogIndex())` で前進するのみで、当該リクエストで実際にマージされた末尾との整合は別途確認されない（`:191-194`） | P1 | ✅ FIXED | R13-1（`f0b0ba9`）: `checkLogConsistency` に切り出し、`PrevLogIndex == LastIncludedIndex` で `PrevLogTerm` を `LastIncludedTerm` と照合、`PrevLogIndex < LastIncludedIndex` でも `Entries` が境界エントリ自体を含む場合は同様に照合。不一致は `ConflictTerm=-1, ConflictIndex=LastIncludedIndex+1` で拒否し続ける（committed prefix 不一致は snapshot 再送でも解決しないため、安全側で拒否し続ける設計。理由は `raft/rpc.go` の `checkLogConsistency` コメントに明記）。R13-2（`4d81414`）: commit index を `min(LeaderCommit, PrevLogIndex+len(Entries), lastAbsLogIndex())` に変更し、Figure 2 receiver rule 5 の「当該リクエストの末尾」を超えて前進しないようにした。R13-3（`ae33b52`、PR #26 のフォローアップ）: `replicateToPeer` が `NextIndex` を読む前に `clampNextIndexIfStale` で `lastAbsLogIndex()+1` にクランプし、`TruncateLogAfter` 後の stale な `NextIndex` による panic を解消。R13-4（`87234ad`、PR #24 のフォローアップ）: merge 後の persist 失敗応答に `ConflictTerm=-1, ConflictIndex=PrevLogIndex+1` を設定し、leader が `NextIndex` を 1 に戻して全ログを再送する退行を防止。変更箇所は `raft/rpc.go`（`checkLogConsistency`、`AppendEntries` の commit index 計算、`clampNextIndexIfStale`、`replicateToPeer`）。回帰テスト `tests/unit/appendentries_bounds_test.go`、`raft/appendentries_bounds_internal_test.go` |
 | R14 | Joint consensus・構成変更ログエントリ・新旧 quorum の二重確認は未実装。`network/discovery.go` の `ClusterManager` は HTTP レベルの参加/離脱のみで Raft レイヤーの安全なメンバーシップ変更ではない | P2 | ❌ UNFIXED | `raft/state.go:81-84`（peers は固定）。監査 §4 P2「R14」。TODO.md 3「Dynamic Cluster Membership」の計画対象 |
-| R15 | InstallSnapshot は `Data []byte` を一括転送するのみで offset/done によるチャンク転送・再送・中断からの再開がない。大容量 snapshot は一括メモリ確保・一括 RPC になる | P2 | ❌ UNFIXED | `raft/rpc.go:39-45`（`InstallSnapshotArgs`）。監査 §4 P2「R15」。`docs/log-compaction.md` Future Enhancements の Streaming 計画に対応 |
+| R15 | InstallSnapshot は `Data []byte` を一括転送するのみで offset/done によるチャンク転送・再送・中断からの再開がない。大容量 snapshot は一括メモリ確保・一括 RPC になる | P2 | ✅ FIXED | `c8c87d0`（`InstallSnapshotArgs` に `Offset`/`Done`、`InstallSnapshotReply` に「次に期待する offset」を追加。いずれも `omitempty` なので offset 0・done true の 1 chunk は従来メッセージ + `"done":true` と同じで、`Serialize*`/`Deserialize*` と HTTP transport は構造体全体の JSON 変換なので変更不要）／ `3ad0220`（受信側が Figure 13 の受信ルール 2–4 を実装。途中状態は `RaftState.pendingChunks`（`snapshotAssembly`）にメモリ上だけで持ち、**done が来るまで Raft 状態・KV・ディスクを一切変更しない** — R3 の順序不変条件（payload durable → 境界 durable → applier へ引き渡し）は組み立て済み payload に対して従来どおり 1 回の `rs.mu` 区間で走る。term 処理・election timer reset・R5 ガードは chunk ごとに行う。offset が buf の末尾と一致しない chunk は拒否し reply に期待 offset を返す。途中状態は `becomeFollowerLocked`（term/leader 変化）と `Stop`（停止）で破棄）／ `b3fbdbb`（送信側 `streamSnapshotToPeer` が envelope を `snapshotChunkSize`（既定 64 KiB）で分割して順に送る。`installSnapshotTimeout` は 1 chunk あたりの上限になった。chunk 間で `stopCh`・降格/term 変化・応答 term・期待 offset を確認して中断し、全 chunk の ACK 後にだけ `MatchIndex`/`NextIndex` を前進させる。再開は実装せず、失敗時は次の tick が offset 0 から envelope を読み直して送り直す — 世代ごとの offset を leader が覚える必要がなく、受信側の offset 検査が古い round の chunk の混入を防ぐ）。**残る制約**: 受信側は payload 全体をメモリに溜めてから 1 回で atomic write するため、chunk 化が抑えるのは 1 RPC のサイズと所要時間（= peer ごとの in-flight スロット占有時間）であって、両端のピークメモリではない。snapshot 送信中にその peer への heartbeat が止まること自体も未解消（PR #26 のフォローアップ）。回帰テスト `raft/snapshotchunks_internal_test.go`、`raft/sendsnapshot_internal_test.go`、`tests/unit/snapshot_test.go` |
 | R16 | `config/config.go:23-38` の `SnapshotInterval` は宣言されているが読み出し側で使われていない（自動 snapshot のトリガーは `maxRaftState` のみ）。`LoadConfig`（`:61-83`）はファイルにないフィールドをゼロ値のまま `Validate` に渡すため、`DefaultConfig()` の既定値を経由しない設定ファイルは意図せず起動を拒否されうる | P3 | ❌ UNFIXED | `config/config.go:23-38,61-83`。監査 §4 P3「R16」 |
 | R17 | CI (`.github/workflows/ci.yml:37-41`) は `./tests/unit/...` と `./tests/integration/...` のみを `-race` 実行し、`./...`（各パッケージ直下の `_test.go`、例: `raft/installsnapshot_internal_test.go`）を対象にしない。また `tests/integration/cluster_test.go:393` の `break` は `select` から抜けるだけで外側の `for` ループを抜けないため、timeout 後も残りの `done` 受信を待ち続ける（意図した「テスト失敗で即座に打ち切る」動作になっていない） | P3 | ✅ FIXED | `19bdb37`（CI の 2 ステップを `go test -v -race -timeout=10m -coverprofile=coverage.txt -covermode=atomic ./...` の 1 ステップに統合、全パッケージ直下のテストを `-race` 対象化）、`91b0f7c`（`tests/integration/cluster_test.go` の timeout `break` をラベル付き `break waitLoop` に変更し、外側の for ループを確実に抜けるよう修正。SA4011 解消） |
 | R18 | `examples/benchmark/benchmark.go` の read ワークロードはヒットしない: `populateInitialData`（`:152-162`、鍵生成は `:157`）が `i` を種に `Operations/populateFraction` 件を書き込む一方、読み取り側 `worker`（`:184-222`、鍵生成は `:201`）は `r.Intn(config.Operations/populateFraction)` で毎回ランダムな種を選ぶ。`generateKey` の乱数サフィックスは呼び出しごとに RNG ストリームが進むため、同じ数値シードでも書き込み時と読み取り時で鍵文字列が一致せず、GET はほぼ確実に 404 になる。成功率・引数検証・失敗統計もない | P3 | ❌ UNFIXED | `examples/benchmark/benchmark.go:152-162,184-222,285-287`。監査 §4 P3「R18」 |
@@ -222,6 +222,6 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
    `73e744f`）、R11（batch を未実装として拒否、`e71926a`）、R12（`-join` fail-closed・
    peers 検証、`9d411ba`）、R13（AppendEntries の境界 term 照合・commit 上限、`f0b0ba9` /
    `4d81414` / `ae33b52` / `87234ad`）
-8. R15（chunk transfer）
+8. ✅ 完了 — R15（chunk transfer、`c8c87d0` / `3ad0220` / `b3fbdbb`）
 9. R14（joint consensus: state → quorum → 管理 API → snapshot の順）
 10. R16、R18（設定、examples、benchmark）
