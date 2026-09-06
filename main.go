@@ -26,6 +26,11 @@ import (
 const (
 	// kvPath is the base path (without trailing slash) for key-value endpoints.
 	kvPath = "/kv"
+	// kvBatchPath is the batch endpoint clients historically sent to even though
+	// no route was ever registered for it (KNOWN_ISSUES.md R11); it must be
+	// rejected explicitly rather than falling through to the "/kv/" prefix
+	// handler and being silently misread as a plain PUT.
+	kvBatchPath = "/kv/batch"
 	// minPeerParts is the minimum number of colon-separated fields in a peer spec (id:addr).
 	minPeerParts = 2
 	// httpShutdownTimeout bounds how long a graceful shutdown waits for the
@@ -77,6 +82,16 @@ func (hs *HTTPServer) Shutdown(ctx context.Context) error {
 }
 
 func (hs *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
+	// Batch operations are not implemented (KNOWN_ISSUES.md R11). Without this
+	// check the request falls through to the "/kv/" prefix handler below and
+	// handlePut silently misreads BatchArgs{Operations} as PutArgs{Key:"",
+	// Value:""}, returning {"success":true} for a batch that never ran. Reject
+	// loudly instead, for any method.
+	if r.URL.Path == kvBatchPath {
+		writeJSONError(w, http.StatusNotImplemented, "batch operations are not implemented")
+		return
+	}
+
 	switch r.Method {
 	case "PUT", "POST":
 		hs.handlePut(w, r)
@@ -89,10 +104,32 @@ func (hs *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// writeJSONError writes a JSON error body of the shape {"success":false,
+// "error":"<msg>"}, for endpoints (like the batch rejection above) that need a
+// structured body rather than the plain-text bodies http.Error produces
+// elsewhere in this file (documented in docs/api.md's Response Formats
+// section).
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": false,
+		"error":   message,
+	})
+}
+
 func (hs *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 	var req kvstore.PutArgs
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// An empty key is the direct symptom of the R11 batch misrouting (a
+	// BatchArgs body decodes to PutArgs{Key:"",Value:""}), but it is rejected
+	// unconditionally here: an empty key was never a meaningful PUT on its own.
+	if req.Key == "" {
+		http.Error(w, "Key required", http.StatusBadRequest)
 		return
 	}
 

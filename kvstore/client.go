@@ -237,6 +237,10 @@ func (c *Client) Close() {
 	}
 }
 
+// BatchOperation, BatchArgs, and BatchReply describe the wire shape a future
+// batch implementation (TODO.md "Advanced Query Features") is expected to use.
+// They are kept as the reserved shape of the feature; Batch itself is rejected
+// below (KNOWN_ISSUES.md R11) until a server-side /kv/batch route exists.
 type BatchOperation struct {
 	Op    string `json:"op"`
 	Key   string `json:"key"`
@@ -253,53 +257,26 @@ type BatchReply struct {
 	Error   string   `json:"error,omitempty"`
 }
 
+// ErrBatchNotImplemented is returned by Batch, PutBatch, and GetBatch. The
+// server has no route for the "POST /kv/batch" request these methods used to
+// send; it fell through to the "/kv/" prefix handler and was silently
+// misinterpreted as a plain PUT with an empty key and value, returning
+// {"success":true} for an operation that never ran (KNOWN_ISSUES.md R11). These
+// methods now reject locally and send no HTTP request at all, rather than
+// repeat that silent wrong-success behavior.
+var ErrBatchNotImplemented = errors.New("batch operations are not implemented")
+
+// Batch is not implemented; see ErrBatchNotImplemented.
 func (c *Client) Batch(operations []BatchOperation) ([]string, error) {
-	args := BatchArgs{Operations: operations}
-	var reply BatchReply
-	err := c.sendRequest("POST", "/kv/batch", args, &reply)
-	if err != nil {
-		return nil, err
-	}
-	if !reply.Success {
-		return nil, errors.New(reply.Error)
-	}
-	return reply.Results, nil
+	return nil, ErrBatchNotImplemented
 }
 
+// PutBatch is not implemented; see ErrBatchNotImplemented.
 func (c *Client) PutBatch(kvPairs map[string]string) error {
-	operations := make([]BatchOperation, 0, len(kvPairs))
-	for key, value := range kvPairs {
-		operations = append(operations, BatchOperation{
-			Op:    "PUT",
-			Key:   key,
-			Value: value,
-		})
-	}
-
-	_, err := c.Batch(operations)
-	return err
+	return ErrBatchNotImplemented
 }
 
+// GetBatch is not implemented; see ErrBatchNotImplemented.
 func (c *Client) GetBatch(keys []string) (map[string]string, error) {
-	operations := make([]BatchOperation, len(keys))
-	for i, key := range keys {
-		operations[i] = BatchOperation{
-			Op:  "GET",
-			Key: key,
-		}
-	}
-
-	results, err := c.Batch(operations)
-	if err != nil {
-		return nil, err
-	}
-
-	resultMap := make(map[string]string)
-	for i, key := range keys {
-		if i < len(results) && results[i] != "" {
-			resultMap[key] = results[i]
-		}
-	}
-
-	return resultMap, nil
+	return nil, ErrBatchNotImplemented
 }
