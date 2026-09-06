@@ -412,14 +412,18 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 3. ✅ **当選時 no-op の導入とリース設計の見直し**（解消済み） — 当選時 no-op（`becomeLeader`、commit `60fd631`）と ReadIndex 方式（`b3b21a4`）を実装し、旧リース機構を撤去（D1〜D3）
 4. ✅ **重複検知の実配線**（解消済み・条件付き） — HTTP API 経路への ClientID/SeqNum の受け渡し（D4・commit `52afd48`）と、"leadership lost" spurious エラーの解消（D5・commit `16a9b31`）を実装。ただし dedup は ClientID 指定時のみで、opID ベースの結果解決には R9 が残る
 
-### 2026-09-06 再監査分（未修正、優先度順）
-5. B3（受信ハンドラの `rs.mu` 保持下ブロッキング送信、TODO.md 2.5 と同根）
-6. R1（`Start` の atomic 化）、R2（durable ACK） — P0
-7. R3–R5（snapshot の世代整合・復旧・適用順序） — P0
-8. R6、E1/E2（peer replication worker とタイマー統一） — P1
-9. R9–R13（KV/client/API/RPC 細部） — P1
-10. R14（joint consensus）、R15（chunk transfer） — P2
-11. R16–R18（設定、CI、examples/benchmark） — P3
+### 2026-09-06 再監査分（未修正、`docs/raft-audit-2026-09-06.md` §6 のロードマップ順）
+1. 現状訂正のみ（本 PR）
+2. CI を `go test -race ./...` に拡大し、`tests/integration/cluster_test.go:393` の
+   timeout `break` を修正（R17）
+3. R1、R2 — P0
+4. R3–R5（snapshot の世代整合・復旧・適用順序） — P0
+5. R6、E1/E2、peer replication worker（タイマー・リーダー参照の統一） — P1
+6. B3（受信ハンドラの `rs.mu` 保持下ブロッキング送信）の ordered applier と shutdown lifecycle
+7. R9–R13（KV/client/API/RPC 細部） — P1
+8. R15（chunk transfer） — P2
+9. R14（joint consensus: state → quorum → 管理 API → snapshot の順） — P2
+10. R16–R18（設定、CI 監視、examples/benchmark） — P3
 
 ---
 
