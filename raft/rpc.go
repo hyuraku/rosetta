@@ -431,9 +431,24 @@ func (rs *RaftState) replicateToPeer(
 		sendSnapshot = true
 	}
 
+	// Copy the entries out while still under the lock. The slice is handed to the
+	// transport after RUnlock and read there — the HTTP transport JSON-marshals
+	// it — while mergeLogEntries, TruncateLogAfter, TruncateLogTo and the
+	// InstallSnapshot receive path all mutate persistent.Log's backing array.
+	// Re-slicing alone is not enough: an append that fits in the spare capacity
+	// writes through the shared array, so the marshaller could read an entry
+	// mid-write (KNOWN_ISSUES.md E2). A shallow copy suffices — LogEntry.Command
+	// is an interface{} the receiver only reads, never writes through.
+	//
+	// The cost is one copy of the outstanding suffix per replication round. That
+	// suffix is unbounded today because there is no per-request entry cap;
+	// introducing one (maxEntriesPerAppend) is a separate change and out of scope
+	// here.
 	entries := make([]LogEntry, 0)
 	if nextIndex > lastIncludedIndex {
-		entries = rs.persistent.Log[nextIndex-lastIncludedIndex-1:]
+		src := rs.persistent.Log[nextIndex-lastIncludedIndex-1:]
+		entries = make([]LogEntry, len(src))
+		copy(entries, src)
 	}
 
 	rs.mu.RUnlock()
