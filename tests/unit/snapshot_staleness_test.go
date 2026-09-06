@@ -52,6 +52,7 @@ func TestInstallSnapshotIgnoredBelowLastApplied(t *testing.T) {
 		LastIncludedIndex: applied - 1,
 		LastIncludedTerm:  1,
 		Data:              stale,
+		Done:              true,
 	}, reply)
 
 	// The term is still accepted (this is valid leader traffic), but nothing

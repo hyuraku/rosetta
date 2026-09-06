@@ -77,6 +77,7 @@ func TestInstallSnapshotRPC(t *testing.T) {
 		LastIncludedIndex: 10,
 		LastIncludedTerm:  3,
 		Data:              []byte("snapshot data"),
+		Done:              true,
 	}
 
 	var reply raft.InstallSnapshotReply
@@ -123,6 +124,7 @@ func TestInstallSnapshotDiscardsOldSnapshot(t *testing.T) {
 		LastIncludedIndex: 10,
 		LastIncludedTerm:  3,
 		Data:              []byte("snapshot 1"),
+		Done:              true,
 	}
 	var reply1 raft.InstallSnapshotReply
 	rs.InstallSnapshot(args1, &reply1)
@@ -137,6 +139,7 @@ func TestInstallSnapshotDiscardsOldSnapshot(t *testing.T) {
 		LastIncludedIndex: 5, // Older than current
 		LastIncludedTerm:  2,
 		Data:              []byte("snapshot 2"),
+		Done:              true,
 	}
 	var reply2 raft.InstallSnapshotReply
 	rs.InstallSnapshot(args2, &reply2)
@@ -163,6 +166,7 @@ func TestSnapshotSerializationDeserialization(t *testing.T) {
 		LastIncludedIndex: 100,
 		LastIncludedTerm:  4,
 		Data:              []byte("test snapshot data"),
+		Done:              true,
 	}
 
 	// Serialize

@@ -129,6 +129,7 @@ func TestApplierOrdersSnapshotAheadOfLaterCommands(t *testing.T) {
 		LastIncludedIndex: 5,
 		LastIncludedTerm:  1,
 		Data:              []byte("snapshot"),
+		Done:              true,
 	}, &InstallSnapshotReply{})
 	if idx, term := rs.GetSnapshotMetadata(); idx != 5 || term != 1 {
 		t.Fatalf("snapshot boundary = (%d, %d), want (5, 1)", idx, term)

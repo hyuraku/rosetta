@@ -57,6 +57,7 @@ func installArgs(index, term int, payload []byte) *raft.InstallSnapshotArgs {
 		LastIncludedIndex: index,
 		LastIncludedTerm:  term,
 		Data:              payload,
+		Done:              true,
 	}
 }
 

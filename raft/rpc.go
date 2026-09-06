@@ -36,16 +36,44 @@ type AppendEntriesReply struct {
 	ConflictIndex int `json:"conflictIndex,omitempty"` // First index of ConflictTerm
 }
 
+// InstallSnapshotArgs carries one chunk of a snapshot (paper §7, Figure 13). A
+// snapshot is shipped as a sequence of chunks that all describe the same
+// generation — the same (LastIncludedIndex, LastIncludedTerm) — where Data holds
+// the payload bytes starting at Offset and Done marks the last chunk. The
+// receiver changes nothing until Done arrives.
+//
+// Offset and Done are omitempty, so the single-chunk form (Offset 0, Done true,
+// the whole payload in Data) is the pre-chunking message plus `"done":true`, and
+// the receiver treats it exactly as it treated the whole-payload message before.
+// A message produced by a sender that predates chunking decodes as Offset 0 /
+// Done false, which reads as "first chunk, more to come": the receiver buffers
+// it and answers with the offset it expects next, so such a transfer stalls
+// rather than installing a truncated snapshot. Every sender in this repository
+// sets Done on its last (possibly only) chunk.
 type InstallSnapshotArgs struct {
 	Term              int    `json:"term"`
 	LeaderID          string `json:"leaderId"`
 	LastIncludedIndex int    `json:"lastIncludedIndex"`
 	LastIncludedTerm  int    `json:"lastIncludedTerm"`
-	Data              []byte `json:"data"`
+	// Offset is where Data belongs within the whole snapshot payload.
+	Offset int `json:"offset,omitempty"`
+	// Data is this chunk's slice of the payload, not the whole snapshot.
+	Data []byte `json:"data"`
+	// Done marks the final chunk of this snapshot.
+	Done bool `json:"done,omitempty"`
 }
 
+// InstallSnapshotReply answers one chunk.
+//
+// Offset is the byte position the receiver expects in the next chunk. It is set
+// when a chunk was buffered but the transfer is not finished (the length
+// received so far), and when a chunk was refused because it did not continue
+// what the receiver holds (0 to ask for a restart, or the length it holds if
+// that chunk simply arrived out of order). It is not meaningful on the reply to
+// a Done chunk.
 type InstallSnapshotReply struct {
-	Term int `json:"term"`
+	Term   int `json:"term"`
+	Offset int `json:"offset,omitempty"`
 }
 
 type RPCTransport interface {
@@ -742,7 +770,9 @@ func (rs *RaftState) sendSnapshotToPeer(
 		LeaderID:          rs.nodeID,
 		LastIncludedIndex: snapshot.LastIncludedIndex,
 		LastIncludedTerm:  snapshot.LastIncludedTerm,
+		Offset:            0,
 		Data:              snapshot.Data,
+		Done:              true,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), installSnapshotTimeout)
 	defer cancel()
