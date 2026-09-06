@@ -96,19 +96,22 @@ func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesR
 // A non-nil error means the entry could not be made durable and was rolled back:
 // the command was not started and must not be reported as accepted, even though
 // isLeader is true.
+//
+// The leadership check and the append happen inside RaftState.Start, under a
+// single rs.mu acquisition, so a concurrent demotion cannot slip between them
+// (KNOWN_ISSUES.md R1). rn.mu is held only to read rn.logger safely against
+// SetLogger; it does not order anything against rs.mu.
 func (rn *RaftNode) Start(command interface{}) (index, term int, isLeader bool, err error) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	term, isLeader = rn.state.GetState()
-	if !isLeader {
-		return -1, term, false, nil
-	}
-
-	index, err = rn.state.AppendLogEntry(command, "command")
-	if err != nil {
+	index, term, isLeader, err = rn.state.Start(command)
+	switch {
+	case !isLeader:
+		return index, term, false, nil
+	case err != nil:
 		rn.logger.Printf("Start: failed to append command at term %d: %v", term, err)
-		return -1, term, true, err
+		return index, term, true, err
 	}
 	rn.logger.Printf("Started command at index %d, term %d", index, term)
 

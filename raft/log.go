@@ -80,8 +80,15 @@ func (rs *RaftState) logAfterSnapshot(lastIncludedIndex, lastIncludedTerm int) [
 	return rs.persistent.Log[rs.slicePos(lastIncludedIndex)+1:]
 }
 
-// AppendLogEntry appends a new entry for the current term and returns its
-// absolute index once the entry has reached stable storage.
+// entryTypeCommand labels a client command in LogEntry.Type. Together with
+// entryTypeNoOp it is observability only; nothing keys behavior off the field.
+const entryTypeCommand = "command"
+
+// appendEntryLocked appends one entry stamped with the current term and makes it
+// durable. Callers must hold rs.mu, and — critically — must have decided under
+// that same acquisition that appending is legal (see Start): the term stamped on
+// the entry is only meaningful while the caller's view of the role and term
+// still holds.
 //
 // A persist failure is reported, never swallowed: the leader counts its own log
 // as one of the replicas when advancing the commit index, so an entry that only
@@ -89,11 +96,8 @@ func (rs *RaftState) logAfterSnapshot(lastIncludedIndex, lastIncludedTerm int) [
 // then lost when the leader restarts (Figure 2, "Persistent state ... updated on
 // stable storage before responding to RPCs"). On failure the in-memory append is
 // rolled back so memory and disk stay in agreement, and the returned index is 0
-// — callers must treat the command as never started.
-func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) (int, error) {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-
+// — callers must treat the entry as never appended.
+func (rs *RaftState) appendEntryLocked(command interface{}, entryType string) (int, error) {
 	index := rs.lastAbsLogIndex() + 1
 	entry := LogEntry{
 		Term:    rs.persistent.CurrentTerm,
@@ -104,10 +108,58 @@ func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) (int,
 	rs.persistent.Log = append(rs.persistent.Log, entry)
 	if err := rs.persist(); err != nil {
 		rs.persistent.Log = rs.persistent.Log[:len(rs.persistent.Log)-1]
-		rs.logger.Printf("AppendLogEntry: persist failed, rolled back entry %d: %v", index, err)
 		return 0, fmt.Errorf("persist log entry %d: %w", index, err)
 	}
 	return index, nil
+}
+
+// AppendLogEntry appends a new entry for the current term and returns its
+// absolute index once the entry has reached stable storage. It performs no role
+// check, so it must not be used for client commands — use Start, which checks
+// leadership and appends under a single lock acquisition.
+func (rs *RaftState) AppendLogEntry(command interface{}, entryType string) (int, error) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	index, err := rs.appendEntryLocked(command, entryType)
+	if err != nil {
+		rs.logger.Printf("AppendLogEntry: persist failed, rolled back entry: %v", err)
+		return 0, err
+	}
+	return index, nil
+}
+
+// Start appends a client command to this node's log, but only while it is still
+// the leader. The leadership check, the term stamped on the entry and the
+// durable append all happen under one rs.mu acquisition (KNOWN_ISSUES.md R1).
+//
+// Splitting them — as the previous GetState()-then-AppendLogEntry sequence did —
+// leaves a window in which a higher-term AppendEntries, RequestVote or
+// InstallSnapshot (or a higher-term reply seen by one of the replication
+// goroutines) demotes this node to follower and bumps CurrentTerm. The append
+// that followed would then stamp the *new* term on a command the new leader
+// never issued, producing two different commands at the same (index, term) in
+// the cluster: a Log Matching violation (§5.4), and a write by a non-leader,
+// which Leader Append-Only forbids.
+//
+// Return contract: isLeader reports whether this node was the leader at the
+// moment of the check. A non-nil error means the entry could not be made durable
+// and was rolled back — the command was not started even though isLeader is true.
+func (rs *RaftState) Start(command interface{}) (index, term int, isLeader bool, err error) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	term = rs.persistent.CurrentTerm
+	if rs.state != Leader {
+		return -1, term, false, nil
+	}
+
+	index, err = rs.appendEntryLocked(command, entryTypeCommand)
+	if err != nil {
+		rs.logger.Printf("Start: persist failed, rolled back command at term %d: %v", term, err)
+		return -1, term, true, err
+	}
+	return index, term, true, nil
 }
 
 // GetLogEntry returns the entry at the given absolute log index, or nil when

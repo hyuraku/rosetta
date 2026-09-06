@@ -47,14 +47,7 @@ func (rs *RaftState) becomeLeader() {
 // becomeLeader continues.
 func (rs *RaftState) appendNoOpLocked() {
 	index := rs.lastAbsLogIndex() + 1
-	rs.persistent.Log = append(rs.persistent.Log, LogEntry{
-		Term:    rs.persistent.CurrentTerm,
-		Index:   index,
-		Command: NoOpCommand,
-		Type:    entryTypeNoOp,
-	})
-	if err := rs.persist(); err != nil {
-		rs.persistent.Log = rs.persistent.Log[:len(rs.persistent.Log)-1]
+	if _, err := rs.appendEntryLocked(NoOpCommand, entryTypeNoOp); err != nil {
 		rs.logger.Printf("appendNoOp: persist failed, rolled back no-op at index %d; "+
 			"reads stay unavailable until a current-term entry commits: %v", index, err)
 	}
