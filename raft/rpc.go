@@ -365,31 +365,66 @@ func (rs *RaftState) requestVoteFromPeer(
 }
 
 func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
-	if rs.GetNodeState() != Leader {
+	rs.mu.Lock()
+	if rs.state != Leader || rs.leader == nil {
+		rs.mu.Unlock()
 		return
 	}
 
-	rs.mu.RLock()
 	currentTerm := rs.persistent.CurrentTerm
 	commitIndex := rs.volatile.CommitIndex
-	isSingleNode := len(rs.peers) == 1
-	rs.mu.RUnlock()
 
 	// For a single-node cluster the leader is its own majority, so it can commit
 	// outstanding entries directly.
-	if isSingleNode {
-		rs.mu.Lock()
+	if len(rs.peers) == 1 {
 		rs.updateCommitIndex()
 		rs.mu.Unlock()
 		return
 	}
 
+	// Claim each peer's replication slot before spawning, and skip the peers that
+	// still have a round outstanding. Claiming under the same lock that reads the
+	// term and commit index is what makes the serialization airtight: two ticks
+	// cannot both see a peer idle.
+	targets := make([]string, 0, len(rs.peers))
 	for _, peer := range rs.peers {
-		if peer == rs.nodeID {
+		if peer == rs.nodeID || rs.leader.inFlight[peer] {
 			continue
 		}
+		rs.leader.inFlight[peer] = true
+		targets = append(targets, peer)
+	}
+	rs.mu.Unlock()
 
-		go rs.replicateToPeer(transport, peer, currentTerm, commitIndex)
+	for _, peer := range targets {
+		go rs.replicatePeerOnce(transport, peer, currentTerm, commitIndex)
+	}
+}
+
+// replicatePeerOnce runs one replication round against peerID and releases that
+// peer's slot when it returns, so the next tick can schedule another round.
+//
+// This is the one place a leader spawns replication work. Keeping the spawn and
+// the release together here is deliberate: when shutdown learns to wait for its
+// goroutines (KNOWN_ISSUES.md R19, roadmap step 6) this is the single site that
+// has to join a WaitGroup and honour the node's done signal.
+func (rs *RaftState) replicatePeerOnce(
+	transport RPCTransport,
+	peerID string,
+	currentTerm, commitIndex int,
+) {
+	defer rs.releaseReplicationSlot(peerID)
+	rs.replicateToPeer(transport, peerID, currentTerm, commitIndex)
+}
+
+// releaseReplicationSlot marks peerID as idle again. A demotion in the meantime
+// drops the whole LeaderState, and a later election builds a fresh one, so there
+// is nothing to release in that case.
+func (rs *RaftState) releaseReplicationSlot(peerID string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.leader != nil {
+		delete(rs.leader.inFlight, peerID)
 	}
 }
 
@@ -497,8 +532,19 @@ func (rs *RaftState) replicateToPeer(
 	}
 
 	if reply.Success {
-		rs.leader.MatchIndex[peerID] = prevLogIndex + len(entries)
-		rs.leader.NextIndex[peerID] = rs.leader.MatchIndex[peerID] + 1
+		// MatchIndex is a high-water mark, so never let a reply move it back.
+		// Replies can still be processed out of order — a slow round answered
+		// after a later, larger one — and rewinding MatchIndex here would rewind
+		// NextIndex with it, re-sending entries the follower already acknowledged
+		// and stalling the commit index behind a quorum that has in fact been
+		// reached. The per-peer serialization above makes the reordering rare;
+		// this makes it harmless.
+		if matchIndex := prevLogIndex + len(entries); matchIndex > rs.leader.MatchIndex[peerID] {
+			rs.leader.MatchIndex[peerID] = matchIndex
+		}
+		if next := rs.leader.MatchIndex[peerID] + 1; next > rs.leader.NextIndex[peerID] {
+			rs.leader.NextIndex[peerID] = next
+		}
 		rs.updateCommitIndex()
 	} else {
 		rs.handleReplicationConflict(peerID, reply)
@@ -604,9 +650,15 @@ func (rs *RaftState) sendSnapshotToPeer(
 	}
 	// Follower has now installed the snapshot we actually shipped, so its match
 	// index follows that envelope's boundary — not the boundary we happened to
-	// read from our own state before the send.
-	rs.leader.MatchIndex[peerID] = snapshot.LastIncludedIndex
-	rs.leader.NextIndex[peerID] = snapshot.LastIncludedIndex + 1
+	// read from our own state before the send. Monotonic for the same reason as
+	// the AppendEntries path: a slow InstallSnapshot acknowledged after the
+	// follower has already been caught up further must not drag it back.
+	if snapshot.LastIncludedIndex > rs.leader.MatchIndex[peerID] {
+		rs.leader.MatchIndex[peerID] = snapshot.LastIncludedIndex
+	}
+	if next := rs.leader.MatchIndex[peerID] + 1; next > rs.leader.NextIndex[peerID] {
+		rs.leader.NextIndex[peerID] = next
+	}
 }
 
 func (rs *RaftState) updateCommitIndex() {

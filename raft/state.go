@@ -67,6 +67,16 @@ type VolatileState struct {
 type LeaderState struct {
 	NextIndex  map[string]int
 	MatchIndex map[string]int
+
+	// inFlight marks the peers that currently have a replication RPC outstanding
+	// (an AppendEntries, or the InstallSnapshot replicateToPeer may fall through
+	// to). Ticks skip a peer that is still busy, so at most one replication RPC
+	// per peer is in flight at a time. Without it every 50ms tick spawned another
+	// round regardless, letting a 5-second InstallSnapshot run alongside a stream
+	// of AppendEntries to the same follower and letting their replies land out of
+	// order. The map is recreated by initializeLeaderState, so a slot can never
+	// leak across leader terms.
+	inFlight map[string]bool
 }
 
 // Persister interface for saving/loading persistent state
@@ -380,6 +390,7 @@ func (rs *RaftState) initializeLeaderState() {
 	rs.leader = &LeaderState{
 		NextIndex:  make(map[string]int),
 		MatchIndex: make(map[string]int),
+		inFlight:   make(map[string]bool),
 	}
 
 	nextIndex := rs.lastAbsLogIndex() + 1
