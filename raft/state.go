@@ -22,10 +22,11 @@ const (
 	// electionTimeoutJitterMs bounds the additional randomized election
 	// timeout (added on top of the base) to prevent split votes.
 	electionTimeoutJitterMs = 150
-	// heartbeatInterval is the leader heartbeat period.
+	// heartbeatInterval is the leader heartbeat period, and also how often the
+	// node event loop ticks (raft/node.go's run): DefaultTiming's zero value for
+	// Timing.HeartbeatInterval, not read directly outside timing.go — see
+	// RaftState.HeartbeatInterval (KNOWN_ISSUES.md R16).
 	heartbeatInterval = 50 * time.Millisecond
-	// raftTickInterval is how often the node event loop ticks.
-	raftTickInterval = 50 * time.Millisecond
 	// quorumDivisor is used to compute a majority quorum (n/quorumDivisor + 1).
 	quorumDivisor = 2
 	// requestVoteTimeout bounds a single RequestVote RPC.
@@ -35,12 +36,14 @@ const (
 	// installSnapshotTimeout bounds a single InstallSnapshot RPC — that is, one
 	// chunk, not a whole snapshot transfer.
 	installSnapshotTimeout = 5 * time.Second
-	// minElectionTimeout is the shortest election timeout any node uses. A
-	// follower that heard from its leader more recently than this cannot yet have
-	// timed out, so a RequestVote arriving inside that window comes from a server
-	// that is not seeing the same leader — see RequestVote's disruption check
-	// (paper §6, "Servers disregard RequestVote RPCs when they believe a current
-	// leader exists").
+	// minElectionTimeout is DefaultTiming's election timeout base, kept as a
+	// named constant for tests. RequestVote's disruption check (paper §6,
+	// "Servers disregard RequestVote RPCs when they believe a current leader
+	// exists") reads rs.timing.ElectionTimeoutBase instead, since R16 made that
+	// value configurable per node; this constant only defines what it defaults
+	// to. A follower that heard from its leader more recently than that base
+	// cannot yet have timed out, so a RequestVote arriving inside that window
+	// comes from a server that is not seeing the same leader.
 	minElectionTimeout = electionTimeoutBaseMs * time.Millisecond
 	// defaultSnapshotChunkSize is how many payload bytes one InstallSnapshot RPC
 	// carries. It bounds the size and the duration of a single RPC, which is what
@@ -142,6 +145,11 @@ type RaftState struct {
 
 	currentLeader string // Track the current leader ID
 
+	// timing is set once at construction (DefaultTiming, overridden by
+	// WithTiming) and never mutated afterward, so it is safe to read without
+	// rs.mu from any goroutine — including HeartbeatInterval, called from
+	// RaftNode.run before any tick has fired (KNOWN_ISSUES.md R16).
+	timing           Timing
 	electionTimeout  time.Duration
 	heartbeatTimeout time.Duration
 	lastHeartbeat    time.Time
@@ -343,20 +351,21 @@ func NewRaftState(nodeID string, peers []string, applyCh chan ApplyMsg) *RaftSta
 	return rs
 }
 
-func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan ApplyMsg, persister Persister) (*RaftState, error) {
-	// Randomized election timeout between 150ms and 300ms
-	// This prevents split votes when nodes start at the same time
-	//nolint:gosec // G404: election timeout jitter does not need a crypto RNG
-	randomTimeout := electionTimeoutBaseMs + rand.Intn(electionTimeoutJitterMs)
-
+// NewRaftStateWithPersister constructs a RaftState. opts is a set of
+// functional options (currently just WithTiming) that let callers override
+// construction parameters without breaking every existing call site, of which
+// there are many (KNOWN_ISSUES.md R16); callers that pass none get the same
+// behavior as before R16 introduced Option.
+func NewRaftStateWithPersister(
+	nodeID string, peers []string, applyCh chan ApplyMsg, persister Persister, opts ...Option,
+) (*RaftState, error) {
 	rs := &RaftState{
 		nodeID:            nodeID,
 		state:             Follower,
 		peers:             peers,
 		persistent:        PersistentState{CurrentTerm: 0, VotedFor: nil, Log: make([]LogEntry, 0)},
 		volatile:          VolatileState{CommitIndex: 0, LastApplied: 0},
-		electionTimeout:   time.Duration(randomTimeout) * time.Millisecond,
-		heartbeatTimeout:  heartbeatInterval,
+		timing:            DefaultTiming(),
 		lastHeartbeat:     time.Now(),
 		applyCh:           applyCh,
 		applyNotify:       make(chan struct{}, 1),
@@ -365,6 +374,17 @@ func NewRaftStateWithPersister(nodeID string, peers []string, applyCh chan Apply
 		persister:         persister,
 		logger:            log.New(log.Writer(), "[RAFT-STATE-"+nodeID+"] ", log.LstdFlags),
 	}
+
+	for _, opt := range opts {
+		opt(rs)
+	}
+
+	// Randomized election timeout in [timing.ElectionTimeoutBase,
+	// timing.ElectionTimeoutBase+timing.ElectionTimeoutJitter) — this prevents
+	// split votes when nodes start at the same time. No lock is needed here:
+	// nothing else can see rs yet.
+	rs.electionTimeout = rs.randomElectionTimeoutLocked()
+	rs.heartbeatTimeout = rs.timing.HeartbeatInterval
 
 	// Load persistent state if a persister is configured. A missing state file
 	// is not an error (LoadRaftState returns a zero-valued state), so this only
@@ -606,11 +626,29 @@ func (rs *RaftState) ResetElectionTimer() {
 // needs no re-subscription.
 func (rs *RaftState) resetElectionTimerLocked() {
 	// Randomize election timeout on each reset to prevent split votes
-	//nolint:gosec // G404: election timeout jitter does not need a crypto RNG
-	randomTimeout := electionTimeoutBaseMs + rand.Intn(electionTimeoutJitterMs)
-	rs.electionTimeout = time.Duration(randomTimeout) * time.Millisecond
+	rs.electionTimeout = rs.randomElectionTimeoutLocked()
 	rs.electionTimer.Reset(rs.electionTimeout)
 	rs.lastHeartbeat = time.Now()
+}
+
+// randomElectionTimeoutLocked returns a freshly randomized election timeout in
+// [timing.ElectionTimeoutBase, timing.ElectionTimeoutBase+timing.ElectionTimeoutJitter).
+// rs.timing is set once at construction and never mutated afterward (see the
+// field comment), so this needs no lock of its own; callers that read or write
+// other RaftState fields around the call still need rs.mu for those.
+func (rs *RaftState) randomElectionTimeoutLocked() time.Duration {
+	//nolint:gosec // G404: election timeout jitter does not need a crypto RNG
+	jitter := time.Duration(rand.Int63n(int64(rs.timing.ElectionTimeoutJitter)))
+	return rs.timing.ElectionTimeoutBase + jitter
+}
+
+// HeartbeatInterval returns the leader heartbeat period this node was
+// constructed with (raft.Timing.HeartbeatInterval, normalized). It is also
+// the node event loop's tick period (raft/node.go's run), since heartbeats are
+// sent once per tick when leader. It does not change after construction, so
+// no lock is needed (KNOWN_ISSUES.md R16).
+func (rs *RaftState) HeartbeatInterval() time.Duration {
+	return rs.heartbeatTimeout
 }
 
 func (rs *RaftState) ElectionTimer() <-chan time.Time {

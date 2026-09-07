@@ -25,12 +25,30 @@ type Config struct {
 	ListenAddr string            `json:"listen_addr"`
 	Peers      map[string]string `json:"peers"`
 	DataDir    string            `json:"data_dir"`
-	LogLevel   string            `json:"log_level"`
+	// LogLevel is reserved for future use: nothing in this codebase reads it
+	// yet (KNOWN_ISSUES.md R16). The field and its JSON key are kept so a
+	// config file that sets it does not fail to parse or lose the value on a
+	// round trip through SaveConfig.
+	LogLevel string `json:"log_level"`
 
-	ElectionTimeout  time.Duration `json:"election_timeout"`
+	// ElectionTimeout is the election timeout base: main.go wires it to
+	// raft.Timing.ElectionTimeoutBase, and the jitter added on top is the same
+	// length again, so the effective range is [ElectionTimeout, 2*ElectionTimeout)
+	// — 150-300ms at the defaults, matching raft's pre-R16 hardcoded constants.
+	// See Validate for the 2*HeartbeatTimeout lower bound this must clear
+	// (paper §5.2, broadcastTime << electionTimeout).
+	ElectionTimeout time.Duration `json:"election_timeout"`
+	// HeartbeatTimeout is the leader heartbeat interval: main.go wires it to
+	// raft.Timing.HeartbeatInterval, which is also the node event loop's tick
+	// period (KNOWN_ISSUES.md R16).
 	HeartbeatTimeout time.Duration `json:"heartbeat_timeout"`
 
-	MaxRaftState     int `json:"max_raft_state"`
+	MaxRaftState int `json:"max_raft_state"`
+	// SnapshotInterval is reserved for future use: automatic snapshotting is
+	// currently triggered only by MaxRaftState (see docs/log-compaction.md).
+	// The field and its JSON key are kept so a config file that sets it does
+	// not fail to parse or lose the value on a round trip through SaveConfig
+	// (KNOWN_ISSUES.md R16).
 	SnapshotInterval int `json:"snapshot_interval"`
 
 	HTTPServerAddr   string        `json:"http_server_addr"`
@@ -58,6 +76,14 @@ func DefaultConfig() *Config {
 	}
 }
 
+// LoadConfig reads a JSON config file starting from DefaultConfig() rather
+// than a zero-valued Config, so a field the file omits keeps its documented
+// default instead of silently becoming Go's zero value (0, "", nil) — which
+// used to be able to fail Validate for reasons the file never expressed, or
+// even pass Validate with a materially different (and unintended) setting
+// than DefaultConfig's (KNOWN_ISSUES.md R16). json.Unmarshal only overwrites
+// the fields present in data, leaving every omitted field at whatever
+// DefaultConfig set it to.
 func LoadConfig(filename string) (*Config, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -70,8 +96,8 @@ func LoadConfig(filename string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %v", err)
 	}
 
-	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
+	config := DefaultConfig()
+	if err := json.Unmarshal(data, config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %v", err)
 	}
 
@@ -79,7 +105,7 @@ func LoadConfig(filename string) (*Config, error) {
 		return nil, fmt.Errorf("invalid configuration: %v", err)
 	}
 
-	return &config, nil
+	return config, nil
 }
 
 func (c *Config) SaveConfig(filename string) error {
@@ -118,6 +144,16 @@ func (c *Config) Validate() error {
 
 	if c.ElectionTimeout <= c.HeartbeatTimeout {
 		return fmt.Errorf("election_timeout must be greater than heartbeat_timeout")
+	}
+
+	// Paper §5.2: broadcastTime << electionTimeout, or the cluster cannot
+	// reliably get a heartbeat out before followers start timing out and
+	// calling elections. Requiring at least a 2x margin catches a config that
+	// technically clears the check above (heartbeat=140ms, election=150ms) but
+	// leaves no real room for a heartbeat to be delayed or lost. The defaults
+	// (150ms/50ms) clear this with room to spare (KNOWN_ISSUES.md R16).
+	if c.ElectionTimeout < 2*c.HeartbeatTimeout {
+		return fmt.Errorf("election_timeout must be at least twice heartbeat_timeout")
 	}
 
 	if c.MaxRaftState <= 0 {

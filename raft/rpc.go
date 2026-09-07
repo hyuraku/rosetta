@@ -120,7 +120,7 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	// and the next candidate is heard. It has to precede the term adoption below,
 	// which is the very thing being suppressed.
 	if args.Term > rs.persistent.CurrentTerm && rs.currentLeader != "" &&
-		time.Since(rs.lastHeartbeat) < minElectionTimeout {
+		time.Since(rs.lastHeartbeat) < rs.timing.ElectionTimeoutBase {
 		rs.logger.Printf("RequestVote: ignoring %s's request for term %d; heard from leader %s %v ago",
 			args.CandidateID, args.Term, rs.currentLeader, time.Since(rs.lastHeartbeat))
 		return
