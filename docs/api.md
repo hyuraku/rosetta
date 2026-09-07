@@ -322,6 +322,14 @@ second `/cluster/add`, or a removal of a *voter*, is refused with 409. Removing
 the learner itself is allowed and is how a catch-up that will never finish is
 abandoned (see below).
 
+**Changing an existing voter's address** uses this same endpoint: sending
+`/cluster/add` for a `node_id` that is already a voter, with a different `addr`,
+appends the joint configuration C_old,new carrying the new address. That server
+stays a voter throughout and never becomes a learner — the catch-up phase is for
+servers that are not counted yet, and demoting a live voter into it would take it
+out of every quorum. Re-sending the address it already has is a 400
+(`ErrNodeAlreadyVoter`).
+
 **Adding a server, end to end:**
 
 1. Start the new node with the **existing** cluster's `-peers` list — the three
@@ -348,11 +356,22 @@ abandoned (see below).
 > `POST /cluster/remove`. Permanent learners are out of scope
 > (KNOWN_ISSUES.md R20).
 >
-> "Caught up" is a single observation of the learner storing everything the
-> leader has. That is a simplification of the dissertation's §4.2.1 criterion
-> (several rounds of replication, the last completing within an election
-> timeout); the consequence is only that a learner which keeps falling behind
-> is never promoted, never that one is promoted too early.
+> **"Caught up" is a single observation** of `MatchIndex[learner]` reaching the
+> leader's last log index, checked when a reply is handled. That is a
+> simplification of the dissertation's §4.2.1 criterion, which measures whether
+> the learner can *keep* up over several rounds rather than whether it is level
+> at one instant.
+>
+> It never promotes a learner too early, but it can promote one late. The
+> leader's last index is read when the reply arrives, not when the request was
+> sent, so a client write that lands during the round trip moves the tail out
+> from under a learner that had caught up with everything the leader had when it
+> was asked. **Under sustained writes a healthy learner can trail the tail by one
+> round trip indefinitely and stay a learner until the write load pauses** — at
+> the first lull the next reply promotes it. In practice: add servers while write
+> load is low, or expect the promotion to happen at the next lull. Until then the
+> cluster is unaffected — the learner is counted by no quorum — but the
+> membership change is not finished, so no other change is accepted either.
 
 ---
 
