@@ -216,6 +216,15 @@ through joint consensus (Raft paper §6).
 **Remaining (tracked separately):**
 - Permanent learners / read replicas are out of scope: a learner here is only a
   transient catch-up state, and its only exits are promotion and removal.
+- R22 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): "caught up" is one observation of
+  the learner matching the leader's last index at reply time, so under
+  sustained writes a healthy learner can stay a learner until the write load
+  pauses. A round-based or commit-index-based criterion would fix this; see
+  item 12.5 below.
+- `configAtIndexLocked` (`raft/membership.go`) walks the log backwards on every
+  recompute (O(n) per truncation/append of a configuration entry). Fine at this
+  project's log sizes; a cached "index of the latest configuration entry" would
+  remove the scan.
 - `-join` stays rejected (R12): joining is granted by the leader, not asserted
   by the joining node. `ClusterManager`'s `/cluster/join|leave|nodes` in
   `network/discovery.go` are untouched and still not reflected in the Raft
@@ -555,6 +564,48 @@ Create official client libraries for easy integration.
 
 ---
 
+### 12.5. Follow-ups filed after the 2026-09 re-audit work
+**Priority:** 🟢 Low (all P3)
+**Status:** Open — filed 2026-09-07 during the R20 work (PR #33), none started
+
+Defects with a KNOWN_ISSUES.md ID (details, evidence and a suggested fix are in
+the R21–R26 rows there; recommended order is smallest change first):
+- [ ] R21 — `main_test.go`'s `newTestHTTPServer` cleanup runs `kvs.Close()`
+      before `node.Kill()`, the reverse of the R19 shutdown order; the source of
+      the rare `-race` failure of `TestHandleKVBatchPathReturns501`. Two lines.
+- [ ] R23 — `sendSnapshotToPeer` advances `MatchIndex` but does not call
+      `updateCommitIndex`, so a commit reached only through a snapshot ACK waits
+      for the next heartbeat tick. One line, plus the same leader re-check that
+      `sendHeartbeats` does.
+- [ ] R26 — `AppendEntries` answers a failed term persist with zero
+      `ConflictIndex`/`ConflictTerm`, which the leader reads as "resend from
+      index 1" (or send a snapshot).
+- [ ] R22 — learner promotion can starve under sustained writes (see item 3).
+- [ ] R24 — an `InstallSnapshot` transfer holds the peer's replication slot, so
+      that peer gets no AppendEntries/heartbeat until the transfer ends.
+- [ ] R25 — the receiver's `pendingChunks` has no size cap and no idle timeout;
+      a stalled transfer from the same leader and term is kept indefinitely.
+
+Code-quality items without an ID (no behavior defect):
+- [ ] `TakeSnapshot` and `InstallSnapshotFromData` in `raft/snapshot.go` are a
+      second implementation of the snapshot paths that only tests call; the RPC
+      path (`sendSnapshotToPeer` / `InstallSnapshot`) is the one that runs. Merge
+      into the RPC path or delete.
+- [ ] `network/discovery.go`'s `ClusterManager` is dead weight on the membership
+      path (see item 3 and R12). Delete or fold its address-book role into the
+      configuration.
+- [ ] `examples/simple-cluster/demo.sh` Step 4 asks `localhost:9080/leader`
+      directly (lines ~122-127) while the rest of the script uses
+      `find_leader_port`; it prints a wrong or empty answer if node1 is down.
+- [ ] `docs/textbook.md` chapter 6 still says the SA4011 finding exists; it is
+      fixed (R17, `91b0f7c`). Its status table (synced at `e183622`) also still
+      lists R16/R18/R20 as open. The file is frozen, so this is a note, not an
+      edit; `KNOWN_ISSUES.md` is the authority.
+- `SnapshotInterval` / `LogLevel` in `config.Config` stay reserved and unread
+  (R16, documented) — listed here only so the list is complete.
+
+---
+
 ## Documentation
 
 ### 13. Documentation Improvements
@@ -587,7 +638,7 @@ Create official client libraries for easy integration.
 - [x] Basic Raft implementation
 - [x] Key-value operations
 - [x] Persistence
-- [x] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; R1-R20 from the 2026-09-06 re-audit and its follow-ups also done). Every filed ID is closed; that is not a claim that unaudited paths are clean
+- [x] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; R1-R20 from the 2026-09-06 re-audit also done). The follow-ups R21-R26 filed on 2026-09-07 are open, but they are P3 liveness/resource/test items, not safety violations (item 12.5). That is not a claim that unaudited paths are clean
 - [x] Log compaction reworked and wired
 - [ ] Monitoring
 - [x] Documentation verified against code (2026-07 overhaul)

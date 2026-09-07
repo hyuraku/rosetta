@@ -19,7 +19,7 @@
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID、R19 以降はその修正作業中に見つかった ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: グループ R に未修正の項目はない（R20 の解消をもって 0 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）と、InstallSnapshot の chunk 転送（R15・`c8c87d0` / `3ad0220` / `b3fbdbb`）も解消した。R14（joint consensus による動的メンバーシップ）も解消した（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。R16（設定の raft への配線、`5aff2e6`）と R18（benchmark/examples の契約、`3438f81`）も解消し、最後に残っていた R20（learner／non-voting member の追いつき段階、`37a60f5` / `40f92cf`）も解消した。ただしこれは「起票済みの ID がすべて閉じた」という意味であって、監査されていない経路が無いことの証明ではない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: 監査由来の R1–R20 はすべて解消。R20 の実装・審査（2026-09-07）で起票したフォローアップ R21–R26（テストの停止順、learner 昇格の飢え、snapshot 経路の commit 遅延・heartbeat 停止・受信バッファ、persist 失敗応答の全ログ再送。すべて P3、liveness／資源／テストの項目）が未対応。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）と、InstallSnapshot の chunk 転送（R15・`c8c87d0` / `3ad0220` / `b3fbdbb`）も解消した。R14（joint consensus による動的メンバーシップ）も解消した（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。R16（設定の raft への配線、`5aff2e6`）と R18（benchmark/examples の契約、`3438f81`）も解消し、最後に残っていた R20（learner／non-voting member の追いつき段階、`37a60f5` / `40f92cf`）も解消した。ただしこれは「監査由来の ID がすべて閉じた」という意味であって、監査されていない経路が無いことの証明ではなく、上記のフォローアップ R21–R26 も残っている。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -383,7 +383,8 @@ follower は 503 + `X-Raft-Leader`）と `GET /cluster/config`（どのノード
   足元で末尾が動きます。書き込みが続いているクラスタでは健全な learner が往復 1 回分
   だけ遅れ続け、書き込みが途切れるまで昇格しません（途切れれば次の応答で昇格します）。
   クラスタ自体は影響を受けません（learner は quorum に数えられない）が、構成変更が
-  完了しないので次の変更も受け付けません。運用上は書き込み負荷の低いときに追加します。
+  完了しないので次の変更も受け付けません。運用上は書き込み負荷の低いときに追加します
+  （判定の改善は KNOWN_ISSUES.md R22 として追跡）。
 - **範囲外**: 恒久的な learner（read replica）はありません。learner は昇格待ちの
   一時状態であり、出口は昇格か削除の 2 つだけです。
 
@@ -504,7 +505,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 - リース方式にあったクロック依存・過半数喪失時の step-down 欠如がなくなりました。孤立した旧リーダーは `confirmLeadership` が過半数 ACK を得られず `ErrLeadershipNotConfirmed` を返し、stale 値を返しません。より高い term を見たら `stepDown` します。D1/D2 解消（commit `b3b21a4`）。see ../KNOWN_ISSUES.md (D1, D2)
 - 当選時 no-op（`becomeLeader`）により、新リーダーは前任 term のコミット済みエントリを advance してから読みを許可します。D3 解消（commit `60fd631`）。see ../KNOWN_ISSUES.md (D3)
 
-**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されており、グループ R に未修正の起票項目はありませんが、本プロジェクトは教育用途であり、監査されていない経路が無いことまでは保証しません。
+**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されており、グループ R の監査由来 ID はすべて閉じています（フォローアップ R21–R26 は未対応）が、本プロジェクトは教育用途であり、監査されていない経路が無いことまでは保証しません。
 
 ---
 
@@ -540,6 +541,11 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 11. ✅ 完了 — R20（learner／non-voting member の追いつき段階、`37a60f5` / `40f92cf`）: 追加は
     quorum を変えない単一構成で `Learners` に足すだけになり、追いついた learner を leader が
     `promoteCaughtUpLearnerLocked` で C_old,new へ昇格させる。恒久 learner は範囲外 — P2
+12. ❌ 未着手 — フォローアップ R21–R26（R20 の実装・審査で起票、すべて P3）: R21 テストヘルパーの
+    停止順、R22 learner 昇格判定の書き込み負荷下での飢え、R23 snapshot ACK 後に commit を
+    再評価しない、R24 snapshot 転送中はその peer への heartbeat が止まる、R25 受信側
+    `pendingChunks` に上限と idle timeout が無い、R26 persist 失敗応答が conflict 情報を持たず
+    全ログ再送になる。詳細と推奨順は KNOWN_ISSUES.md
 
 ---
 
