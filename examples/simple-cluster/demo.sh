@@ -126,10 +126,14 @@ demo_cmd "curl -s http://localhost:9080/leader"
 # fixed port list this script started the cluster with).
 LEADER_INFO=$(curl -s http://localhost:9080/leader)
 if [ "$HAS_JQ" = true ]; then
-    LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader')
+    # "// "unknown"" alone would not catch an empty .leader: GetLeader()
+    # encodes "no leader yet" as an empty string, not JSON null/false, and
+    # jq's "//" only substitutes for null/false.
+    LEADER_ID=$(echo $LEADER_INFO | jq -r 'if (.leader // "") == "" then "unknown" else .leader end')
 else
     # Simple extraction without jq
     LEADER_ID=$(echo $LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
+    [ -z "$LEADER_ID" ] && LEADER_ID="unknown"
 fi
 
 echo -e "${GREEN}Current leader is: $LEADER_ID${NC}"
@@ -213,67 +217,87 @@ pause
 echo -e "${BLUE}═══ Step 7: Leader Failover Test ═══${NC}"
 echo ""
 
-LEADER_INFO=$(curl -s http://localhost:9080/leader)
-if [ "$HAS_JQ" = true ]; then
-    LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader')
-else
-    LEADER_ID=$(echo $LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
-fi
-
-# Find leader port
-if [ "$LEADER_ID" = "node1" ]; then
-    LEADER_HTTP_PORT=9080
-    LEADER_PID=$(pgrep -f "rosetta.*-id=node1")
-elif [ "$LEADER_ID" = "node2" ]; then
-    LEADER_HTTP_PORT=9081
-    LEADER_PID=$(pgrep -f "rosetta.*-id=node2")
-else
-    LEADER_HTTP_PORT=9082
-    LEADER_PID=$(pgrep -f "rosetta.*-id=node3")
-fi
-
-echo -e "${RED}Killing leader node: $LEADER_ID (PID: $LEADER_PID)${NC}"
-kill $LEADER_PID
-
-echo ""
-echo "Waiting for new leader election..."
-sleep 3
-
-# Find new leader
-for port in 9080 9081 9082; do
-    if curl -s http://localhost:$port/status > /dev/null 2>&1; then
-        NEW_LEADER_INFO=$(curl -s http://localhost:$port/leader 2>/dev/null || echo '{}')
-        if [ "$HAS_JQ" = true ]; then
-            # "// "unknown"" alone would not catch this: GetLeader() encodes "no
-            # leader yet" as an empty string, not JSON null/false, and jq's "//"
-            # only substitutes for null/false. Without this fix, an empty
-            # .leader made NEW_LEADER_ID="" here, which the check below treated
-            # as "a leader was found" and broke out of the retry loop before an
-            # election had actually completed.
-            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | jq -r 'if (.leader // "") == "" then "unknown" else .leader end')
-        else
-            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
-            [ -z "$NEW_LEADER_ID" ] && NEW_LEADER_ID="unknown"
-        fi
-        if [ "$NEW_LEADER_ID" != "unknown" ] && [ "$NEW_LEADER_ID" != "null" ]; then
-            break
-        fi
+# Retry a few times: right after Step 6's recovery, the cluster may not have
+# settled on (or reported) a leader yet. LEADER_ID starts "unknown" so the
+# skip path below is taken if every attempt still comes back empty/unknown.
+LEADER_ID="unknown"
+for attempt in 1 2 3 4 5; do
+    LEADER_INFO=$(curl -s http://localhost:9080/leader 2>/dev/null || echo '{}')
+    if [ "$HAS_JQ" = true ]; then
+        # "// "unknown"" alone would not catch an empty .leader: GetLeader()
+        # encodes "no leader yet" as an empty string, not JSON null/false, and
+        # jq's "//" only substitutes for null/false.
+        LEADER_ID=$(echo $LEADER_INFO | jq -r 'if (.leader // "") == "" then "unknown" else .leader end')
+    else
+        LEADER_ID=$(echo $LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
+        [ -z "$LEADER_ID" ] && LEADER_ID="unknown"
     fi
+    if [ "$LEADER_ID" != "unknown" ] && [ "$LEADER_ID" != "null" ]; then
+        break
+    fi
+    sleep 1
 done
 
-echo -e "${GREEN}New leader elected: $NEW_LEADER_ID${NC}"
-echo ""
+if [ "$LEADER_ID" = "unknown" ] || [ "$LEADER_ID" = "null" ]; then
+    # Previously this fell through to the port-mapping below anyway, whose
+    # "else" branch defaulted to node3 -- silently killing node3 even though
+    # no leader was actually confirmed, rather than skipping the step.
+    echo -e "${YELLOW}No leader currently known -- skipping the leader failover test.${NC}"
+    pause
+else
+    # Find leader port
+    if [ "$LEADER_ID" = "node1" ]; then
+        LEADER_HTTP_PORT=9080
+        LEADER_PID=$(pgrep -f "rosetta.*-id=node1")
+    elif [ "$LEADER_ID" = "node2" ]; then
+        LEADER_HTTP_PORT=9081
+        LEADER_PID=$(pgrep -f "rosetta.*-id=node2")
+    else
+        LEADER_HTTP_PORT=9082
+        LEADER_PID=$(pgrep -f "rosetta.*-id=node3")
+    fi
 
-# Find the new leader port
-NEW_LEADER_PORT=$(find_leader_port)
-echo -e "${GREEN}New leader on port: $NEW_LEADER_PORT${NC}"
-echo ""
+    echo -e "${RED}Killing leader node: $LEADER_ID (PID: $LEADER_PID)${NC}"
+    kill $LEADER_PID
 
-echo "Testing cluster after leadership change..."
-demo_cmd "curl -s -X PUT http://localhost:$NEW_LEADER_PORT/kv -H 'Content-Type: application/json' -d '{\"key\":\"after-failover\",\"value\":\"new leader works!\"}'"
+    echo ""
+    echo "Waiting for new leader election..."
+    sleep 3
 
-echo -e "${GREEN}✓ Leader failover successful!${NC}"
-pause
+    # Find new leader
+    for port in 9080 9081 9082; do
+        if curl -s http://localhost:$port/status > /dev/null 2>&1; then
+            NEW_LEADER_INFO=$(curl -s http://localhost:$port/leader 2>/dev/null || echo '{}')
+            if [ "$HAS_JQ" = true ]; then
+                # Same empty-string fix as above: without it, an empty .leader
+                # made NEW_LEADER_ID="" here, which the check below treated as
+                # "a leader was found" and broke out of the retry loop before
+                # an election had actually completed.
+                NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | jq -r 'if (.leader // "") == "" then "unknown" else .leader end')
+            else
+                NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
+                [ -z "$NEW_LEADER_ID" ] && NEW_LEADER_ID="unknown"
+            fi
+            if [ "$NEW_LEADER_ID" != "unknown" ] && [ "$NEW_LEADER_ID" != "null" ]; then
+                break
+            fi
+        fi
+    done
+
+    echo -e "${GREEN}New leader elected: $NEW_LEADER_ID${NC}"
+    echo ""
+
+    # Find the new leader port
+    NEW_LEADER_PORT=$(find_leader_port)
+    echo -e "${GREEN}New leader on port: $NEW_LEADER_PORT${NC}"
+    echo ""
+
+    echo "Testing cluster after leadership change..."
+    demo_cmd "curl -s -X PUT http://localhost:$NEW_LEADER_PORT/kv -H 'Content-Type: application/json' -d '{\"key\":\"after-failover\",\"value\":\"new leader works!\"}'"
+
+    echo -e "${GREEN}✓ Leader failover successful!${NC}"
+    pause
+fi
 
 # Step 8: Delete Operation
 echo -e "${BLUE}═══ Step 8: Delete Operation ═══${NC}"
