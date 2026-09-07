@@ -515,7 +515,17 @@ func main() {
 	transport.SetPeers(cfg.Peers)
 
 	peerIDs := cfg.GetPeerIDs()
-	raftNode, err := raft.NewRaftNodeWithPersister(cfg.NodeID, peerIDs, transport, applyCh, raftPersister)
+	// cfg.ElectionTimeout is the base; the jitter added on top is the same
+	// length again, giving [base, 2*base) — 150-300ms at the defaults, matching
+	// raft's pre-R16 hardcoded constants. cfg.HeartbeatTimeout is the heartbeat
+	// interval, which is also the node event loop's tick period
+	// (raft.RaftState.HeartbeatInterval). See KNOWN_ISSUES.md R16.
+	timing := raft.Timing{
+		ElectionTimeoutBase:   cfg.ElectionTimeout,
+		ElectionTimeoutJitter: cfg.ElectionTimeout,
+		HeartbeatInterval:     cfg.HeartbeatTimeout,
+	}
+	raftNode, err := raft.NewRaftNodeWithPersister(cfg.NodeID, peerIDs, transport, applyCh, raftPersister, raft.WithTiming(timing))
 	if err != nil {
 		log.Fatalf("Failed to start Raft node: %v", err)
 	}

@@ -421,10 +421,12 @@ Add advanced querying capabilities beyond simple key-value operations.
 ### 9. Configuration Management
 **Priority:** 🟢 Low
 **Estimated Effort:** Small (1 week)
-**Status:** Partially Implemented — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R16):
-`SnapshotInterval` is declared in `config/config.go` but not read by anything, and
-`LoadConfig` validates a file-loaded config without filling in `DefaultConfig()`'s
-defaults for fields the file omits.
+**Status:** Partially Implemented — `ElectionTimeout`/`HeartbeatTimeout` are now
+wired into `raft.Timing` and `LoadConfig` default-fills a file-loaded config from
+`DefaultConfig()` (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md), R16, fixed). Still
+outstanding: `SnapshotInterval` and `LogLevel` remain declared in
+`config/config.go` but read by nothing — no reload, no env vars, no config API
+endpoint. Any of those is still open work for this item.
 
 **Description:**
 Improve configuration management and runtime configurability.
@@ -584,7 +586,7 @@ Create official client libraries for easy integration.
 - [x] Basic Raft implementation
 - [x] Key-value operations
 - [x] Persistence
-- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; R9-R12 also done; the open items are R13-R16 and R18 from the 2026-09-06 re-audit)
+- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; R9-R18 also done; the open item is R20, learner/non-voting member, from the 2026-09-06 re-audit)
 - [x] Log compaction reworked and wired
 - [ ] Monitoring
 - [x] Documentation verified against code (2026-07 overhaul)

@@ -96,9 +96,15 @@ done
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# Get leader info
+# Get leader info. /leader is answered by any node (it just reports what that
+# node currently believes, not only what it is itself), so querying node1
+# here works even when node1 is not the leader; only the write example below
+# needs the leader's own port. "// "unknown"" alone is not enough: GetLeader()
+# encodes "no leader yet" as an empty string, not JSON null/false, and jq's
+# "//" only substitutes for null/false, so an empty .leader would otherwise
+# print as a blank leader name instead of "unknown".
 LEADER_INFO=$(curl -s http://localhost:9080/leader 2>/dev/null || echo '{}')
-LEADER_ID=$(echo $LEADER_INFO | jq -r '.leader // "unknown"')
+LEADER_ID=$(echo $LEADER_INFO | jq -r 'if (.leader // "") == "" then "unknown" else .leader end')
 
 if [ "$LEADER_ID" != "unknown" ] && [ "$LEADER_ID" != "null" ]; then
     echo ""
@@ -107,6 +113,17 @@ else
     echo ""
     echo -e "${YELLOW}No leader elected yet (this is normal, wait a moment)${NC}"
 fi
+
+# Map the leader's node ID to its HTTP port for the example commands below.
+# Writes (and reads, which also require the leader) only succeed against the
+# leader (CLAUDE.md gotcha: "Writes only go to the leader") -- node1's port
+# is not a safe default once dynamic membership can put the leader anywhere.
+case "$LEADER_ID" in
+    node1) LEADER_PORT=9080 ;;
+    node2) LEADER_PORT=9081 ;;
+    node3) LEADER_PORT=9082 ;;
+    *)     LEADER_PORT=9080 ;; # unknown yet: fall back to node1 and let the caller retry
+esac
 
 echo ""
 echo -e "${GREEN}Cluster is ready!${NC}"
@@ -122,11 +139,11 @@ echo "Example commands:"
 echo -e "  ${YELLOW}# Check status${NC}"
 echo "  curl http://localhost:9080/status | jq"
 echo ""
-echo -e "  ${YELLOW}# Store data${NC}"
-echo "  curl -X PUT http://localhost:9080/kv -d '{\"key\":\"hello\",\"value\":\"world\"}'"
+echo -e "  ${YELLOW}# Store data (must go to the leader; currently port $LEADER_PORT)${NC}"
+echo "  curl -X PUT http://localhost:$LEADER_PORT/kv -d '{\"key\":\"hello\",\"value\":\"world\"}'"
 echo ""
-echo -e "  ${YELLOW}# Retrieve data${NC}"
-echo "  curl http://localhost:9080/kv/hello"
+echo -e "  ${YELLOW}# Retrieve data (reads also require the leader)${NC}"
+echo "  curl http://localhost:$LEADER_PORT/kv/hello"
 echo ""
 echo -e "  ${YELLOW}# Stop cluster${NC}"
 echo "  ./stop.sh"

@@ -35,8 +35,9 @@ func NewRaftNode(nodeID string, peers []string, transport RPCTransport, applyCh 
 
 func NewRaftNodeWithPersister(
 	nodeID string, peers []string, transport RPCTransport, applyCh chan ApplyMsg, persister Persister,
+	opts ...Option,
 ) (*RaftNode, error) {
-	state, err := NewRaftStateWithPersister(nodeID, peers, applyCh, persister)
+	state, err := NewRaftStateWithPersister(nodeID, peers, applyCh, persister, opts...)
 	if err != nil {
 		// Refuse to construct/start the node when persistent state cannot be
 		// trusted; the caller is expected to abort startup.
@@ -58,7 +59,10 @@ func NewRaftNodeWithPersister(
 }
 
 func (rn *RaftNode) run() {
-	ticker := time.NewTicker(raftTickInterval)
+	// The tick period is the node's heartbeat interval (raft.Timing,
+	// KNOWN_ISSUES.md R16): handleTick sends heartbeats when leader, once per
+	// tick, so this is what actually governs heartbeat cadence.
+	ticker := time.NewTicker(rn.state.HeartbeatInterval())
 	defer ticker.Stop()
 
 	for {
