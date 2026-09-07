@@ -262,9 +262,16 @@ func (hs *HTTPServer) handleClusterRemove(w http.ResponseWriter, r *http.Request
 
 // handleClusterChange proposes one membership change. Only the leader can start
 // one, so a follower answers with the same 503 + X-Raft-Leader redirect the
-// write path uses. Success means the joint configuration has been appended and
-// is in effect here — not that the change is complete; the caller polls
-// GET /cluster/config until "joint" is false.
+// write path uses. Success means the configuration in the response has been
+// appended and is in effect here — not that the change is complete:
+//
+//   - an add returns a configuration listing the server under "learners". It is
+//     being caught up and is not counted by any quorum yet; the leader promotes
+//     it to a voter by itself once it has caught up (KNOWN_ISSUES.md R20). The
+//     caller polls GET /cluster/config until the node appears in "voters" and
+//     "learners" is gone;
+//   - removing a voter returns the joint configuration; the caller polls until
+//     "joint" is false.
 func (hs *HTTPServer) handleClusterChange(w http.ResponseWriter, r *http.Request, add bool) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -348,6 +355,12 @@ func clusterConfigBody(clusterConfig *raft.ClusterConfig) map[string]interface{}
 	body["voters"] = clusterConfig.Voters
 	if clusterConfig.OldVoters != nil {
 		body["old_voters"] = clusterConfig.OldVoters
+	}
+	// Reported only while a catch-up is under way, so an operator polling this
+	// endpoint sees exactly one of "learners" (still catching up) or the node
+	// among "voters" (promoted) — KNOWN_ISSUES.md R20.
+	if len(clusterConfig.Learners) > 0 {
+		body["learners"] = clusterConfig.Learners
 	}
 	return body
 }
