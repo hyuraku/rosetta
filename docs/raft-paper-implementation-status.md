@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-06 against commit `e183622`
+> 最終検証: 2026-09-07 against commit `7a73481`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -19,7 +19,7 @@
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID、R19 以降はその修正作業中に見つかった ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: グループ R のうち R16, R18, R20（計 3 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）と、InstallSnapshot の chunk 転送（R15・`c8c87d0` / `3ad0220` / `b3fbdbb`）も解消した。R14（joint consensus による動的メンバーシップ）も解消した（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。ただし learner が未実装（R20）であるなど残る項目があるため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: グループ R のうち R20（1 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）と、InstallSnapshot の chunk 転送（R15・`c8c87d0` / `3ad0220` / `b3fbdbb`）も解消した。R14（joint consensus による動的メンバーシップ）も解消した（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。R16（設定の raft への配線、`5aff2e6`）と R18（benchmark/examples の契約、`3438f81`）も解消した。ただし learner が未実装（R20）であるなど残る項目があるため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -45,16 +45,21 @@ const (
     Leader
 )
 
-// raft/state.go:136 - ランダム化された選挙タイムアウト (150-300ms)
-randomTimeout := electionTimeoutBaseMs + rand.Intn(electionTimeoutJitterMs)
+// raft/state.go:627-643 - リセット時に再ランダム化（R16: raft.Timing 経由、
+// 既定は electionTimeoutBaseMs/electionTimeoutJitterMs＝150-300ms のまま不変）
+func (rs *RaftState) resetElectionTimerLocked() {
+    rs.electionTimeout = rs.randomElectionTimeoutLocked()
+    rs.electionTimer.Reset(rs.electionTimeout)
+    rs.lastHeartbeat = time.Now()
+}
 
-// raft/state.go:255-262 - リセット時も再ランダム化
-func (rs *RaftState) ResetElectionTimer() {
-    randomTimeout := electionTimeoutBaseMs + rand.Intn(electionTimeoutJitterMs)
-    rs.electionTimeout = time.Duration(randomTimeout) * time.Millisecond
-    ...
+func (rs *RaftState) randomElectionTimeoutLocked() time.Duration {
+    jitter := time.Duration(rand.Int63n(int64(rs.timing.ElectionTimeoutJitter)))
+    return rs.timing.ElectionTimeoutBase + jitter
 }
 ```
+
+`rs.timing`（`raft.Timing`）はコンストラクタで一度だけ設定され（既定は `raft.DefaultTiming()`）、`raft.WithTiming` オプション経由で `config.Config` の `ElectionTimeout`/`HeartbeatTimeout` から上書きできる（`main.go` の `resolveConfig` 後）。以前はこの計算がパッケージ定数 `electionTimeoutBaseMs`/`electionTimeoutJitterMs` を直接読んでおり、設定ファイルの値は捨てられていた（R16、`5aff2e6`）。
 
 **RequestVote RPC構造体** (`raft/rpc.go:11-16`):
 ```go
@@ -470,7 +475,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 - リース方式にあったクロック依存・過半数喪失時の step-down 欠如がなくなりました。孤立した旧リーダーは `confirmLeadership` が過半数 ACK を得られず `ErrLeadershipNotConfirmed` を返し、stale 値を返しません。より高い term を見たら `stepDown` します。D1/D2 解消（commit `b3b21a4`）。see ../KNOWN_ISSUES.md (D1, D2)
 - 当選時 no-op（`becomeLeader`）により、新リーダーは前任 term のコミット済みエントリを advance してから読みを許可します。D3 解消（commit `60fd631`）。see ../KNOWN_ISSUES.md (D3)
 
-**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、グループ R の未修正項目（R13–R16, R18）が残る点は変わりません。
+**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、グループ R の未修正項目（R20、learner／non-voting member）が残る点は変わりません。
 
 ---
 
@@ -501,7 +506,8 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 8. ✅ 完了 — R15（chunk transfer、`c8c87d0` / `3ad0220` / `b3fbdbb`） — P2
 9. ✅ 完了 — R14（joint consensus）を state（`9da332c`）→ quorum（`3a82a6a`）→
    管理 API（`49e513e`）→ snapshot（`54fba63`）の順に実装 — P2
-10. R16、R18（設定、examples/benchmark）、R20（learner／non-voting member） — P2/P3
+10. ✅ 完了 — R16（設定の raft への配線、`5aff2e6`）、R18（benchmark/examples の契約、
+    `3438f81`） — P3。R20（learner／non-voting member）は未着手 — P2
 
 ---
 

@@ -9,8 +9,24 @@ The benchmark tool allows you to:
 - Test read performance (GET operations)
 - Test mixed workloads
 - Measure latency distributions (p50, p95, p99)
-- Measure throughput
+- Measure throughput and success rate, with a breakdown by HTTP status
 - Test with various concurrency levels
+
+Reads are guaranteed to hit: keys are derived deterministically from an index
+(`keyForIndex` in `keys.go`), and every read picks an index from the range a
+preload pass already confirmed as written, so a healthy cluster reports very
+close to 100% success on the default (mixed) workload — a run that reports a
+lot of `404` in the status breakdown, not just a nonzero `Failed` count, means
+something upstream of the benchmark's own key generation is wrong (wrong
+cluster, wrong port, cluster lost the data). See [KNOWN_ISSUES.md](../../KNOWN_ISSUES.md)
+(R18, fixed).
+
+Command-line arguments are validated up front (`-ops`/`-concurrency`/
+`-value-size`/`-report-interval` must be positive, `-read-ratio` must be in
+`[0, 1]`, `-duration` must be `>= 0`, and `-key-size` must be large enough to
+hold the key prefix plus every digit of the largest index the run plans to
+generate) — an invalid combination prints a usage message and exits with
+status 2 instead of failing deep inside a worker goroutine.
 
 ## Prerequisites
 
@@ -40,8 +56,9 @@ curl -s http://localhost:9080/leader | jq
 ### 2. Run Basic Benchmark
 
 ```bash
-# Build the benchmark tool
-go build -o benchmark benchmark.go
+# Build the benchmark tool (the package now spans benchmark.go and keys.go,
+# so `go build benchmark.go` alone no longer works — build the package instead)
+go build -o benchmark .
 
 # Run default benchmark (mixed workload)
 ./benchmark -url=http://localhost:9080
@@ -117,6 +134,7 @@ Progress: 5000/5000 ops (100.0%) - Elapsed: 10.7s
 Total Operations: 5000
 Successful: 5000
 Failed: 0
+Success Rate: 100.00%
 Duration: 10.7s
 Throughput: 467 ops/sec
 
@@ -127,6 +145,14 @@ Write Latency:
   P50: 42.1ms
   P95: 78.4ms
   P99: 125.6ms
+
+Status Breakdown:
+  2xx:                       5000
+  404 Not Found:             0
+  503 Service Unavailable:   0
+  Other 4xx:                 0
+  5xx:                       0
+  Transport errors/timeouts: 0
 ```
 
 ### Scenario 2: Read Performance
@@ -459,9 +485,12 @@ cat results.txt
 ```
 
 **Expected behavior:** writes fail for roughly one election timeout
-(150-300ms, randomized per node) until a new leader is elected. Election
-and heartbeat timeouts are currently hardcoded in `raft/state.go`, so they
-cannot be tuned via flags or the config file.
+(150-300ms by default, randomized per node) until a new leader is elected.
+Election and heartbeat timeouts are configurable via the `-config` file's
+`election_timeout`/`heartbeat_timeout` (see the main [README](../../README.md)'s
+Configuration section) — there is no per-flag override, so a different value
+means running the cluster with `-config` rather than the individual `-id`/
+`-listen`/... flags used elsewhere in this README (KNOWN_ISSUES.md R16, fixed).
 
 ### Testing Network Partition
 
@@ -486,11 +515,15 @@ sudo iptables -D OUTPUT -d <node2-ip> -j DROP
 
 ## Sample Benchmark Tool
 
-See `benchmark.go` for the complete implementation.
+See `benchmark.go` for the complete implementation, and `keys.go` for the
+deterministic key generation (`keyForIndex`) that preload/read/write share —
+covered by `keys_test.go`.
 
 Key features:
 - Concurrent worker goroutines
+- Deterministic, collision-checked key generation shared between preload, reads and writes
 - Latency histogram tracking
 - Progress reporting
-- Comprehensive results output
+- Success rate and per-status-code breakdown in the results
+- Argument validation (exits 2 with a usage message on an invalid combination)
 - Support for various workload patterns

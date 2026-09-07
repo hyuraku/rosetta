@@ -157,7 +157,8 @@ go test ./tests/unit/... -v
 go test ./tests/integration/... -v
 
 # HTTP-level benchmark (no Go Benchmark functions exist; use the benchmark tool)
-# see examples/benchmark/
+cd examples/benchmark && go build . && ./benchmark -url=http://localhost:9080
+# see examples/benchmark/ for options, argument validation, and report format
 
 # Race condition detection
 go test -race ./...
@@ -180,7 +181,26 @@ Command line options:
 - `-listen`: Raft RPC listen address
 - `-http`: HTTP API listen address
 - `-peers`: Comma-separated list of peer nodes (format: `id:addr,id:addr`)
-- `-config`: Configuration file path
+- `-config`: Configuration file path (JSON). There is no per-field command-line
+  flag for anything below this table — the individual `-id`/`-listen`/`-http`/
+  `-peers` flags above are the only way to set those fields without a file.
+  `LoadConfig` starts from the defaults below and overlays whatever the file
+  sets, so a file that only sets `node_id` still gets every other field's
+  default rather than Go's zero value.
+
+  | Key | Default | Meaning |
+  |-----|---------|---------|
+  | `node_id`, `listen_addr`, `http_server_addr`, `peers`, `data_dir` | see `-id`/`-listen`/`-http`/`-peers` above, `./data` | Same as the matching flag |
+  | `election_timeout` | `150ms` | Election timeout **base**. The jitter added on top is the same length again, so the effective range is `[election_timeout, 2*election_timeout)` — 150-300ms at the default, matching raft's original hardcoded constants |
+  | `heartbeat_timeout` | `50ms` | Leader heartbeat interval, which is also how often the node's internal event loop ticks |
+  | `max_raft_state` | `1000` | Log entries applied before an automatic snapshot/compaction |
+  | `snapshot_interval` | `100` | **Reserved, not read by anything yet** — automatic snapshotting is driven only by `max_raft_state` today. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R16) |
+  | `log_level` | `"INFO"` | **Reserved, not read by anything yet** |
+  | `http_read_timeout`, `http_write_timeout` | `10s` each | HTTP server timeouts |
+
+  `Validate` rejects `election_timeout <= heartbeat_timeout` and, separately,
+  `election_timeout < 2*heartbeat_timeout` (paper §5.2: broadcastTime should be
+  much smaller than the election timeout, not merely smaller).
 - `-join`: Reserved, and still **rejected** if given a non-empty value: startup
   fails fast with an error. Membership changes now exist, but they are granted by
   the leader (`POST /cluster/add`), not asserted by the joining node — which has
@@ -224,7 +244,7 @@ Cluster sizing: Raft needs a majority to commit, so run an odd number of nodes �
 
 ## Implementation Details
 
-- **Election Timeouts**: Randomized timeouts (150ms + offset) prevent split votes
+- **Election Timeouts**: Randomized timeouts (150ms + offset by default) prevent split votes; both the base and the heartbeat interval are configurable via `-config` (see Configuration above) — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R16, fixed)
 - **Log Consistency**: AppendEntries includes consistency checks with backtracking
 - **Pending Operations**: Request tracking with unique IDs for client matching. The tracking entry is registered before the command is submitted to Raft, not after, so a commit that completes unusually fast can never find nothing to deliver its result to — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R9, fixed)
 - **State Persistence**: Durable storage of Raft state and log entries
