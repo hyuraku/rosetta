@@ -18,6 +18,12 @@ type RaftNode struct {
 	// caller still waits for the goroutines through RaftState.Stop.
 	killOnce sync.Once
 
+	// peerAddrSink receives the cluster configuration's peer addresses when they
+	// change; publishedAddrs is the last set handed to it. Both are guarded by
+	// rn.mu and only touched from the event loop and the setter.
+	peerAddrSink   func(map[string]string)
+	publishedAddrs map[string]string
+
 	logger *log.Logger
 }
 
@@ -75,16 +81,107 @@ func (rn *RaftNode) handleElectionTimeout() {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	if rn.state.GetNodeState() != Leader {
-		rn.logger.Printf("Election timeout, starting election for term %d", rn.state.GetCurrentTerm()+1)
-		rn.state.startElection(rn.transport)
+	if rn.state.GetNodeState() == Leader {
+		return
 	}
+	// A server that is not a voter in the configuration it holds must not
+	// campaign (paper §6). Two cases reach here: a server started with the
+	// existing cluster's peer list so it can be added to it, which is not in any
+	// configuration until C_old,new reaches its log; and a server that has been
+	// removed but has not shut down yet. Neither can win, and both would raise
+	// the cluster's term on every timeout if they tried. This is the weaker,
+	// local half of the protection — the disruption check in RequestVote is what
+	// protects the cluster from a server that campaigns anyway
+	// (KNOWN_ISSUES.md R14).
+	if !rn.state.IsVoter() {
+		return
+	}
+	rn.logger.Printf("Election timeout, starting election for term %d", rn.state.GetCurrentTerm()+1)
+	rn.state.startElection(rn.transport)
 }
 
 func (rn *RaftNode) handleTick() {
+	rn.publishPeerAddresses()
 	if rn.state.GetNodeState() == Leader {
 		rn.state.sendHeartbeats(rn.transport)
 	}
+}
+
+// publishPeerAddresses hands the current configuration's peer addresses to the
+// registered sink whenever they have changed, so the transport's address book
+// follows the cluster configuration instead of the -peers flag the process
+// started with (KNOWN_ISSUES.md R14).
+//
+// It runs on the event loop rather than at the point the configuration changes,
+// which keeps it off every lock-holding path: a configuration entry can land in
+// an RPC handler under rs.mu, and calling out to the transport from there would
+// invert the lock order between the Raft state and the transport's own mutex.
+// The cost is that the address book lags a configuration change by at most one
+// tick — harmless, since a peer that cannot be resolved yet is simply retried by
+// the next replication round.
+func (rn *RaftNode) publishPeerAddresses() {
+	rn.mu.Lock()
+	sink := rn.peerAddrSink
+	rn.mu.Unlock()
+	if sink == nil {
+		return
+	}
+
+	addrs := rn.state.PeerAddresses()
+
+	rn.mu.Lock()
+	if samePeerAddresses(rn.publishedAddrs, addrs) {
+		rn.mu.Unlock()
+		return
+	}
+	rn.publishedAddrs = addrs
+	rn.mu.Unlock()
+
+	sink(addrs)
+}
+
+func samePeerAddresses(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if other, ok := b[k]; !ok || other != v {
+			return false
+		}
+	}
+	return true
+}
+
+// SetPeerAddressSink registers a callback that receives the addresses of the
+// other servers in the cluster configuration whenever they change. main.go wires
+// it to the transport's address book. The callback runs on the Raft event loop
+// and must not block or call back into the node.
+func (rn *RaftNode) SetPeerAddressSink(sink func(map[string]string)) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+	rn.peerAddrSink = sink
+	rn.publishedAddrs = nil
+}
+
+// SetPeerAddresses records the addresses of servers already in the cluster
+// configuration whose address is not yet known — the fixed -peers startup path.
+func (rn *RaftNode) SetPeerAddresses(addrs map[string]string) {
+	rn.state.SetPeerAddresses(addrs)
+}
+
+// ProposeConfigChange starts a cluster configuration change (paper §6). It must
+// be called on the leader; every other node returns ErrNotLeader so the HTTP
+// layer can redirect. The returned configuration is the joint one that has just
+// been appended — the change is complete only once C_new commits, which the
+// leader drives on its own.
+func (rn *RaftNode) ProposeConfigChange(add bool, nodeID, addr string) (*ClusterConfig, error) {
+	return rn.state.ProposeConfigChange(add, nodeID, addr)
+}
+
+// GetClusterConfig returns the cluster configuration currently in effect on this
+// node.
+func (rn *RaftNode) GetClusterConfig() *ClusterConfig {
+	return rn.state.GetClusterConfig()
 }
 
 func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {

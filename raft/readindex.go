@@ -60,7 +60,11 @@ func (rs *RaftState) ReadIndex(transport RPCTransport) (int, error) {
 		rs.mu.RUnlock()
 		return 0, ErrNoCurrentTermCommit
 	}
-	if len(rs.peers) == 1 {
+	// A configuration in which this node alone is a majority needs no round trip.
+	// Asking the configuration rather than counting a fixed peer list is what
+	// keeps this correct while the cluster is growing or shrinking, joint
+	// configurations included (KNOWN_ISSUES.md R14).
+	if rs.quorumReachedLocked(map[string]bool{rs.nodeID: true}) {
 		rs.mu.RUnlock()
 		return readIndex, nil
 	}
@@ -69,16 +73,10 @@ func (rs *RaftState) ReadIndex(transport RPCTransport) (int, error) {
 	// which is all leadership confirmation requires.
 	prevLogIndex := rs.lastAbsLogIndex()
 	prevLogTerm := rs.lastAbsLogTerm()
-	peers := make([]string, 0, len(rs.peers))
-	for _, p := range rs.peers {
-		if p != rs.nodeID {
-			peers = append(peers, p)
-		}
-	}
-	majority := len(rs.peers)/quorumDivisor + 1
+	peers := rs.peerIDsLocked()
 	rs.mu.RUnlock()
 
-	if rs.confirmLeadership(transport, currentTerm, readIndex, prevLogIndex, prevLogTerm, peers, majority) {
+	if rs.confirmLeadership(transport, currentTerm, readIndex, prevLogIndex, prevLogTerm, peers) {
 		return readIndex, nil
 	}
 	// confirmLeadership steps down if it observed a higher term; distinguish that
@@ -88,6 +86,15 @@ func (rs *RaftState) ReadIndex(transport RPCTransport) (int, error) {
 		return 0, ErrNotLeader
 	}
 	return 0, ErrLeadershipNotConfirmed
+}
+
+// heartbeatAck is one peer's answer to a leadership-confirmation heartbeat. The
+// peer's identity travels with the term because quorum is decided over the *set*
+// of servers that answered, not a count: under joint consensus the same set has
+// to contain a majority of the old and of the new configuration (§6).
+type heartbeatAck struct {
+	peerID string
+	term   int
 }
 
 // confirmLeadership sends an empty AppendEntries (heartbeat) to every peer in
@@ -100,10 +107,9 @@ func (rs *RaftState) confirmLeadership(
 	transport RPCTransport,
 	currentTerm, leaderCommit, prevLogIndex, prevLogTerm int,
 	peers []string,
-	majority int,
 ) bool {
 	// Buffered so no goroutine leaks if we return after reaching quorum early.
-	results := make(chan int, len(peers))
+	results := make(chan heartbeatAck, len(peers))
 	for _, peer := range peers {
 		// Spawned through rs.spawn so Kill waits for these heartbeats
 		// (KNOWN_ISSUES.md R19). A refused spawn means shutdown has begun; it
@@ -122,31 +128,39 @@ func (rs *RaftState) confirmLeadership(
 			defer cancel()
 			reply, err := transport.SendAppendEntries(ctx, peer, args)
 			if err != nil {
-				results <- -1 // unreachable within the deadline
+				results <- heartbeatAck{peerID: peer, term: -1} // unreachable within the deadline
 				return
 			}
-			results <- reply.Term
+			results <- heartbeatAck{peerID: peer, term: reply.Term}
 		})
 		if !started {
-			results <- -1
+			results <- heartbeatAck{peerID: peer, term: -1}
 		}
 	}
 
-	acks := 1 // count ourselves
+	acks := map[string]bool{rs.nodeID: true} // count ourselves
 	for range peers {
-		term := <-results
+		ack := <-results
 		switch {
-		case term > currentTerm:
-			rs.stepDown(term)
+		case ack.term > currentTerm:
+			rs.stepDown(ack.term)
 			return false
-		case term == currentTerm:
-			acks++
-			if acks >= majority {
+		case ack.term == currentTerm:
+			acks[ack.peerID] = true
+			if rs.quorumReached(acks) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// quorumReached evaluates agreement under the configuration currently in effect
+// for callers that hold no lock.
+func (rs *RaftState) quorumReached(agree map[string]bool) bool {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	return rs.quorumReachedLocked(agree)
 }
 
 // stepDown reverts this node to a follower at newTerm when newTerm is newer than

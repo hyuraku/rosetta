@@ -3,7 +3,7 @@ package raft
 import (
 	"context"
 	"encoding/json"
-	"sync"
+	"time"
 )
 
 type RequestVoteArgs struct {
@@ -61,6 +61,19 @@ type InstallSnapshotArgs struct {
 	Data []byte `json:"data"`
 	// Done marks the final chunk of this snapshot.
 	Done bool `json:"done,omitempty"`
+	// Config is the cluster configuration in effect at LastIncludedIndex.
+	//
+	// A snapshot subsumes the log entries below its boundary, configuration
+	// entries included, so a follower that installs one would otherwise lose
+	// every trace of the configuration it is meant to be part of — and, having
+	// discarded that prefix, could never be told again (paper §6/§7: a snapshot
+	// carries the latest configuration). It is sent on every chunk and read from
+	// the final one; all chunks of a transfer describe the same envelope, so
+	// which one is read does not matter.
+	//
+	// Nil from a sender that predates dynamic membership, in which case the
+	// receiver keeps the configuration it already has.
+	Config *ClusterConfig `json:"config,omitempty"`
 }
 
 // InstallSnapshotReply answers one chunk.
@@ -90,6 +103,26 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	reply.VoteGranted = false
 
 	if args.Term < rs.persistent.CurrentTerm {
+		return
+	}
+
+	// Disruption check (paper §6, last paragraph): a server that has heard from
+	// its leader within the minimum election timeout disregards RequestVote
+	// entirely — it does not grant the vote and, crucially, does not adopt the
+	// candidate's term.
+	//
+	// This is what makes removing a server safe. A server that has been taken out
+	// of the configuration stops receiving heartbeats, times out, and campaigns
+	// with ever-increasing terms; without this check each of those RPCs would
+	// depose the perfectly healthy leader and the cluster would never make
+	// progress again (KNOWN_ISSUES.md R14). It costs nothing in the normal case:
+	// a genuinely dead leader stops resetting lastHeartbeat, the window lapses,
+	// and the next candidate is heard. It has to precede the term adoption below,
+	// which is the very thing being suppressed.
+	if args.Term > rs.persistent.CurrentTerm && rs.currentLeader != "" &&
+		time.Since(rs.lastHeartbeat) < minElectionTimeout {
+		rs.logger.Printf("RequestVote: ignoring %s's request for term %d; heard from leader %s %v ago",
+			args.CandidateID, args.Term, rs.currentLeader, time.Since(rs.lastHeartbeat))
 		return
 	}
 
@@ -172,7 +205,16 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	// agree, which is why the failure path below rolls the merge back.
 	if len(args.Entries) > 0 {
 		previousLog := rs.persistent.Log
+		previousConfig := rs.persistent.Config
 		if rs.mergeLogEntries(args) {
+			// A merge can both add and remove configuration entries — the append
+			// puts a new configuration into effect the moment it lands (§6), and
+			// the conflict truncation that may precede it reverts to whatever
+			// configuration entry is now last. Re-deriving covers both, and doing
+			// it before the persist is what puts the configuration on disk in the
+			// same write as the log it was derived from.
+			rs.recomputeConfigLocked()
+
 			// The appended entries must be durable before we acknowledge them: a
 			// leader that sees Success advances its commit index, so reporting
 			// success for entries we could lose on a crash would break the log
@@ -191,6 +233,7 @@ func (rs *RaftState) AppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 				// caps the slice before appending, so the discarded entries stay
 				// intact in the old backing array — and rs.mu is held throughout.
 				rs.persistent.Log = previousLog
+				rs.persistent.Config = previousConfig
 
 				// Tell the leader this was a transient storage failure, not a log
 				// conflict. Left at their zero value, ConflictTerm/ConflictIndex
@@ -383,37 +426,36 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 	lastLogIndex := rs.lastAbsLogIndex()
 	lastLogTerm := rs.lastAbsLogTerm()
 
-	// Use a vote counter that's protected by the RaftState mutex
-	votes := 1
-	votesNeeded := len(rs.peers)/quorumDivisor + 1
+	// Votes are tracked as the *set* of servers that granted one, not a count,
+	// because under joint consensus a majority has to be found separately in the
+	// old and the new voter set (KNOWN_ISSUES.md R14, §6). The set is only ever
+	// read and written under rs.mu — created here, updated in
+	// requestVoteFromPeer's locked section — so it needs no lock of its own.
+	votes := map[string]bool{rs.nodeID: true}
+	peers := rs.peerIDsLocked()
 	// Re-arm the (already fired) timer under the same lock the RPC handlers hold
 	// when they reset it, so this election's timeout does not race with an
 	// incoming AppendEntries (KNOWN_ISSUES.md E1). It also bounds this election:
 	// if it draws no quorum, the timeout starts the next one.
 	rs.resetElectionTimerLocked()
-	rs.mu.Unlock()
 
-	// If this is a single-node cluster, immediately become leader. becomeLeader
-	// appends the current-term no-op and stops the election timer.
-	if len(rs.peers) == 1 {
-		rs.mu.Lock()
+	// A single-voter configuration is its own majority, so the self-vote already
+	// wins the election. Asking the configuration rather than counting peers also
+	// covers the case where this node is not a voter at all: QuorumReached is
+	// then false and the election proceeds (and draws nothing), which
+	// handleElectionTimeout avoids reaching in the first place.
+	if rs.quorumReachedLocked(votes) {
 		rs.becomeLeader()
 		rs.mu.Unlock()
 		return
 	}
+	rs.mu.Unlock()
 
-	// Use a mutex to protect vote counting across goroutines
-	var voteMu sync.Mutex
-
-	for _, peer := range rs.peers {
-		if peer == rs.nodeID {
-			continue
-		}
-
+	for _, peer := range peers {
 		// Spawned through rs.spawn so Kill can wait for it; after Stop nothing is
 		// started and this election simply draws no votes (KNOWN_ISSUES.md R19).
 		rs.spawn(func() {
-			rs.requestVoteFromPeer(transport, peer, currentTerm, lastLogIndex, lastLogTerm, votesNeeded, &votes, &voteMu)
+			rs.requestVoteFromPeer(transport, peer, currentTerm, lastLogIndex, lastLogTerm, votes)
 		})
 	}
 }
@@ -424,9 +466,8 @@ func (rs *RaftState) startElection(transport RPCTransport) {
 func (rs *RaftState) requestVoteFromPeer(
 	transport RPCTransport,
 	peerID string,
-	currentTerm, lastLogIndex, lastLogTerm, votesNeeded int,
-	votes *int,
-	voteMu *sync.Mutex,
+	currentTerm, lastLogIndex, lastLogTerm int,
+	votes map[string]bool,
 ) {
 	args := &RequestVoteArgs{
 		Term:         currentTerm,
@@ -461,12 +502,14 @@ func (rs *RaftState) requestVoteFromPeer(
 	}
 
 	if reply.VoteGranted {
-		voteMu.Lock()
-		*votes++
-		currentVotes := *votes
-		voteMu.Unlock()
+		votes[peerID] = true
 
-		if currentVotes >= votesNeeded && rs.state == Candidate {
+		// Evaluated against the configuration in effect right now, which under
+		// joint consensus needs a majority of the old *and* the new voter set
+		// (§6). A candidate does not append entries, so its configuration can
+		// only change by accepting a leader's — at which point it is no longer a
+		// Candidate and the check above has already returned.
+		if rs.quorumReachedLocked(votes) && rs.state == Candidate {
 			// becomeLeader appends the current-term no-op, initializes leader
 			// state, and stops the election timer. We already hold rs.mu.
 			rs.becomeLeader()
@@ -484,9 +527,10 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	currentTerm := rs.persistent.CurrentTerm
 	commitIndex := rs.volatile.CommitIndex
 
-	// For a single-node cluster the leader is its own majority, so it can commit
-	// outstanding entries directly.
-	if len(rs.peers) == 1 {
+	// With no other server in the configuration the leader is its own majority,
+	// so it can commit outstanding entries directly.
+	peers := rs.peerIDsLocked()
+	if len(peers) == 0 {
 		rs.updateCommitIndex()
 		rs.mu.Unlock()
 		return
@@ -496,9 +540,9 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	// still have a round outstanding. Claiming under the same lock that reads the
 	// term and commit index is what makes the serialization airtight: two ticks
 	// cannot both see a peer idle.
-	targets := make([]string, 0, len(rs.peers))
-	for _, peer := range rs.peers {
-		if peer == rs.nodeID || rs.leader.inFlight[peer] {
+	targets := make([]string, 0, len(peers))
+	for _, peer := range peers {
+		if rs.leader.inFlight[peer] {
 			continue
 		}
 		rs.leader.inFlight[peer] = true
@@ -770,7 +814,14 @@ func (rs *RaftState) sendSnapshotToPeer(
 			snapshot.LastIncludedIndex, peerID, nextIndex)
 		return
 	}
-	if !rs.streamSnapshotToPeer(transport, peerID, currentTerm, snapshot) {
+	// The configuration to ship is the one in effect at the envelope's boundary,
+	// not the leader's current one: the follower will replay every entry above
+	// that boundary, configuration entries included, and would otherwise be
+	// seeded with a configuration newer than the log position it is being placed
+	// at (KNOWN_ISSUES.md R14). configAtIndex answers for exactly the index the
+	// envelope names, so the pairing stays one generation the way R4 requires.
+	boundaryConfig := rs.configAtIndex(snapshot.LastIncludedIndex)
+	if !rs.streamSnapshotToPeer(transport, peerID, currentTerm, snapshot, boundaryConfig) {
 		return
 	}
 
@@ -824,6 +875,7 @@ func (rs *RaftState) streamSnapshotToPeer(
 	peerID string,
 	currentTerm int,
 	snapshot *SnapshotData,
+	config *ClusterConfig,
 ) bool {
 	chunkSize := rs.getSnapshotChunkSize()
 
@@ -843,7 +895,7 @@ func (rs *RaftState) streamSnapshotToPeer(
 			return false
 		}
 
-		reply, err := rs.sendSnapshotChunk(transport, peerID, currentTerm, snapshot, offset, end, done)
+		reply, err := rs.sendSnapshotChunk(transport, peerID, currentTerm, snapshot, config, offset, end, done)
 		if err != nil {
 			rs.logger.Printf("sendSnapshotToPeer: chunk at offset %d of the snapshot at index %d "+
 				"failed for %s, abandoning this round: %v",
@@ -880,6 +932,7 @@ func (rs *RaftState) sendSnapshotChunk(
 	peerID string,
 	currentTerm int,
 	snapshot *SnapshotData,
+	config *ClusterConfig,
 	offset, end int,
 	done bool,
 ) (*InstallSnapshotReply, error) {
@@ -891,6 +944,7 @@ func (rs *RaftState) sendSnapshotChunk(
 		Offset:            offset,
 		Data:              snapshot.Data[offset:end],
 		Done:              done,
+		Config:            config,
 	}
 
 	// The timeout bounds one chunk, which is the point of chunking: a slow link
@@ -924,6 +978,9 @@ func (rs *RaftState) stepDownIfHigherTerm(replyTerm int, where string) bool {
 	return true
 }
 
+// updateCommitIndex advances the leader's commit index over every entry of its
+// own term that a quorum has stored, then lets the configuration change (if any)
+// make its next move. Callers must hold rs.mu.
 func (rs *RaftState) updateCommitIndex() {
 	if rs.state != Leader {
 		return
@@ -934,18 +991,30 @@ func (rs *RaftState) updateCommitIndex() {
 			continue
 		}
 
-		count := 1
-		for _, peer := range rs.peers {
-			if peer != rs.nodeID && rs.leader.MatchIndex[peer] >= n {
-				count++
+		// Which servers store index n, as a set: the leader itself (its log is
+		// the one being counted) plus every peer whose MatchIndex has reached n.
+		// Whether any of them actually counts is the configuration's decision —
+		// under joint consensus n needs a majority in both voter sets, and a
+		// leader that has been voted out of C_new contributes nothing
+		// (KNOWN_ISSUES.md R14, §6).
+		agree := map[string]bool{rs.nodeID: true}
+		for peer, matchIndex := range rs.leader.MatchIndex {
+			if matchIndex >= n {
+				agree[peer] = true
 			}
 		}
 
-		if count*2 > len(rs.peers) {
+		if rs.quorumReachedLocked(agree) {
 			rs.volatile.CommitIndex = n
 			rs.notifyApplierLocked()
 		}
 	}
+
+	// A committed joint configuration is what lets C_new be appended, and a
+	// committed C_new is what lets a removed leader step down. Both are decided
+	// by the commit index, so this is the one place that has to look
+	// (raft/membership.go).
+	rs.advanceConfigChangeLocked()
 }
 
 func SerializeRequestVote(args *RequestVoteArgs) ([]byte, error) {
@@ -1097,48 +1166,8 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		snapshotPersisted = true
 	}
 
-	// Step 2: advance the Raft boundary and make it durable. Everything the
-	// persist covers is saved first so a failed write can be undone exactly:
-	// logAfterSnapshot only re-slices (or drops) the log, so restoring the slice
-	// header restores the entries, and rs.mu is held throughout.
-	prevLog := rs.persistent.Log
-	prevLastIncludedIndex := rs.persistent.LastIncludedIndex
-	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
-	prevCommitIndex := rs.volatile.CommitIndex
-	prevLastApplied := rs.volatile.LastApplied
-
-	// Replace the log per the paper's §7 retention rule: entries the snapshot
-	// covers always go, and the suffix above the boundary survives only when
-	// our entry at LastIncludedIndex agrees with the snapshot's term. Must run
-	// before LastIncludedIndex is advanced below — the rule is evaluated
-	// against the log we still hold.
-	rs.persistent.Log = rs.logAfterSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
-
-	// Update snapshot metadata
-	rs.persistent.LastIncludedIndex = args.LastIncludedIndex
-	rs.persistent.LastIncludedTerm = args.LastIncludedTerm
-
-	// Update commit index and last applied
-	if rs.volatile.CommitIndex < args.LastIncludedIndex {
-		rs.volatile.CommitIndex = args.LastIncludedIndex
-	}
-	if rs.volatile.LastApplied < args.LastIncludedIndex {
-		rs.volatile.LastApplied = args.LastIncludedIndex
-	}
-
-	if err := rs.persist(); err != nil {
-		// Roll the whole install back so memory and disk still agree when this
-		// handler returns, the same discipline AppendEntries follows for a
-		// failed merge (KNOWN_ISSUES.md R2). The payload we already wrote stays
-		// on disk; that only leaves snapshot.json ahead of raft_state.json,
-		// which the startup check and the state machine's monotonicity guard
-		// absorb. The leader retries and the install completes then.
-		rs.persistent.Log = prevLog
-		rs.persistent.LastIncludedIndex = prevLastIncludedIndex
-		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
-		rs.volatile.CommitIndex = prevCommitIndex
-		rs.volatile.LastApplied = prevLastApplied
-		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed, rolled back: %v", err)
+	// Step 2: advance the Raft boundary and make it durable.
+	if !rs.adoptSnapshotBoundaryLocked(args) {
 		return
 	}
 
@@ -1162,6 +1191,72 @@ func (rs *RaftState) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSn
 		SnapshotPersisted: snapshotPersisted,
 	}
 	rs.notifyApplierLocked()
+}
+
+// adoptSnapshotBoundaryLocked is step 2 of InstallSnapshot's durability
+// ordering: it moves the log, the snapshot boundary, the cluster configuration
+// and the volatile indices to the snapshot's generation and makes them durable,
+// reporting whether the write succeeded. Callers must hold rs.mu and must
+// already have made the payload durable (step 1).
+//
+// Everything the persist covers is saved first so a failed write can be undone
+// exactly: logAfterSnapshot only re-slices (or drops) the log, so restoring the
+// slice header restores the entries, and rs.mu is held throughout.
+func (rs *RaftState) adoptSnapshotBoundaryLocked(args *InstallSnapshotArgs) bool {
+	prevLog := rs.persistent.Log
+	prevLastIncludedIndex := rs.persistent.LastIncludedIndex
+	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
+	prevCommitIndex := rs.volatile.CommitIndex
+	prevLastApplied := rs.volatile.LastApplied
+	prevConfig := rs.persistent.Config
+	prevSnapshotConfig := rs.persistent.SnapshotConfig
+
+	// Replace the log per the paper's §7 retention rule: entries the snapshot
+	// covers always go, and the suffix above the boundary survives only when
+	// our entry at LastIncludedIndex agrees with the snapshot's term. Must run
+	// before LastIncludedIndex is advanced below — the rule is evaluated
+	// against the log we still hold.
+	rs.persistent.Log = rs.logAfterSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
+
+	// Update snapshot metadata
+	rs.persistent.LastIncludedIndex = args.LastIncludedIndex
+	rs.persistent.LastIncludedTerm = args.LastIncludedTerm
+
+	// Adopt the configuration the boundary was taken under, then re-derive the
+	// one in effect: any configuration entry that survived the §7 retention rule
+	// above still wins, and if none did, the snapshot's is what is left
+	// (KNOWN_ISSUES.md R14). A sender that did not send one leaves both alone.
+	if args.Config != nil {
+		rs.persistent.SnapshotConfig = args.Config.Clone()
+	}
+	rs.recomputeConfigLocked()
+
+	// Update commit index and last applied
+	if rs.volatile.CommitIndex < args.LastIncludedIndex {
+		rs.volatile.CommitIndex = args.LastIncludedIndex
+	}
+	if rs.volatile.LastApplied < args.LastIncludedIndex {
+		rs.volatile.LastApplied = args.LastIncludedIndex
+	}
+
+	if err := rs.persist(); err != nil {
+		// Roll the whole install back so memory and disk still agree when the
+		// handler returns, the same discipline AppendEntries follows for a
+		// failed merge (KNOWN_ISSUES.md R2). The payload already written stays
+		// on disk; that only leaves snapshot.json ahead of raft_state.json,
+		// which the startup check and the state machine's monotonicity guard
+		// absorb. The leader retries and the install completes then.
+		rs.persistent.Log = prevLog
+		rs.persistent.LastIncludedIndex = prevLastIncludedIndex
+		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
+		rs.volatile.CommitIndex = prevCommitIndex
+		rs.volatile.LastApplied = prevLastApplied
+		rs.persistent.Config = prevConfig
+		rs.persistent.SnapshotConfig = prevSnapshotConfig
+		rs.logger.Printf("InstallSnapshot: persist of snapshot metadata failed, rolled back: %v", err)
+		return false
+	}
+	return true
 }
 
 // acceptSnapshotChunkLocked implements Figure 13's receiver rules 2-4 against

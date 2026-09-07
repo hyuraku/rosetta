@@ -268,12 +268,13 @@ func (kvs *KVStore) applyLoop() {
 			continue
 		}
 
-		// A no-op entry (appended by a newly elected leader, Raft §6.4) carries
-		// no state-machine command. We must still advance lastAppliedIndex over
-		// it — both the log-compaction accounting and the ReadIndex catch-up in
-		// waitForApplied rely on lastAppliedIndex reflecting every committed
-		// index — then skip execution and pendingOps matching.
-		if isNoOpCommand(applyMsg.Command) {
+		// A no-op entry (appended by a newly elected leader, Raft §6.4) and a
+		// cluster configuration entry (Raft §6) carry no state-machine command.
+		// We must still advance lastAppliedIndex over them — both the
+		// log-compaction accounting and the ReadIndex catch-up in waitForApplied
+		// rely on lastAppliedIndex reflecting every committed index — then skip
+		// execution and pendingOps matching.
+		if isBookkeepingEntry(&applyMsg) {
 			kvs.mu.Lock()
 			kvs.lastAppliedIndex = applyMsg.CommandIndex
 			kvs.lastAppliedTerm = applyMsg.CommandTerm
@@ -560,6 +561,14 @@ func (kvs *KVStore) waitForApplied(index int) error {
 			return fmt.Errorf("timed out waiting for state machine to apply through index %d", index)
 		}
 	}
+}
+
+// isBookkeepingEntry reports whether an applied entry is Raft's own bookkeeping
+// rather than a state machine command: the leader's election no-op (§6.4) or a
+// cluster configuration entry (§6, KNOWN_ISSUES.md R14). Neither can be decoded
+// as a Command, and both must still advance lastAppliedIndex — see applyLoop.
+func isBookkeepingEntry(msg *raft.ApplyMsg) bool {
+	return msg.ConfigChange || isNoOpCommand(msg.Command)
 }
 
 // isNoOpCommand reports whether an ApplyMsg command is the leader's no-op marker

@@ -1,6 +1,6 @@
 # Log Compaction and Snapshotting
 
-> Last verified: 2026-09-06 against commit `c6ee4b4`.
+> Last verified: 2026-09-06 against commit `e183622`.
 
 This document describes the log compaction and snapshotting features in Rosetta, which are intended to prevent unbounded log growth and enable efficient operation over long periods.
 
@@ -157,7 +157,7 @@ When a node is far behind or joins the cluster, the design intent is:
        ↓
 [Follower discards conflicting log entries]
        ↓
-[Follower updates snapshot metadata]
+[Follower updates snapshot metadata and adopts the snapshot's configuration]
        ↓
 [Follower sends snapshot to apply channel]
        ↓
@@ -167,6 +167,18 @@ When a node is far behind or joins the cluster, the design intent is:
 ```
 
 > **Note**: This flow works end to end for the four defects it used to have: the production snapshotter is wired so the leader actually sends (A6), the receiver applies the §7 retention rule instead of keeping a divergent suffix (A7, `019d33e` — see "Follower discards conflicting log entries" above, implemented by `logAfterSnapshot` in raft/log.go), the KV store parses the V2 snapshot format (A6), and the installed snapshot is persisted on the follower (A8). The 2026-09-06 re-audit's safety findings on this flow are fixed as well: the leader ships metadata and payload as one generation (R4), both receivers refuse a snapshot at or below what they have already applied (R5), and the payload is made durable before the Raft boundary so a crash falls on the recoverable side (R3). The liveness gap on the same path is closed too: B3 (`f873d9b`) moved the `applyCh` hand-off to a dedicated applier goroutine, so the handler no longer holds `rs.mu` across a send the state machine may be slow to take. See ../KNOWN_ISSUES.md.
+
+> **Cluster configuration**: an `InstallSnapshot` RPC carries the cluster
+> configuration in effect at the snapshot's boundary (`InstallSnapshotArgs.Config`,
+> KNOWN_ISSUES.md R14). It has to: the snapshot subsumes the log prefix below its
+> boundary, configuration entries included, so a follower that installed one
+> would otherwise lose every trace of the configuration it is meant to be part of
+> — and, having discarded that prefix, could never be told again, because the
+> leader no longer holds those entries either. The configuration sent is the one
+> at the *envelope's* boundary, not the leader's current one, because the
+> follower replays the leader's entries above that boundary afterwards. The field
+> is `omitempty`; a sender that attaches none leaves the receiver's configuration
+> alone.
 
 ### 3. Recovery Process
 
@@ -214,9 +226,23 @@ data/
     }
   ],
   "LastIncludedIndex": 1000,
-  "LastIncludedTerm": 9
+  "LastIncludedTerm": 9,
+  "SnapshotConfig": {
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082" }
+  },
+  "Config": {
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082" }
+  }
 }
 ```
+
+Compaction discards configuration entries along with everything else below the
+boundary, so `TruncateLogTo` records the configuration in effect at that
+boundary in `SnapshotConfig` before the entries carrying it go away
+(KNOWN_ISSUES.md R14). That is what the node reverts to once no configuration
+entry is left in the log, and what it recovers on restart. It is kept here, next
+to the boundary it describes, rather than in `snapshot.json`, so compaction never
+has to rewrite the state machine's snapshot file.
 
 ### snapshot.json
 

@@ -72,6 +72,11 @@ func (rs *RaftState) TakeSnapshot(lastIncludedIndex int, snapshotter Snapshotter
 		return err
 	}
 
+	// Record the configuration the boundary is taken under before the entries
+	// carrying it are discarded (see TruncateLogTo).
+	boundaryConfig := rs.configAtIndexLocked(lastIncludedIndex)
+	rs.persistent.SnapshotConfig = boundaryConfig
+
 	// Truncate log - keep only entries after snapshot
 	entriesToKeep := lastIncludedIndex - rs.persistent.LastIncludedIndex
 	if entriesToKeep < len(rs.persistent.Log) {
@@ -132,6 +137,14 @@ func (rs *RaftState) InstallSnapshotFromData(lastIncludedIndex, lastIncludedTerm
 	// Update snapshot metadata
 	rs.persistent.LastIncludedIndex = lastIncludedIndex
 	rs.persistent.LastIncludedTerm = lastIncludedTerm
+
+	// This path installs a snapshot the caller already holds, with no cluster
+	// configuration attached — unlike the InstallSnapshot RPC, which carries the
+	// sender's boundary configuration. SnapshotConfig therefore stays as it was,
+	// and only the configuration in effect is re-derived from whatever log
+	// survived. Callers that need the configuration transferred must use the RPC
+	// path (KNOWN_ISSUES.md R14).
+	rs.recomputeConfigLocked()
 
 	// Update volatile state
 	if rs.volatile.CommitIndex < lastIncludedIndex {
@@ -195,6 +208,16 @@ func (rs *RaftState) TruncateLogTo(absoluteIndex int) error {
 	prevLog := rs.persistent.Log
 	prevLastIncludedIndex := rs.persistent.LastIncludedIndex
 	prevLastIncludedTerm := rs.persistent.LastIncludedTerm
+	prevSnapshotConfig := rs.persistent.SnapshotConfig
+
+	// The configuration in effect at the new boundary has to be recorded before
+	// the entries that carry it are discarded: it becomes what the log reverts to
+	// once no configuration entry is left in it, and what a lagging follower is
+	// told when this boundary is shipped as a snapshot (KNOWN_ISSUES.md R14).
+	// Config itself is unchanged — the entries above the boundary, and therefore
+	// the latest configuration entry, survive.
+	boundaryConfig := rs.configAtIndexLocked(absoluteIndex)
+	rs.persistent.SnapshotConfig = boundaryConfig
 
 	discarded := absoluteIndex - rs.persistent.LastIncludedIndex
 	rs.persistent.Log = rs.persistent.Log[discarded:]
@@ -205,6 +228,7 @@ func (rs *RaftState) TruncateLogTo(absoluteIndex int) error {
 		rs.persistent.Log = prevLog
 		rs.persistent.LastIncludedIndex = prevLastIncludedIndex
 		rs.persistent.LastIncludedTerm = prevLastIncludedTerm
+		rs.persistent.SnapshotConfig = prevSnapshotConfig
 		rs.logger.Printf("TruncateLogTo: persist failed, restored the log at boundary %d: %v",
 			prevLastIncludedIndex, err)
 		return fmt.Errorf("failed to persist state after truncating log: %w", err)

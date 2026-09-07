@@ -31,6 +31,14 @@ const (
 	// rejected explicitly rather than falling through to the "/kv/" prefix
 	// handler and being silently misread as a plain PUT.
 	kvBatchPath = "/kv/batch"
+	// Cluster membership endpoints (KNOWN_ISSUES.md R14). They are served on the
+	// client API port, alongside /kv and /status, because they are operator
+	// requests rather than Raft RPCs. They are unrelated to the
+	// /cluster/join|leave|nodes routes in network/discovery.go, which are
+	// HTTP-level bookkeeping only and are never reached from a normal start.
+	clusterAddPath    = "/cluster/add"
+	clusterRemovePath = "/cluster/remove"
+	clusterConfigPath = "/cluster/config"
 	// minPeerParts is the minimum number of colon-separated fields in a peer spec (id:addr).
 	minPeerParts = 2
 	// httpShutdownTimeout bounds how long a graceful shutdown waits for the
@@ -57,6 +65,9 @@ func NewHTTPServer(kvs *kvstore.KVStore, raftNode *raft.RaftNode, cfg *config.Co
 	mux.HandleFunc("/kv", hs.handleKV)
 	mux.HandleFunc("/status", hs.handleStatus)
 	mux.HandleFunc("/leader", hs.handleLeader)
+	mux.HandleFunc(clusterAddPath, hs.handleClusterAdd)
+	mux.HandleFunc(clusterRemovePath, hs.handleClusterRemove)
+	mux.HandleFunc(clusterConfigPath, hs.handleClusterConfig)
 
 	hs.server = &http.Server{
 		Addr:         cfg.HTTPServerAddr,
@@ -233,21 +244,129 @@ func (hs *HTTPServer) handleLeader(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// validateJoinFlag rejects a non-empty -join value. Dynamic membership is not
-// implemented (KNOWN_ISSUES.md R12/R14): ClusterManager's node bookkeeping
-// (network/discovery.go) is HTTP-level only and is never reflected in the Raft
-// quorum, so honoring -join would let an operator believe a node had safely
-// joined the cluster when it had not. The flag is kept -- reserved, not
-// removed -- so that a caller who still passes it gets this explicit rejection
-// instead of "flag provided but not defined", and can retire the flag from
-// their tooling deliberately. Until real membership changes exist, every node
-// must be started with the same fixed -peers list.
+// clusterChangeRequest is the body of POST /cluster/add and /cluster/remove.
+// Addr is required by add (it is what the rest of the cluster will use to reach
+// the new server) and ignored by remove.
+type clusterChangeRequest struct {
+	NodeID string `json:"node_id"`
+	Addr   string `json:"addr,omitempty"`
+}
+
+func (hs *HTTPServer) handleClusterAdd(w http.ResponseWriter, r *http.Request) {
+	hs.handleClusterChange(w, r, true)
+}
+
+func (hs *HTTPServer) handleClusterRemove(w http.ResponseWriter, r *http.Request) {
+	hs.handleClusterChange(w, r, false)
+}
+
+// handleClusterChange proposes one membership change. Only the leader can start
+// one, so a follower answers with the same 503 + X-Raft-Leader redirect the
+// write path uses. Success means the joint configuration has been appended and
+// is in effect here — not that the change is complete; the caller polls
+// GET /cluster/config until "joint" is false.
+func (hs *HTTPServer) handleClusterChange(w http.ResponseWriter, r *http.Request, add bool) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req clusterChangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.NodeID == "" {
+		writeJSONError(w, http.StatusBadRequest, "node_id required")
+		return
+	}
+	if add && req.Addr == "" {
+		writeJSONError(w, http.StatusBadRequest, "addr required when adding a node")
+		return
+	}
+
+	clusterConfig, err := hs.raftNode.ProposeConfigChange(add, req.NodeID, req.Addr)
+	if err != nil {
+		hs.writeConfigChangeError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"config":  clusterConfigBody(clusterConfig),
+	})
+}
+
+// writeConfigChangeError maps a ProposeConfigChange failure onto a status code:
+// a redirect when this node is not (or is no longer able to act as) the leader,
+// 409 when the cluster is already changing, 400 for a request that does not make
+// sense against the current configuration.
+func (hs *HTTPServer) writeConfigChangeError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, raft.ErrNotLeader):
+		leader := hs.raftNode.GetLeader()
+		w.Header().Set("X-Raft-Leader", leader)
+		writeJSONError(w, http.StatusServiceUnavailable,
+			fmt.Sprintf("Not leader. Current leader: %s", leader))
+	case errors.Is(err, raft.ErrNoCurrentTermCommit), errors.Is(err, raft.ErrConfigChangeInProgress):
+		writeJSONError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, raft.ErrNodeAlreadyVoter),
+		errors.Is(err, raft.ErrNodeNotVoter),
+		errors.Is(err, raft.ErrLastVoter):
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+	default:
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+// handleClusterConfig reports the configuration this node currently holds. It is
+// answered by any node, leader or not: a configuration takes effect as soon as
+// its entry reaches a log, so what a follower reports is meaningful — it is what
+// that follower is using.
+func (hs *HTTPServer) handleClusterConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"config":  clusterConfigBody(hs.raftNode.GetClusterConfig()),
+	})
+}
+
+func clusterConfigBody(clusterConfig *raft.ClusterConfig) map[string]interface{} {
+	body := map[string]interface{}{
+		"joint":  clusterConfig.IsJoint(),
+		"voters": map[string]string{},
+	}
+	if clusterConfig == nil {
+		return body
+	}
+	body["voters"] = clusterConfig.Voters
+	if clusterConfig.OldVoters != nil {
+		body["old_voters"] = clusterConfig.OldVoters
+	}
+	return body
+}
+
+// validateJoinFlag rejects a non-empty -join value. Membership changes exist now
+// (KNOWN_ISSUES.md R14), but they are made through the leader's
+// POST /cluster/add, not by a joining node announcing itself: the joining node
+// has no way to know whether the cluster agreed, and ClusterManager's node
+// bookkeeping (network/discovery.go) is still HTTP-level only and never
+// reflected in the Raft quorum. So -join stays rejected (KNOWN_ISSUES.md R12).
+// The flag is kept -- reserved, not removed -- so that a caller who still passes
+// it gets this explicit rejection instead of "flag provided but not defined".
+// See docs/api.md for the supported way to add a node.
 func validateJoinFlag(join string) error {
 	if join == "" {
 		return nil
 	}
-	return fmt.Errorf("dynamic membership is not implemented (KNOWN_ISSUES.md R12/R14); " +
-		"run every node with the same fixed -peers list instead of -join")
+	return fmt.Errorf("-join is not supported (KNOWN_ISSUES.md R12); start the new node with the " +
+		"existing cluster's -peers list and then POST /cluster/add to the leader")
 }
 
 func parsePeers(peers string) map[string]string {
@@ -360,8 +479,8 @@ func main() {
 		listenAddr = flag.String("listen", "localhost:8080", "Listen address for Raft")
 		httpAddr   = flag.String("http", "localhost:9080", "HTTP server address")
 		peers      = flag.String("peers", "", "Comma-separated list of peer addresses (format: id:addr,id:addr)")
-		join       = flag.String("join", "", "Reserved: dynamic membership is not implemented "+
-			"(KNOWN_ISSUES.md R12/R14); a non-empty value refuses to start")
+		join       = flag.String("join", "", "Reserved and rejected (KNOWN_ISSUES.md R12): to add a node, "+
+			"start it with the existing cluster's -peers list and POST /cluster/add to the leader")
 	)
 	flag.Parse()
 
@@ -407,6 +526,15 @@ func main() {
 	raftNode.SetSnapshotter(raftSnapshotter)
 	transport.SetRaftNode(raftNode)
 
+	// Attach the -peers addresses to the cluster configuration, then let the
+	// configuration drive the transport's address book from there on. This is
+	// what makes a membership change reach the network layer: a server added by
+	// POST /cluster/add is carried in the configuration entry with its address,
+	// so every node that replicates the entry learns how to reach it, and a
+	// removed one disappears from the book on the next tick (KNOWN_ISSUES.md R14).
+	raftNode.SetPeerAddresses(cfg.Peers)
+	raftNode.SetPeerAddressSink(transport.SetPeers)
+
 	if err := transport.Start(); err != nil {
 		log.Fatalf("Failed to start transport: %v", err)
 	}
@@ -414,7 +542,9 @@ func main() {
 	// validateJoinFlag above already refuses to start when -join is set, so
 	// there is no HTTP join attempt here (KNOWN_ISSUES.md R12): ClusterManager
 	// is used only for the fixed -peers bookkeeping and for LeaveCluster on
-	// shutdown, not for joining a running cluster.
+	// shutdown, not for joining a running cluster. It is deliberately left out of
+	// the R14 membership path — the Raft cluster configuration, not this list, is
+	// what decides the quorum.
 	clusterManager := network.NewClusterManager(cfg.NodeID, cfg.ListenAddr)
 	for id, addr := range cfg.Peers {
 		clusterManager.AddNode(id, addr)

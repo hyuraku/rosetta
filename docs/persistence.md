@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-09-06 against commit `c6ee4b4`.
+> Last verified: 2026-09-06 against commit `e183622`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -89,7 +89,22 @@ The KV store prefers the V2 interface, which also persists client sessions
 - **VotedFor**: Candidate that received vote in current term
 - **Log**: Log of commands (entries not yet covered by a snapshot)
 - **LastIncludedIndex** / **LastIncludedTerm**: Snapshot metadata for log compaction
+- **Config**: the cluster configuration currently in effect — the voters and
+  their addresses (KNOWN_ISSUES.md R14). It is derived state: the last
+  configuration entry in `Log`, or `SnapshotConfig` when the log holds none, so
+  it is written by the same `persist()` as the log it was derived from
+- **SnapshotConfig**: the cluster configuration in effect at `LastIncludedIndex`.
+  This is what `Config` falls back to once every configuration entry has been
+  compacted away or truncated off. It lives in this file rather than in
+  `snapshot.json` on purpose: it must be exactly the configuration the boundary
+  it accompanies was taken under, and this is the file that already carries that
+  boundary atomically — so log compaction never has to rewrite the state
+  machine's snapshot, and neither the payload-before-boundary ordering below nor
+  `VerifySnapshotConsistency` is affected
 
+Both configuration fields are absent from a state file written before dynamic
+membership existed; the node then seeds them from its `-peers` list, so an old
+data directory starts unchanged.
 #### KV Store State
 - **KVData**: Complete key-value pairs
 - **Sessions**: Client sessions for duplicate detection (V2 format)
@@ -215,9 +230,24 @@ data/
     }
   ],
   "LastIncludedIndex": 0,
-  "LastIncludedTerm": 0
+  "LastIncludedTerm": 0,
+  "Config": {
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081" }
+  },
+  "SnapshotConfig": {
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081" }
+  }
 }
 ```
+
+While a membership change is in flight, `Config` is the joint configuration and
+carries an `old_voters` map alongside `voters`; agreement then needs a majority
+of both (paper §6). A configuration entry appears in `Log` with
+`"type": "config"` and a `command` that is the configuration as a JSON string.
+
+`snapshot.json` deliberately carries no configuration: the state machine payload
+is the KV store's, and the configuration is Raft's own state, kept beside the
+boundary it describes.
 
 ### Snapshot File Format
 

@@ -120,11 +120,18 @@ Implemented in [`raft/state.go`](raft/state.go). Randomized election timeouts pr
 
 - **network/**: Network communication layer
   - HTTP-based RPC transport
-  - `ClusterManager` tracks node join/leave over HTTP, but this bookkeeping is not
-    wired into the Raft quorum — the cluster is effectively fixed-peer, and `-join`
-    now fails startup rather than pretending otherwise (R12, fixed). Real Raft-level
-    membership changes are still unimplemented (R14, open). See
-    [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+  - Membership changes go through Raft: `POST /cluster/add` / `POST /cluster/remove`
+    on the leader append a configuration entry and the cluster moves through the
+    joint configuration C_old,new to C_new (paper §6, R14, fixed). `GET /cluster/config`
+    reports what a node is currently using. The transport's peer address book
+    follows the configuration, so an added server is reachable without editing
+    anyone's flags. There is no learner / catch-up phase yet, so a newly added
+    server counts towards the quorum immediately (R20, open)
+  - `ClusterManager`'s `/cluster/join`, `/cluster/leave` and `/cluster/nodes`
+    are HTTP-level bookkeeping only and are *not* part of that path — they are
+    never reflected in the Raft quorum, are not served on a normal startup, and
+    `-join` still fails startup rather than pretending otherwise (R12, fixed).
+    See [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
 
 - **config/**: Configuration management
 
@@ -174,15 +181,43 @@ Command line options:
 - `-http`: HTTP API listen address
 - `-peers`: Comma-separated list of peer nodes (format: `id:addr,id:addr`)
 - `-config`: Configuration file path
-- `-join`: Reserved, and **rejected** if given a non-empty value: startup fails
-  fast with an error instead of continuing without the node it named. Dynamic
-  membership is not implemented — `ClusterManager`'s HTTP-level node
-  bookkeeping is never reflected in the Raft quorum — so there is no safe way
-  to honor a join request yet. Run clusters with a fixed, matching `-peers`
-  list on every node instead. `config.Validate` rejects a `-peers` list that
-  includes this node's own ID, has two peers at the same address, or has a
-  peer at this node's own listen address. See
-  [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R12, fixed; R14, open)
+- `-join`: Reserved, and still **rejected** if given a non-empty value: startup
+  fails fast with an error. Membership changes now exist, but they are granted by
+  the leader (`POST /cluster/add`), not asserted by the joining node — which has
+  no way to know whether the cluster agreed. `config.Validate` rejects a `-peers`
+  list that includes this node's own ID, has two peers at the same address, or
+  has a peer at this node's own listen address. See
+  [KNOWN_ISSUES.md](KNOWN_ISSUES.md) (R12, fixed)
+
+### Changing cluster membership
+
+Start every node of the initial cluster with the same `-peers` list. After that,
+add and remove servers through the leader rather than by editing flags:
+
+```bash
+# Start the new node with the EXISTING cluster's peers (not including itself).
+./rosetta -id=node4 -listen=localhost:8083 -http=localhost:9083 \
+  -peers=node1:localhost:8080,node2:localhost:8081,node3:localhost:8082
+
+# Ask the leader to admit it (addr is the new node's Raft -listen address).
+curl -X POST http://localhost:9080/cluster/add \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id":"node4","addr":"localhost:8083"}'
+
+# Poll until the change completes ("joint": false).
+curl http://localhost:9080/cluster/config
+
+# Removing works the same way; the removed node can be shut down once it is gone
+# from the configuration.
+curl -X POST http://localhost:9080/cluster/remove \
+  -H 'Content-Type: application/json' -d '{"node_id":"node2"}'
+```
+
+A node started with the existing cluster's peer list is not a voter in it, so it
+does not campaign; it becomes one when the configuration entry admitting it
+reaches its log. Only one change at a time is accepted. Removing the leader is
+allowed: it steps down once C_new commits. Full details and error codes are in
+[docs/api.md](docs/api.md).
 
 Cluster sizing: Raft needs a majority to commit, so run an odd number of nodes —
 3 nodes tolerate 1 failure, 5 tolerate 2. Adding nodes does not make writes faster.
