@@ -275,37 +275,33 @@ func runBenchmark(config *Config) *Stats {
 
 // populateInitialData writes preloadCount(config.Operations) keys with
 // deterministic, index-derived keys (keyForIndex) so the read workload has a
-// known set of keys to pick from. It returns how many keys were written
-// successfully — worker only ever picks read indices below that count, so a
-// preload failure shrinks the read pool instead of producing a read that was
-// never going to hit.
+// known set of keys to pick from. It returns the length of the contiguous
+// prefix [0, n) that was actually written: it stops at the first failed put
+// rather than skipping over it and continuing, because worker's read path
+// picks its index uniformly from [0, preloaded) — a *count* of successes
+// would let that range include a failed (never-written) index and exclude a
+// later index that did succeed, which is exactly the preload/read mismatch
+// this function exists to prevent (KNOWN_ISSUES.md R18).
 func populateInitialData(client *http.Client, config *Config) int {
 	fmt.Println("Populating initial data...")
 	// #nosec G404 -- benchmark payload generation, not security-sensitive
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	count := preloadCount(config.Operations)
-	written := 0
-	failures := 0
 	for i := 0; i < count; i++ {
 		key := keyForIndex(i, config.KeySize)
 		value := generateValue(r, config.ValueSize)
 		if _, _, err := put(client, config.URL, key, value); err != nil {
-			failures++
-			continue
+			fmt.Printf("Initial data populated (%d/%d keys; preload stopped early: index %d failed: %v)\n",
+				i, count, i, err)
+			// i, not i-1: indices [0, i) succeeded, so i is both the failed
+			// index and the length of the usable prefix below it.
+			return i
 		}
-		written++
 	}
 
-	if failures > 0 {
-		fmt.Printf("Initial data populated (%d/%d keys; %d preload writes failed)\n", written, count, failures)
-	} else {
-		fmt.Printf("Initial data populated (%d keys)\n", written)
-	}
-	// written, not count: a read must only ever pick an index this preload
-	// pass actually confirmed as written, or it inherits the very
-	// preload/read mismatch this fix exists to close.
-	return written
+	fmt.Printf("Initial data populated (%d keys)\n", count)
+	return count
 }
 
 func dispatchWork(config *Config, workChan chan<- bool) {
