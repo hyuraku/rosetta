@@ -244,7 +244,13 @@ for port in 9080 9081 9082; do
     if curl -s http://localhost:$port/status > /dev/null 2>&1; then
         NEW_LEADER_INFO=$(curl -s http://localhost:$port/leader 2>/dev/null || echo '{}')
         if [ "$HAS_JQ" = true ]; then
-            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | jq -r '.leader // "unknown"')
+            # "// "unknown"" alone would not catch this: GetLeader() encodes "no
+            # leader yet" as an empty string, not JSON null/false, and jq's "//"
+            # only substitutes for null/false. Without this fix, an empty
+            # .leader made NEW_LEADER_ID="" here, which the check below treated
+            # as "a leader was found" and broke out of the retry loop before an
+            # election had actually completed.
+            NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | jq -r 'if (.leader // "") == "" then "unknown" else .leader end')
         else
             NEW_LEADER_ID=$(echo $NEW_LEADER_INFO | grep -o '"leader":"[^"]*"' | cut -d'"' -f4)
             [ -z "$NEW_LEADER_ID" ] && NEW_LEADER_ID="unknown"
