@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// testOverrideNodeID is reused by TestLoadConfig_ExplicitFieldsOverrideDefaults
+// to check the file's own node_id survives LoadConfig's default-fill.
+const testOverrideNodeID = "node9"
+
 // TestLoadConfig_DefaultFillsOmittedFields covers KNOWN_ISSUES.md R16: a
 // config file that sets only a few fields must come out of LoadConfig with
 // every field it omitted at DefaultConfig's value, not Go's zero value. Before
@@ -63,7 +67,7 @@ func TestLoadConfig_ExplicitFieldsOverrideDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	full := DefaultConfig()
-	full.NodeID = "node9"
+	full.NodeID = testOverrideNodeID
 	full.ElectionTimeout = 300 * time.Millisecond
 	full.HeartbeatTimeout = 100 * time.Millisecond
 	data, err := json.Marshal(full)
@@ -78,8 +82,8 @@ func TestLoadConfig_ExplicitFieldsOverrideDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.NodeID != "node9" {
-		t.Errorf("NodeID = %q, want %q", cfg.NodeID, "node9")
+	if cfg.NodeID != testOverrideNodeID {
+		t.Errorf("NodeID = %q, want %q", cfg.NodeID, testOverrideNodeID)
 	}
 	if cfg.ElectionTimeout != 300*time.Millisecond {
 		t.Errorf("ElectionTimeout = %v, want 300ms", cfg.ElectionTimeout)

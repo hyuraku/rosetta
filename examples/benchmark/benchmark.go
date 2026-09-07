@@ -28,12 +28,18 @@ const (
 	idleConnTimeout      = 90 * time.Second
 	idleConnMultiplier   = 2
 	httpErrorThreshold   = 400
+	serverErrorThreshold = 500
 	progressTickInterval = 2 * time.Second
 	percentMultiplier    = 100
 	// populateFraction is the denominator used to size the preloaded read
 	// pool from -ops: 1/populateFraction of -ops keys are written before the
 	// timed run starts, then only reads pick indices from that pool.
 	populateFraction = 10
+	// exitCodeInvalidArgs is what an invalid flag combination exits with,
+	// distinct from exit 1 (an unexpected runtime error) and the flag
+	// package's own exit 2 on an unparsable flag -- deliberately the same
+	// value as flag.Parse's, so scripts can treat both as "bad invocation".
+	exitCodeInvalidArgs = 2
 )
 
 type Config struct {
@@ -106,9 +112,9 @@ func (s *Stats) recordStatus(statusCode int) {
 		atomic.AddInt64(&s.Status404, 1)
 	case statusCode == http.StatusServiceUnavailable:
 		atomic.AddInt64(&s.Status503, 1)
-	case statusCode >= 400 && statusCode < 500:
+	case statusCode >= httpErrorThreshold && statusCode < serverErrorThreshold:
 		atomic.AddInt64(&s.StatusOther4xx, 1)
-	case statusCode >= 500:
+	case statusCode >= serverErrorThreshold:
 		atomic.AddInt64(&s.Status5xx, 1)
 	default:
 		// Should not happen (every branch above is exhaustive for a valid HTTP
@@ -123,7 +129,7 @@ func main() {
 	if err := validateConfig(config); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 		flag.Usage()
-		os.Exit(2)
+		os.Exit(exitCodeInvalidArgs)
 	}
 
 	fmt.Println("=== Rosetta Benchmark ===")
