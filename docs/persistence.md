@@ -1,6 +1,6 @@
 # Persistence Feature
 
-> Last verified: 2026-09-06 against commit `e183622`.
+> Last verified: 2026-09-07 against commit `61daab8`.
 
 This document describes the persistence feature implemented in Rosetta, which provides crash recovery and durability for the distributed key-value store.
 
@@ -244,6 +244,26 @@ While a membership change is in flight, `Config` is the joint configuration and
 carries an `old_voters` map alongside `voters`; agreement then needs a majority
 of both (paper §6). A configuration entry appears in `Log` with
 `"type": "config"` and a `command` that is the configuration as a JSON string.
+
+Both `Config` and `SnapshotConfig` may also carry a `learners` map, in the same
+`nodeID -> addr` shape, while a server added through `POST /cluster/add` is
+still catching up (KNOWN_ISSUES.md R20):
+
+```json
+  "Config": {
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081" },
+    "learners": { "node3": "localhost:8082" }
+  }
+```
+
+All three maps are omitted when empty, so a state file written before learners
+existed reads back unchanged — a missing `learners` decodes to no learners.
+Learners are persistent state for the same reason voters are: the configuration
+is derived from the log, so it has to reach disk in the same write as the log it
+was derived from, and a restart mid-catch-up has to come back knowing it is
+replicating to a server no quorum counts. The learner also travels with an
+`InstallSnapshot` (in `SnapshotConfig`), because a snapshot subsumes the
+configuration entries below its boundary.
 
 `snapshot.json` deliberately carries no configuration: the state machine payload
 is the KV store's, and the configuration is Raft's own state, kept beside the

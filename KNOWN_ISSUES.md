@@ -1,6 +1,6 @@
 # Known Issues — 既知の安全性問題
 
-> 最終検証: 2026-09-07 against commit `7a73481`
+> 最終検証: 2026-09-07 against commit `61daab8`
 >
 > This file is the **live, authoritative status** of the safety issues found in the
 > 2026-07-07 safety review. The frozen report with full evidence and reproduction
@@ -23,9 +23,9 @@
 
 | 状態 | 件数 |
 |---|---|
-| ✅ FIXED | 39（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R9, R10, R11, R12, R13, R14, R15, R16, R17, R18, R19） |
+| ✅ FIXED | 40（A1–A8, B1, B2, B3, C1, C2, C3, C4, D1, D2, D3, D4, D5, E1, E2, R1, R2, R3, R4, R5, R6, R9, R10, R11, R12, R13, R14, R15, R16, R17, R18, R19, R20） |
 | 🟠 PARTIAL | 0 |
-| ❌ UNFIXED | 1（グループ R: R20） |
+| ❌ UNFIXED | 0 |
 
 **実用上の含意**: ログ圧縮（グループ A）の受信側 §7 保持ルール（A7）は解消済みで、圧縮を
 有効にしても分岐 suffix を無条件保持することはない。2026-09-06 の再監査で見つかった snapshot
@@ -54,8 +54,12 @@ commit 上限（R13）、InstallSnapshot の chunk 転送（R15）も解消し�
 動的メンバーシップ）も解消した（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）: クラスタ構成は
 ログエントリで決まり、受け取った時点で有効になり、joint 中の合意は旧・新それぞれの過半数を要する。
 R16（`config.Config` の `ElectionTimeout`/`HeartbeatTimeout` を raft に配線、`5aff2e6`）と
-R18（benchmark/examples の契約、`3438f81`）も解消した。ただし learner（追いつき段階）は
-未実装（R20）のまま残るため、「安全性違反なし」とは言えない。
+R18（benchmark/examples の契約、`3438f81`）も解消した。最後に残っていた R20（learner／
+non-voting member の追いつき段階、`37a60f5` / `40f92cf`）も解消し、`POST /cluster/add` は
+サーバーを quorum に数えない learner として追加するようになった。leader は learner が
+追いついた時点で自動的に C_old,new へ昇格させる。これで起票済みの ID はすべて閉じたが、
+それは「監査されていない経路が無い」ことの証明ではない。本プロジェクトは学習用であり、
+本番運用可ではない。
 
 降格処理は `becomeFollowerLocked` に一本化され（R6・`ac93fcb`）、高 term を見て降格した元 leader も
 選挙タイマーが再始動して自力で立候補できる。既知の data race 2 件も解消した（E1・`c5fdc0f`、
@@ -129,8 +133,8 @@ seqNum 採番から `sendRequest` 完了まで同一 mutex を保持し、Client
 [docs/raft-audit-2026-09-06.md](docs/raft-audit-2026-09-06.md)（凍結・対象 commit `d370c72`）
 で新規に確認された問題（R1–R18）と、その修正作業中に見つかった問題（R19 以降。監査には存在しない）。
 R1–R18 はいずれも `go test ./...`／`go test -race ./...` が green のままで検出されない静的確認
-として起票された。修正済みの R1–R5・R14・R15・R17・R19 には障害注入・世代競合・停止順・構成変更の
-決定的テストが付いているが、未修正の項目にはまだない。R19 は例外的に `-race` でも捕まる panic だったが、
+として起票された。R1–R5・R14・R15・R17・R19・R20 には障害注入・世代競合・停止順・構成変更の
+決定的テストが付いている。R19 は例外的に `-race` でも捕まる panic だったが、
 発火が停止時のタイミング依存だったため CI では不安定失敗としてしか現れていなかった。
 R7・R8 は監査に存在しない（欠番ではなく、そもそも採番されていない）。
 
@@ -152,7 +156,7 @@ R7・R8 は監査に存在しない（欠番ではなく、そもそも採番さ
 | R16 | `config/config.go:23-38` の `SnapshotInterval` は宣言されているが読み出し側で使われていない（自動 snapshot のトリガーは `maxRaftState` のみ）。`LoadConfig`（`:61-83`）はファイルにないフィールドをゼロ値のまま `Validate` に渡すため、`DefaultConfig()` の既定値を経由しない設定ファイルは意図せず起動を拒否されうる | P3 | ✅ FIXED | `5aff2e6`（`raft.Timing` と functional option `raft.WithTiming` を新設し、`NewRaftStateWithPersister`/`NewRaftNodeWithPersister` は可変長 `opts ...Option` を追加するだけで既存呼び出し元を一切変更せずに済ませた。`RaftState.timing` を `newRaftState` の乱数計算と `resetElectionTimerLocked` が読み、RequestVote の §6 妨害対策（`raft/rpc.go:123`）も `minElectionTimeout` 定数から `rs.timing.ElectionTimeoutBase` に切り替えた（定数は `DefaultTiming` の既定値定義としてのみ残存）。`RaftNode.run` の tick 周期も固定 `raftTickInterval` から `RaftState.HeartbeatInterval()` に変更し、`HeartbeatTimeout` が実際に heartbeat 頻度を左右するようにした。`main.go` の `resolveConfig` 後、`cfg.ElectionTimeout` を base・同じ長さの jitter（結果として `[base, 2*base)`、既定 150-300ms は不変）、`cfg.HeartbeatTimeout` を heartbeat interval として `raft.WithTiming` に渡す。`Validate` に `election_timeout >= 2*heartbeat_timeout`（論文 §5.2）を追加。`SnapshotInterval`/`LogLevel` は構造体コメントで「予約・未使用」と明記し、フィールドと JSON キーはそのまま維持。`LoadConfig` は `DefaultConfig()` を土台に JSON を上書きする形に変更し、ファイルが省略したフィールドは既定値のまま残るようにした。テスト: `config/config_test.go`、`raft/timing_internal_test.go`） |
 | R17 | CI (`.github/workflows/ci.yml:37-41`) は `./tests/unit/...` と `./tests/integration/...` のみを `-race` 実行し、`./...`（各パッケージ直下の `_test.go`、例: `raft/installsnapshot_internal_test.go`）を対象にしない。また `tests/integration/cluster_test.go:393` の `break` は `select` から抜けるだけで外側の `for` ループを抜けないため、timeout 後も残りの `done` 受信を待ち続ける（意図した「テスト失敗で即座に打ち切る」動作になっていない） | P3 | ✅ FIXED | `19bdb37`（CI の 2 ステップを `go test -v -race -timeout=10m -coverprofile=coverage.txt -covermode=atomic ./...` の 1 ステップに統合、全パッケージ直下のテストを `-race` 対象化）、`91b0f7c`（`tests/integration/cluster_test.go` の timeout `break` をラベル付き `break waitLoop` に変更し、外側の for ループを確実に抜けるよう修正。SA4011 解消） |
 | R18 | `examples/benchmark/benchmark.go` の read ワークロードはヒットしない: `populateInitialData`（`:152-162`、鍵生成は `:157`）が `i` を種に `Operations/populateFraction` 件を書き込む一方、読み取り側 `worker`（`:184-222`、鍵生成は `:201`）は `r.Intn(config.Operations/populateFraction)` で毎回ランダムな種を選ぶ。`generateKey` の乱数サフィックスは呼び出しごとに RNG ストリームが進むため、同じ数値シードでも書き込み時と読み取り時で鍵文字列が一致せず、GET はほぼ確実に 404 になる。成功率・引数検証・失敗統計もない | P3 | ✅ FIXED | `3438f81`（鍵生成を `examples/benchmark/keys.go` の純粋関数 `keyForIndex(index, keySize)` に切り出し、preload・read・write すべてがこれを使うようにした: preload は `[0, preloadCount)` を書き込み、read はその preload が先頭から連続して書き込めた件数（最初の失敗で preload を打ち切る）`[0, preloaded)` から index を引き、write は `preloaded` より上の専用カウンタで採番するため read の対象と衝突しない。`Stats` に HTTP ステータス別の内訳（2xx/404/503/other 4xx/5xx/transport error）を追加し、read の 404 は失敗として数える。`printResults` に成功率（%）と内訳を出力するようにした。`validateConfig` で `ops`/`concurrency`/`value-size`/`report-interval` の正数、`read-ratio` の `[0,1]`、`duration >= 0`、`key-size` が prefix + 想定される最大 index の桁数を満たすことを検証し、不正なら `flag.Usage()` を出して exit code 2 で終了する。鍵生成を別ファイルに切り出したため `go build benchmark.go` 単体ビルドは失敗するようになり、`go build .` に案内を変更（CLAUDE.md・README.md・`examples/benchmark/README.md`）。`examples/simple-cluster/start.sh`／`demo.sh` の `jq -r '.leader // "unknown"'` は `.leader` が空文字列（leader 未確定）のとき `""` を返し `"unknown"` にならない不具合があり、`demo.sh` の leader failover 検出ループでは「未確定」を「確定した」と誤認してループを早期終了させていたため、`if (.leader // "") == "" then "unknown" else .leader end` に修正。`start.sh` の例示コマンドも固定 `node1:9080` ではなく実際の leader のポートを表示するようにした。テスト: `examples/benchmark/keys_test.go`。フォローアップ 2 件: `9fdf776` — `populateInitialData` は成功件数を返していたため、preload 途中の失敗（例: index 3 だけ失敗）があると read 範囲 `[0, preloaded)` に未書き込みの index が入り、書き込めた末尾の index が範囲外になる同種の不整合が preload 自身に残っていた。最初の失敗で打ち切り、連続して書き込めた先頭区間の長さを返すよう修正。`d075a5d` — `demo.sh` に未修正のまま残っていた 2 箇所（Step 4 の表示、Step 7 の kill 対象特定）にも同じ guard を適用し、Step 7 は leader が確定するまで数回リトライし、それでも不明なら node3 決め打ちで kill せずに failover テストをスキップするよう変更） |
-| R20 | learner（non-voting member）の追いつき段階が未実装。`ProposeConfigChange` で追加されたサーバーは C_old,new がログに届いた瞬間から quorum の一員として数えられるため、ログが大きく遅れているサーバーを追加すると、そのサーバーが追いつくまでクラスタの commit が遅くなる（最悪の場合、旧構成の 1 台が同時に落ちると quorum を失う）。論文 §6 が "new servers join as non-voting members" として挙げている availability gap そのもの。R14 の修正作業中に、明示的な範囲外として起票 | P2 | ❌ UNFIXED | `raft/membership.go` の `ProposeConfigChange`（追加は即 voter）、`ClusterConfig` に non-voting 用のグループが無い。対策は「learner 段階を設け、追いついてから C_old,new を追記する」。運用上の暫定策: 追加するサーバーは、既存クラスタの snapshot／ログにできるだけ追いついた状態で追加する |
+| R20 | learner（non-voting member）の追いつき段階が未実装。`ProposeConfigChange` で追加されたサーバーは C_old,new がログに届いた瞬間から quorum の一員として数えられるため、ログが大きく遅れているサーバーを追加すると、そのサーバーが追いつくまでクラスタの commit が遅くなる（最悪の場合、旧構成の 1 台が同時に落ちると quorum を失う）。論文 §6 が "new servers join as non-voting members" として挙げている availability gap そのもの。R14 の修正作業中に、明示的な範囲外として起票 | P2 | ✅ FIXED | `37a60f5`（raft）/ `40f92cf`（HTTP API）。**state**: `ClusterConfig.Learners`（`json:"learners,omitempty"`、nodeID→addr）を新設。learner は `Members()` に含まれるので AppendEntries／heartbeat／InstallSnapshot の送信先になり `syncLeaderPeersLocked` が `NextIndex`/`MatchIndex` を与えるが、**`QuorumReached` は一切変更していない**（`Voters`／`OldVoters` しか見ない）ため quorum 計算は learner の有無で変わらない — これが安全性の要で、`raft/learner_internal_test.go` の `TestLearnersDoNotChangeQuorum` が単一・joint 両方で直接検証する。`IsVoter` は learner に false を返すので既存の立候補ゲート（`raft/node.go:100`）だけで立候補せず、`RequestVote` は自分が learner なら `VoteGranted=false` を返して `VotedFor` も消費しない（博士論文 §4.2.1）。`Contains` は learner を含む（「構成に参加している」の意味）。**追加は 2 段階**: `ProposeConfigChange(add=true)` は joint ではなく「`Voters` 不変・`Learners` に 1 件足した単一構成」を追記する（voter 集合が動かないので二重過半数で守るものが無い）。同時 1 変更の規律は維持され、learner が居る間の追加・voter 削除は `ErrConfigChangeInProgress`。例外は**その learner の削除**だけで、これが追いつかない追加を取り消す唯一の手段（これも単一構成）。**昇格**: `promoteCaughtUpLearnerLocked`（`raft/membership.go`）を、`MatchIndex` を前進させた直後の同じ `rs.mu` 区間から呼ぶ — AppendEntries 応答（`raft/rpc.go` の `replicateToPeer`、`updateCommitIndex` の直後。同じ応答で構成エントリが commit されたケースを拾うため）と snapshot ACK（`sendSnapshotToPeer`）の 2 箇所。`MatchIndex[learner] >= lastAbsLogIndex()` かつ learner を導入した構成エントリが commit 済み・非 joint なら、learner を `Voters` へ移した C_old,new を `appendConfigEntryLocked` で追記し、以後は既存の `advanceConfigChangeLocked` が C_new まで運ぶ。persist 失敗は追記をロールバックしてログのみ、次の応答で再試行（`advanceConfigChangeLocked` と同じ扱い）。applyCh には触れない（B3 不変）。**構成は従来どおりログから再導出**されるので、learner を足したエントリが切り詰められれば learner も消える（`recomputeConfigLocked`）。**副次の修正**: `sendHeartbeats` は commit index の再評価を「peer が 0 件のとき」ではなく毎回行うようになった — learner が member になったことで、voter 1 台のみの leader が learner を抱えると peer が非 0 になり、自分が過半数であるにもかかわらず learner を導入した構成エントリを永久に commit できなくなるため。**簡略化**: 「追いついた」の判定は上記 1 回の観測で、博士論文の「複数ラウンド・最後のラウンドが election timeout 以内」は実装していない（帰結は「落ち続ける learner が昇格しない」ことだけ）。**範囲外**: 恒久的な learner（read replica）。learner は昇格待ちの一時状態であり、出口は昇格か削除の 2 つだけ。これにより R14 行末尾の「残る制約: learner／non-voting の追いつき段階は未実装（R20）」は解消された。回帰テスト `raft/learner_internal_test.go`、`main_test.go` の `TestClusterAddReportsTheServerAsALearner` |
 | R19 | `RaftNode.Kill` は done を閉じるだけで run goroutine と replication goroutine の終了を待たない。呼び出し側が Kill 直後に `kvs.Close()` で applyCh を閉じると、進行中の tick／応答処理が閉じた applyCh に送信し `panic: send on closed channel` になる。CI（macOS）で `TestFullSystemPersistence_CrashAndRecover` が不安定失敗（PR #24 の run 34011107561）。監査 §4 P1-3（B3 と shutdown lifecycle）の範囲 | P1 | ✅ FIXED | `7c96f14`（`RaftState` が `stopCh` と `WaitGroup` を持ち、goroutine の起動は `spawn`（`raft/state.go`）の 1 経路に統一。対象は applier・`RaftNode.run`・`replicatePeerOnce`・`requestVoteFromPeer`・ReadIndex の `confirmLeadership` heartbeat・`TriggerSnapshot` の圧縮。`Kill` は `sync.Once` で冪等、`RaftState.Stop` で全 goroutine の終了を待ってから返る。Stop 開始後は `spawn` が false を返して何も起動せず、予約を持つ 2 箇所（`sendHeartbeats` の replication slot、`confirmLeadership` の results 枠）は自分で解放する。applier の送信は停止シグナルを先に見るので Kill 後は 1 件も送らない）＋ `13570d5`（`main.go` の停止順を HTTP API → transport → `Kill` → `kvs.Close()` に変更）。回帰テスト `raft/shutdown_internal_test.go` |
 
 ## 注記（レビュー後に判明した事実）
@@ -231,4 +235,6 @@ A 群（A1–A8）も A7 の修正で解消した。2026-09-06 再監査（グ�
 9. ✅ 完了 — R14（joint consensus）を監査の推奨順どおり state（`9da332c`）→ quorum（`3a82a6a`）
    → 管理 API（`49e513e`）→ snapshot（`54fba63`）の 4 commit で実装
 10. ✅ 完了 — R16（設定の raft への配線、`5aff2e6`）、R18（benchmark/examples の契約、
-    `3438f81`）。R20（learner／non-voting member）は未着手
+    `3438f81`）
+11. ✅ 完了 — R20（learner／non-voting member の追いつき段階、`37a60f5` / `40f92cf`）。
+    これをもってグループ R に未修正の項目はない

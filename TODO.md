@@ -184,8 +184,8 @@ at the snapshot boundary, so those entries are re-applied from the log anyway.
 ### 3. Dynamic Cluster Membership ✅ Complete
 **Priority:** 🟡 Medium
 **Status:** Done — R14 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) is fixed
-(`9da332c` / `3a82a6a` / `49e513e` / `54fba63`). One follow-up remains: R20,
-below.
+(`9da332c` / `3a82a6a` / `49e513e` / `54fba63`), and so is its follow-up R20
+(the learner catch-up phase, `37a60f5` / `40f92cf`).
 
 **Description:**
 Nodes can be added to and removed from a running cluster without downtime,
@@ -208,13 +208,14 @@ through joint consensus (Raft paper §6).
       restart — `9da332c`, `54fba63`
 - [x] Only one change at a time; a removed server cannot disrupt the cluster
       (§6's RequestVote rule) — `3a82a6a`, `49e513e`
+- [x] Learner / non-voting catch-up phase: an added server goes into
+      `ClusterConfig.Learners`, is replicated to but counted by no quorum, and
+      the leader promotes it to a voter once it has caught up — `37a60f5`,
+      `40f92cf` (R20)
 
 **Remaining (tracked separately):**
-- R20 in [KNOWN_ISSUES.md](KNOWN_ISSUES.md): no learner / non-voting catch-up
-  phase. An added server counts towards the quorum from the moment C_old,new
-  reaches a log, so adding one whose log is far behind slows commits until it
-  catches up. This is the availability gap §6 addresses with "new servers join
-  as non-voting members".
+- Permanent learners / read replicas are out of scope: a learner here is only a
+  transient catch-up state, and its only exits are promotion and removal.
 - `-join` stays rejected (R12): joining is granted by the leader, not asserted
   by the joining node. `ClusterManager`'s `/cluster/join|leave|nodes` in
   `network/discovery.go` are untouched and still not reflected in the Raft
@@ -586,7 +587,7 @@ Create official client libraries for easy integration.
 - [x] Basic Raft implementation
 - [x] Key-value operations
 - [x] Persistence
-- [ ] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; R9-R18 also done; the open item is R20, learner/non-voting member, from the 2026-09-06 re-audit)
+- [x] All confirmed safety issues in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) fixed (groups A/B/C/D/E done; R1-R20 from the 2026-09-06 re-audit and its follow-ups also done). Every filed ID is closed; that is not a claim that unaudited paths are clean
 - [x] Log compaction reworked and wired
 - [ ] Monitoring
 - [x] Documentation verified against code (2026-07 overhaul)

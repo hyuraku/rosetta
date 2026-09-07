@@ -1,6 +1,6 @@
 # Raft論文実装状況比較
 
-> 最終検証: 2026-09-07 against commit `7a73481`
+> 最終検証: 2026-09-07 against commit `61daab8`
 
 本ドキュメントは [Raft論文](https://raft.github.io/raft.pdf) の内容と rosetta プロジェクトの実装状況を比較したものです。本プロジェクトは学習目的の実装であり、既知の安全性違反は `KNOWN_ISSUES.md`（`docs/safety-review-2026-07-07.md` および `docs/raft-audit-2026-09-06.md` の再監査結果を反映した現在のステータス表）に集約されています。
 
@@ -13,13 +13,13 @@
 | 安全性保証 (Section 5.4) | ✅ 実装済み | 選挙制限は実装済み。B2・A2 は解消済み（`7151e77` / `8ad5367`）。A7（InstallSnapshot 受信側の §7 保持ルール）も解消（`019d33e`）。Log Matching（R1: `Start` の leader 確認と append の原子化・`2c26b9a`）と Leader Completeness（R2: 未永続エントリの duplicate ACK・`c362ae4`）も解消。State Machine Safety の R3–R5（snapshot の世代整合・古い snapshot の適用）も解消（`0695b95` / `f53617e` / `156510a`）。E2（送信エントリの backing array 共有）も送信前コピーで解消（`7e3eb61`）。境界 term 検査・commit 上限（R13）も解消し、AppendEntries 側の未検証分岐は残っていない |
 | 永続化 (Figure 2) | ✅ 実装済み | RPC 応答前の persist 規律あり（C1/C2/C4 解消・commit `2a35ce9`）。リーダー自身の追記経路（`appendEntryLocked` 経由の `AppendLogEntry`/`Start`/当選時 no-op、`TruncateLogAfter`）も persist 失敗をロールバックしてエラー通知（C3 解消・commit `ffc2926`）。AppendEntries 受信経路の未永続 merge も persist 失敗時にロールバックするようになった（R2 解消・commit `c362ae4`）。InstallSnapshot 受信経路と `TruncateLogTo` も同じロールバック規律に揃えた（R3 解消・commit `0695b95`）。加えて raft_state.json と snapshot.json の世代整合を起動時に検証し、復旧不能な組み合わせでは起動を拒否する |
 | ログコンパクション (Section 7) | ✅ 実装済み | 絶対 index 統一・投票/コミット/適用経路・本番配線・フォロワー側永続化（A1–A6, A8・`8ad5367`/`d0cbdc1`/`c516f54`）、受信側の §7 保持ルール（A7・`019d33e`）に加え、2026-09-06 再監査の 3 件も解消: 受信経路の世代整合と起動時検証（R3・`0695b95`）、メタデータとペイロードの同一世代化（R4・`f53617e`）、古い snapshot の適用禁止（R5・`156510a`）。安全性の未修正項目はない。B3（`rs.mu` 保持下での `applyCh` 送信、liveness）も専用 applier goroutine への分離で解消した（`f873d9b`）。R15（chunk 転送）も解消し、snapshot は `snapshotChunkSize`（既定 64 KiB）ごとの chunk で送られ、受信側は done まで何も変更しない（`c8c87d0`/`3ad0220`/`b3fbdbb`）。ただし両端のピークメモリは従来どおり payload 1 本分で、chunk 化が抑えるのは 1 RPC のサイズと所要時間 |
-| クラスタメンバーシップ変更 (Section 6) | ⚠️ 実装済み（learner を除く） | Joint consensus を実装（R14 解消・`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。構成はログエントリで決まり、受け取った時点で有効になり、C_old,new → C_new の 2 段階を経る。管理 API は `POST /cluster/add`／`POST /cluster/remove`／`GET /cluster/config`。learner（non-voting member）の追いつき段階は未実装（R20）。`-join` は引き続き拒否（R12） |
+| クラスタメンバーシップ変更 (Section 6) | ✅ 実装済み | Joint consensus を実装（R14 解消・`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。構成はログエントリで決まり、受け取った時点で有効になり、voter 集合が動く変更は C_old,new → C_new の 2 段階を経る。learner（non-voting member）の追いつき段階も実装（R20 解消・`37a60f5` / `40f92cf`）: 追加は quorum を変えない単一構成で learner を足すだけで、追いついた時点で leader が自動的に C_old,new へ昇格させる。恒久 learner（read replica）は範囲外。管理 API は `POST /cluster/add`／`POST /cluster/remove`／`GET /cluster/config`。`-join` は引き続き拒否（R12） |
 | クライアント相互作用 (Section 8) | ⚠️ 条件付きで配線済み | 重複検知（ClientID/SeqNum）を実 API 経路へ配線（D4 解消・commit `52afd48`）。ただし dedup は `ClientID` を指定した場合のみ発動する条件付きで（`kvstore/store.go:386`）、無条件の at-most-once ではない。committed 済みの結果解決の pending 登録タイミング競合（R9・commit `29bf047`）と client 側の並行書き込み・結果不明契約（R10・commit `73e744f`）は解消済み。batch API は未実装として明示的に 501/`ErrBatchNotImplemented` を返すようになった（R11 解消・commit `e71926a`） |
 | 読み取り専用クエリ最適化 | ✅ 線形化実装 | ReadIndex プロトコル + 当選時 no-op で linearizable read を実装。旧リース方式は撤去（D1〜D3 解消） |
 
 （A1〜E2 の ID は see ../KNOWN_ISSUES.md を参照。R1〜R18 は 2026-09-06 再監査 `docs/raft-audit-2026-09-06.md` で新規に確認された ID、R19 以降はその修正作業中に見つかった ID で、詳細は KNOWN_ISSUES.md のグループ R を参照）
 
-> **現在の未修正**: グループ R のうち R20（1 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）と、InstallSnapshot の chunk 転送（R15・`c8c87d0` / `3ad0220` / `b3fbdbb`）も解消した。R14（joint consensus による動的メンバーシップ）も解消した（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。R16（設定の raft への配線、`5aff2e6`）と R18（benchmark/examples の契約、`3438f81`）も解消した。ただし learner が未実装（R20）であるなど残る項目があるため、「論文の安全性性質を破る既知の経路は残っていない」とはまだ言えない。本プロジェクトは教育用途であり、本番運用可ではない。
+> **現在の未修正**: グループ R に未修正の項目はない（R20 の解消をもって 0 件）。B3（`applyCh` への送信を `rs.mu` 保持のまま行う liveness 問題）と R19（`Kill` が goroutine の終了を待たない）は解消した（`f873d9b` / `7c96f14` / `13570d5`）。監査が P0 とした R1–R5 はすべて解消し（`2c26b9a` / `c362ae4` / `0695b95` / `f53617e` / `156510a`）、P1 の R6 と data race 2 件（E1/E2）も解消した（`ac93fcb` / `c5fdc0f` / `7e3eb61`）。KV/client/API 細部の R9–R12（`29bf047` / `73e744f` / `e71926a` / `9d411ba`）と、AppendEntries の境界 term 検査・commit 上限の R13（`f0b0ba9` / `4d81414` / `ae33b52` / `87234ad`）と、InstallSnapshot の chunk 転送（R15・`c8c87d0` / `3ad0220` / `b3fbdbb`）も解消した。R14（joint consensus による動的メンバーシップ）も解消した（`9da332c` / `3a82a6a` / `49e513e` / `54fba63`）。R16（設定の raft への配線、`5aff2e6`）と R18（benchmark/examples の契約、`3438f81`）も解消し、最後に残っていた R20（learner／non-voting member の追いつき段階、`37a60f5` / `40f92cf`）も解消した。ただしこれは「起票済みの ID がすべて閉じた」という意味であって、監査されていない経路が無いことの証明ではない。本プロジェクトは教育用途であり、本番運用可ではない。
 
 ---
 
@@ -297,7 +297,7 @@ see ../KNOWN_ISSUES.md (A1〜A8)。2026-09-06 再監査分の解消状況:
 
 ---
 
-### 6. クラスタメンバーシップ変更 (Section 6) ⚠️ 実装済み（learner を除く）
+### 6. クラスタメンバーシップ変更 (Section 6) ✅ 実装済み
 
 #### 論文の要件
 - **Joint Consensus**: 新旧設定の両方で過半数を必要とする2段階プロセス
@@ -317,6 +317,7 @@ state（`9da332c`）→ quorum（`3a82a6a`）→ 管理 API（`49e513e`）→ sn
 type ClusterConfig struct {
     Voters    map[string]string `json:"voters"`
     OldVoters map[string]string `json:"old_voters,omitempty"` // joint 中のみ
+    Learners  map[string]string `json:"learners,omitempty"`   // 追いつき中のみ（R20）
 }
 ```
 
@@ -353,10 +354,32 @@ follower は 503 + `X-Raft-Leader`）と `GET /cluster/config`（どのノード
 痕跡を失い、しかもその prefix を捨てた後なので二度と教えられません。leader の**現在の**構成
 ではなく境界時点の構成を送るのは、境界より上のエントリは後から複製されるためです。
 
-**未実装（R20）**: learner（non-voting member）の追いつき段階。追加されたサーバーは
-C_old,new がログに届いた瞬間から quorum に数えられるため、大きく遅れたサーバーを追加すると
-追いつくまで commit が遅くなります。論文 §6 が "new servers join as non-voting members" と
-して挙げている availability gap です。
+**learner（non-voting member）の追いつき段階**（R20 解消・`37a60f5` / `40f92cf`）。
+論文 §6 の "new servers join as non-voting members"、および Ongaro 博士論文 §4.2.1
+"Catching up new servers" に相当します。
+
+- 追加（`ProposeConfigChange(add=true)`）は **joint ではなく単一構成**を追記します。
+  `Voters` は一切変わらず、追加されるサーバーは `Learners` に入るだけです。voter 集合が
+  動かないので二重過半数で守るものが無く、joint 段階は不要です。
+- learner は `Members()` に含まれるので AppendEntries／heartbeat／InstallSnapshot の
+  送信先になり、`syncLeaderPeersLocked` が `NextIndex`/`MatchIndex` を与えます。
+  一方で `QuorumReached` は `Voters`／`OldVoters` しか見ないので、**quorum 計算は
+  一切変わりません**（これが安全性の要）。`IsVoter` は learner に対して false なので
+  立候補せず（`raft/node.go` の既存ゲート）、`RequestVote` も learner なら拒否します。
+- **昇格は leader が自動で行う**（`promoteCaughtUpLearnerLocked`）。`MatchIndex` を
+  前進させた直後（AppendEntries 応答／snapshot ACK）の同じ `rs.mu` 区間で、
+  `MatchIndex[learner] >= lastAbsLogIndex()` かつ learner を導入した構成エントリが
+  commit 済み・非 joint なら、learner を `Voters` へ移した **C_old,new** を追記します。
+  以後は既存の `advanceConfigChangeLocked` が C_new まで運びます。persist 失敗時は
+  追記をロールバックし、次の応答で再試行します。
+- 同時 1 変更の規律は維持されます。learner が居る間は追加も voter 削除も
+  `ErrConfigChangeInProgress` で拒否し、例外は**その learner の削除**だけ
+  （追いつかない追加を取り消す唯一の手段）。
+- **簡略化**: 「追いついた」の判定は上記 1 回の観測です。博士論文の「複数ラウンドを
+  行い最後のラウンドが election timeout 以内に終わること」は実装していません。
+  帰結は「落ち続ける learner が昇格しない」ことだけで、早すぎる昇格は起きません。
+- **範囲外**: 恒久的な learner（read replica）はありません。learner は昇格待ちの
+  一時状態であり、出口は昇格か削除の 2 つだけです。
 
 `-join` フラグ（`main.go`）はかつて失敗してもログ出力のみで起動を継続する fail-open でしたが、
 `validateJoinFlag` の新設により非空値を渡すと起動を拒否する fail-closed に変わりました
@@ -368,7 +391,7 @@ R14 の経路には入っておらず、依然として Raft quorum には反映
 含めない・`Peers` 内でアドレスが重複しない・`Peers` のアドレスが自ノードの `ListenAddr` と
 重複しない）は起動時の `-peers` 検査としてそのまま有効です。
 
-⚠️ **learner（R20）を除いて実装済み**。新ノードの起動手順は [api.md](api.md) を参照。
+✅ **実装済み**（learner の追いつき段階を含む）。新ノードの起動手順は [api.md](api.md) を参照。
 
 ---
 
@@ -475,7 +498,7 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 - リース方式にあったクロック依存・過半数喪失時の step-down 欠如がなくなりました。孤立した旧リーダーは `confirmLeadership` が過半数 ACK を得られず `ErrLeadershipNotConfirmed` を返し、stale 値を返しません。より高い term を見たら `stepDown` します。D1/D2 解消（commit `b3b21a4`）。see ../KNOWN_ISSUES.md (D1, D2)
 - 当選時 no-op（`becomeLeader`）により、新リーダーは前任 term のコミット済みエントリを advance してから読みを許可します。D3 解消（commit `60fd631`）。see ../KNOWN_ISSUES.md (D3)
 
-**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されますが、本プロジェクトは教育用途であり、グループ R の未修正項目（R20、learner／non-voting member）が残る点は変わりません。
+**残る性質（安全性の穴ではない）**: 選挙直後、no-op がコミットされるまでの短時間は `ErrNoCurrentTermCommit` を返します。これは安全のための待ちであり、レイテンシ上の性質です。読み取りは線形化されており、グループ R に未修正の起票項目はありませんが、本プロジェクトは教育用途であり、監査されていない経路が無いことまでは保証しません。
 
 ---
 
@@ -507,7 +530,10 @@ no-op エントリは適用ループで実行スキップされますが `lastAp
 9. ✅ 完了 — R14（joint consensus）を state（`9da332c`）→ quorum（`3a82a6a`）→
    管理 API（`49e513e`）→ snapshot（`54fba63`）の順に実装 — P2
 10. ✅ 完了 — R16（設定の raft への配線、`5aff2e6`）、R18（benchmark/examples の契約、
-    `3438f81`） — P3。R20（learner／non-voting member）は未着手 — P2
+    `3438f81`） — P3
+11. ✅ 完了 — R20（learner／non-voting member の追いつき段階、`37a60f5` / `40f92cf`）: 追加は
+    quorum を変えない単一構成で `Learners` に足すだけになり、追いついた learner を leader が
+    `promoteCaughtUpLearnerLocked` で C_old,new へ昇格させる。恒久 learner は範囲外 — P2
 
 ---
 

@@ -1,6 +1,6 @@
 # API Documentation
 
-> Last verified: 2026-09-06 against commit `e183622`.
+> Last verified: 2026-09-07 against commit `61daab8`.
 
 This document provides detailed information about the Rosetta HTTP API.
 
@@ -268,7 +268,12 @@ with 400 regardless of how it got there. See ../KNOWN_ISSUES.md (R11, fixed).
 **Endpoint:** `POST /cluster/add`
 
 Starts a membership change that adds a server (Raft paper §6, KNOWN_ISSUES.md
-R14). Leader-only.
+R14/R20). Leader-only.
+
+The server is admitted as a **learner**: a non-voting member that is replicated
+to but that no quorum counts (paper §6, "new servers join as non-voting
+members"; Ongaro's dissertation §4.2.1). The leader promotes it to a voter by
+itself once it has caught up, so a single call is all that is needed.
 
 **Request:**
 ```json
@@ -290,17 +295,32 @@ learns it from the log.
 {
   "success": true,
   "config": {
-    "joint": true,
-    "voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082", "node4": "localhost:8083" },
-    "old_voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082" }
+    "joint": false,
+    "voters": { "node1": "localhost:8080", "node2": "localhost:8081", "node3": "localhost:8082" },
+    "learners": { "node4": "localhost:8083" }
   }
 }
 ```
 
-A 200 means the **joint** configuration C_old,new has been appended and is in
-effect on the leader — not that the change is finished. The leader completes it
-on its own: once C_old,new commits it appends C_new, and once C_new commits the
-change is done. Poll `GET /cluster/config` until `joint` is `false`.
+A 200 means that configuration has been appended and is in effect on the leader
+— not that the change is finished. Note what it is **not**: the voter set has
+not changed, and there is no joint configuration, because a learner changes no
+quorum. The leader finishes the change on its own, in three further steps:
+
+1. it replicates to `node4` until `MatchIndex[node4]` reaches the end of its log;
+2. it then appends the joint configuration C_old,new that moves `node4` from
+   `learners` into `voters` — the voter set is changing now, so §6's joint
+   consensus applies from here on;
+3. once C_old,new commits it appends C_new, and once C_new commits the change is
+   done.
+
+Poll `GET /cluster/config` until `node4` is among `voters`, `learners` is absent
+and `joint` is `false`.
+
+While a learner is catching up the addition counts as a change in flight, so a
+second `/cluster/add`, or a removal of a *voter*, is refused with 409. Removing
+the learner itself is allowed and is how a catch-up that will never finish is
+abandoned (see below).
 
 **Adding a server, end to end:**
 
@@ -320,12 +340,19 @@ change is done. Poll `GET /cluster/config` until `joint` is `false`.
      -d '{"node_id":"node4","addr":"localhost:8083"}'
    ```
 3. Wait for `GET /cluster/config` to report `"joint": false` with `node4` among
-   the voters.
+   the voters and no `learners` field.
 
-> **Warning:** there is no learner / catch-up phase (KNOWN_ISSUES.md R20). The new
-> server counts towards the quorum from the moment C_old,new reaches a log, so
-> adding one whose log is far behind slows commits until it catches up. Add
-> servers when the cluster is healthy, not while it is already down a node.
+> **Scope:** a learner here is a *transient* catch-up state, not a permanent
+> role. There is no way to keep a server as a non-voting read replica: the
+> leader promotes any learner that catches up, and the only other exit is
+> `POST /cluster/remove`. Permanent learners are out of scope
+> (KNOWN_ISSUES.md R20).
+>
+> "Caught up" is a single observation of the learner storing everything the
+> leader has. That is a simplification of the dissertation's §4.2.1 criterion
+> (several rounds of replication, the last completing within an election
+> timeout); the consequence is only that a learner which keeps falling behind
+> is never promoted, never that one is promoted too early.
 
 ---
 
@@ -341,6 +368,16 @@ change is done. Poll `GET /cluster/config` until `joint` is `false`.
 ```
 
 **Response:** the same shape as `/cluster/add`.
+
+Both voters and learners can be removed:
+
+- removing a **voter** changes the voter set, so it goes through the joint
+  configuration: the response has `"joint": true` with `old_voters`, and the
+  caller polls until `joint` is `false`;
+- removing a **learner** appends a single, non-joint configuration without it.
+  This cancels an addition whose catch-up is not going to finish — a server that
+  is unreachable, or one that keeps falling behind — and it is the only change
+  accepted while a learner exists.
 
 Removing the current leader is allowed. It keeps serving until C_new commits —
 it is the only server that can get C_new committed — and steps down immediately
@@ -369,8 +406,14 @@ The last remaining voter cannot be removed (400).
 
 Answered by **any** node, leader or not. A configuration takes effect as soon as
 its entry reaches a log, so what a follower reports is meaningful: it is the
-configuration that follower is itself using. `old_voters` is present only while
-`joint` is `true`.
+configuration that follower is itself using.
+
+Two fields are conditional:
+
+- `old_voters` is present only while `joint` is `true`;
+- `learners` is present only while a server is catching up (KNOWN_ISSUES.md
+  R20). Servers listed there are replicated to but counted by no quorum, and
+  they neither campaign nor grant votes.
 
 > These three endpoints are unrelated to the `/cluster/join`, `/cluster/leave`
 > and `/cluster/nodes` routes in `network/discovery.go`. Those are HTTP-level
@@ -391,7 +434,7 @@ configuration that follower is itself using. `old_voters` is present only while
 | 404 | Not Found | Key doesn't exist (GET only) |
 | 405 | Method Not Allowed | Unsupported HTTP method on `/kv` |
 | 500 | Internal Server Error | Operation timeout (5s), leadership lost, internal failure |
-| 409 | Conflict | A membership change is already in progress, or the leader has not yet committed an entry in its own term (`/cluster/add`, `/cluster/remove`) |
+| 409 | Conflict | A membership change is already in progress — a joint configuration in flight, an uncommitted configuration entry, or a learner still catching up — or the leader has not yet committed an entry in its own term (`/cluster/add`, `/cluster/remove`) |
 | 501 | Not Implemented | `/kv/batch` (any method) — see "Batch Endpoint" above |
 | 503 | Service Unavailable | Node is not leader |
 
