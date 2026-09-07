@@ -58,6 +58,16 @@ var (
 // it into Voters as soon as it has caught up. Permanent learners / read replicas
 // are out of scope.
 //
+// Invariant: **no server is ever in both Voters and Learners.** Every producer
+// of a configuration upholds it — configForChange puts a server in exactly one
+// group, and promoteCaughtUpLearnerLocked moves it from Learners to Voters in a
+// single entry. Breaking it would make the two questions this type answers
+// disagree about the same server: QuorumReached would count it while IsVoter
+// (and therefore the campaign gate and RequestVote) treated it as non-voting, so
+// a server that the cluster depends on for a majority would refuse to vote.
+// Nothing in a joint configuration relaxes this: OldVoters may overlap Voters,
+// but neither may overlap Learners.
+//
 // The address is carried here, not merely in the process's -peers flag, because
 // a node that joins a running cluster learns of its peers only through the
 // configuration entry that admits it. The address is advisory to consensus —
@@ -577,14 +587,32 @@ func (rs *RaftState) ProposeConfigChange(add bool, nodeID, addr string) (*Cluste
 // state — which is what keeps "which configuration does this change produce"
 // separate from "may a change be started at all".
 //
-// Only the voter-set change (removing a voter) produces a joint configuration;
-// the two learner cases leave Voters alone and so need no joint step.
+// The changes that move the voter set (removing a voter, and re-addressing one)
+// produce a joint configuration; the two learner cases leave Voters alone and so
+// need no joint step. Every branch preserves the invariant that no server is in
+// both Voters and Learners — see the ClusterConfig doc comment for why that
+// matters.
 func configForChange(current *ClusterConfig, add bool, nodeID, addr string) (*ClusterConfig, error) {
 	switch {
-	case add:
-		if existing, ok := current.Voters[nodeID]; ok && existing == addr {
+	case add && current.IsVoter(nodeID):
+		// Adding a server that is already a voter is how its address is changed.
+		// It must stay a voter throughout — demoting a counted server to a
+		// non-voting learner would take it out of every quorum while it is up and
+		// healthy, and would make it refuse votes (RequestVote) although
+		// QuorumReached still counts it. So this goes through joint consensus and
+		// never touches Learners.
+		if current.Voters[nodeID] == addr {
 			return nil, ErrNodeAlreadyVoter
 		}
+		newVoters := cloneAddrs(current.Voters)
+		newVoters[nodeID] = addr
+		return &ClusterConfig{
+			Voters:    newVoters,
+			OldVoters: cloneAddrs(current.Voters),
+			Learners:  cloneAddrs(current.Learners),
+		}, nil
+
+	case add:
 		learners := cloneAddrs(current.Learners)
 		if learners == nil {
 			learners = make(map[string]string, 1)
@@ -684,11 +712,19 @@ func (rs *RaftState) advanceConfigChangeLocked() {
 // "Caught up" is one observation of MatchIndex[learner] >= lastAbsLogIndex(): the
 // learner stores everything the leader has. That is a deliberate simplification
 // of the dissertation's §4.2.1 criterion (several rounds of replication, the last
-// of which finishes within an election timeout), which bounds how long the
-// cluster's availability is reduced by the final catch-up round. Here the learner
-// is fully caught up at the instant it is promoted, so the round that would be
-// measured has already completed; what is not modeled is a learner that keeps
-// falling behind again, and the leader simply keeps not promoting it.
+// of which finishes within an election timeout), which measures whether the
+// learner can *keep* up rather than whether it is level right now.
+//
+// The simplification is safe but costs liveness under load, and the cost is not
+// only theoretical. lastAbsLogIndex() is read when the reply is handled, not when
+// the request was sent, so a client write that lands during the round trip moves
+// the tail out from under a learner that had in fact caught up with everything
+// the leader had when it was asked. On a cluster under sustained writes a
+// perfectly healthy learner can therefore trail the tail by one round trip
+// indefinitely and never be promoted until the write load pauses — at the first
+// lull the very next reply promotes it. So: an addition completes promptly on a
+// quiet cluster, and may wait for a lull on a busy one. It never promotes a
+// learner too early, which is the direction that would matter for safety.
 //
 // The append is refused unless the configuration that introduced the learner is
 // itself committed and non-joint, so §6's "one change at a time" still holds:

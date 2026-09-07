@@ -89,6 +89,115 @@ func TestAddAppendsALearnerNotAJointConfiguration(t *testing.T) {
 	}
 }
 
+// addrN2Moved is the new address the re-addressing test moves n2 to; it is
+// checked in several places, so it is named rather than repeated.
+const addrN2Moved = "a2-moved"
+
+// TestReAddingAVoterChangesItsAddressWithoutDemotingIt covers the one add that
+// is not a catch-up: /cluster/add for a server that is already a voter is how
+// its address is changed. It must go through joint consensus and leave the
+// server a voter — putting a counted server into Learners would break the "never
+// in both groups" invariant, and a node that found itself there would refuse to
+// vote while QuorumReached went on counting it.
+func TestReAddingAVoterChangesItsAddressWithoutDemotingIt(t *testing.T) {
+	rs := NewRaftState("n1", []string{"n1"}, make(chan ApplyMsg, 16))
+	defer rs.Stop()
+
+	rs.mu.Lock()
+	rs.persistent.CurrentTerm = configEntryTerm
+	rs.state = Leader
+	rs.initializeLeaderState()
+	current := &ClusterConfig{Voters: map[string]string{"n1": "a1", "n2": "a2"}}
+	at, err := rs.appendConfigEntryLocked(current)
+	if err != nil {
+		rs.mu.Unlock()
+		t.Fatalf("append the starting configuration: %v", err)
+	}
+	rs.volatile.CommitIndex = at
+	rs.mu.Unlock()
+
+	// The same address is still a no-op error.
+	if _, err := rs.ProposeConfigChange(true, "n2", "a2"); !errors.Is(err, ErrNodeAlreadyVoter) {
+		t.Errorf("re-adding at the same address: got %v, want ErrNodeAlreadyVoter", err)
+	}
+
+	moved, err := rs.ProposeConfigChange(true, "n2", addrN2Moved)
+	if err != nil {
+		t.Fatalf("re-adding a voter at a new address: %v", err)
+	}
+
+	if !moved.IsJoint() {
+		t.Errorf("changing a voter's address moves the voter set and must be joint: %+v", moved)
+	}
+	if moved.Voters["n2"] != addrN2Moved {
+		t.Errorf("the new address did not reach the voter set: %+v", moved.Voters)
+	}
+	if moved.OldVoters["n2"] != "a2" {
+		t.Errorf("the old voter set should hold the previous address: %+v", moved.OldVoters)
+	}
+	if len(moved.Learners) != 0 {
+		t.Errorf("an existing voter must not be demoted to a learner: %+v", moved.Learners)
+	}
+	assertNeverBothVoterAndLearner(t, moved)
+
+	// The node's own view agrees: it is still counted, and it still votes.
+	if !moved.IsVoter("n2") || moved.IsLearner("n2") {
+		t.Errorf("n2 is no longer unambiguously a voter: %+v", moved)
+	}
+	// Members reports the *new* address, not the one the old group still holds.
+	if addr := moved.Members()["n2"]; addr != addrN2Moved {
+		t.Errorf("Members reported %q, want the updated address", addr)
+	}
+}
+
+// assertNeverBothVoterAndLearner checks the ClusterConfig invariant that no
+// server appears in a voter group and in Learners at the same time.
+func assertNeverBothVoterAndLearner(t *testing.T, cfg *ClusterConfig) {
+	t.Helper()
+	for id := range cfg.Learners {
+		if _, ok := cfg.Voters[id]; ok {
+			t.Errorf("%s is both a voter and a learner: %+v", id, cfg)
+		}
+		if _, ok := cfg.OldVoters[id]; ok {
+			t.Errorf("%s is both an old voter and a learner: %+v", id, cfg)
+		}
+	}
+}
+
+// TestConfigForChangeNeverProducesABothGroupsMember runs the invariant over
+// every branch of configForChange and over a promotion, which are all the places
+// a configuration is built.
+func TestConfigForChangeNeverProducesABothGroupsMember(t *testing.T) {
+	base := &ClusterConfig{Voters: map[string]string{"n1": "a1", "n2": "a2"}}
+	withLearner := &ClusterConfig{
+		Voters:   map[string]string{"n1": "a1", "n2": "a2"},
+		Learners: map[string]string{"n3": "a3"},
+	}
+
+	cases := []struct {
+		name    string
+		current *ClusterConfig
+		add     bool
+		nodeID  string
+		addr    string
+	}{
+		{"add a new server", base, true, "n3", "a3"},
+		{"re-address a voter", base, true, "n2", addrN2Moved},
+		{"remove a voter", base, false, "n2", ""},
+		{"remove a learner", withLearner, false, "n3", ""},
+		{"remove a voter beside a learner", withLearner, false, "n2", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := configForChange(tc.current, tc.add, tc.nodeID, tc.addr)
+			if err != nil {
+				t.Fatalf("configForChange: %v", err)
+			}
+			assertNeverBothVoterAndLearner(t, cfg)
+		})
+	}
+}
+
 // TestLearnersDoNotChangeQuorum is the safety core of the whole feature: a
 // learner is invisible to the quorum arithmetic, whether or not it agrees.
 func TestLearnersDoNotChangeQuorum(t *testing.T) {
@@ -187,6 +296,7 @@ func TestCaughtUpLearnerIsPromotedThroughJointConsensus(t *testing.T) {
 	if joint.Voters["n2"] != "a-n2" {
 		t.Errorf("the learner's address was lost in the promotion: %+v", joint.Voters)
 	}
+	assertNeverBothVoterAndLearner(t, joint)
 
 	// Committing the joint configuration is what lets C_new be appended.
 	rs.volatile.CommitIndex = rs.lastAbsLogIndex()

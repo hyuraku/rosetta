@@ -550,6 +550,15 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	// and without this it would never commit the very configuration entry that
 	// introduced the learner (KNOWN_ISSUES.md R20).
 	rs.updateCommitIndex()
+	// The commit re-evaluation can reach advanceConfigChangeLocked, which steps a
+	// leader that C_new no longer contains down through becomeFollowerLocked --
+	// and that clears rs.leader. No reachable path does so from here today (C_new
+	// commits on a reply, and replies re-evaluate the commit index themselves),
+	// but everything below dereferences rs.leader.
+	if rs.state != Leader || rs.leader == nil {
+		rs.mu.Unlock()
+		return
+	}
 	commitIndex := rs.volatile.CommitIndex
 
 	peers := rs.peerIDsLocked()
