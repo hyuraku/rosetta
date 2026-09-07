@@ -141,6 +141,21 @@ func (rs *RaftState) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 		}
 	}
 
+	// A non-voting member does not vote (dissertation §4.2.1). Its vote could
+	// never help anyone win — QuorumReached does not look at Learners at all — but
+	// granting it would still spend this node's VotedFor for the term, and it
+	// would let a learner's opinion of "up to date enough" (§5.4.1) be recorded
+	// for a set it is not part of. Refusing keeps the election entirely in the
+	// hands of the voters, which is what makes a catch-up phase invisible to
+	// consensus (KNOWN_ISSUES.md R20). The term adoption above still happened, so
+	// a learner does not fall behind the cluster's term.
+	if rs.persistent.Config.IsLearner(rs.nodeID) {
+		rs.logger.Printf("RequestVote: refusing %s's request for term %d; this node is a "+
+			"non-voting member of the current configuration", args.CandidateID, args.Term)
+		reply.Term = rs.persistent.CurrentTerm
+		return
+	}
+
 	if rs.persistent.VotedFor == nil || *rs.persistent.VotedFor == args.CandidateID {
 		// Evaluate the election restriction (§5.4.1) against the absolute last
 		// log index/term, which after compaction is the snapshot boundary plus
@@ -525,13 +540,29 @@ func (rs *RaftState) sendHeartbeats(transport RPCTransport) {
 	}
 
 	currentTerm := rs.persistent.CurrentTerm
+
+	// Re-evaluate the commit index before sending. The leader's own log counts
+	// towards every quorum, so a configuration in which it is already its own
+	// majority commits here rather than on a reply that may never come. This used
+	// to be conditional on having no peers at all, which stopped being the same
+	// question once learners joined the member set: a single-voter leader that has
+	// taken on a learner has a peer to replicate to and is still its own majority,
+	// and without this it would never commit the very configuration entry that
+	// introduced the learner (KNOWN_ISSUES.md R20).
+	rs.updateCommitIndex()
+	// The commit re-evaluation can reach advanceConfigChangeLocked, which steps a
+	// leader that C_new no longer contains down through becomeFollowerLocked --
+	// and that clears rs.leader. No reachable path does so from here today (C_new
+	// commits on a reply, and replies re-evaluate the commit index themselves),
+	// but everything below dereferences rs.leader.
+	if rs.state != Leader || rs.leader == nil {
+		rs.mu.Unlock()
+		return
+	}
 	commitIndex := rs.volatile.CommitIndex
 
-	// With no other server in the configuration the leader is its own majority,
-	// so it can commit outstanding entries directly.
 	peers := rs.peerIDsLocked()
 	if len(peers) == 0 {
-		rs.updateCommitIndex()
 		rs.mu.Unlock()
 		return
 	}
@@ -735,6 +766,12 @@ func (rs *RaftState) replicateToPeer(
 			rs.leader.NextIndex[peerID] = next
 		}
 		rs.updateCommitIndex()
+		// A learner that has just reached the end of the log is ready to become a
+		// voter (KNOWN_ISSUES.md R20). This runs after updateCommitIndex so that
+		// the very reply that commits the configuration which introduced the
+		// learner can also promote it, and inside the same rs.mu section that moved
+		// MatchIndex above.
+		rs.promoteCaughtUpLearnerLocked()
 	} else {
 		rs.handleReplicationConflict(peerID, reply)
 	}
@@ -842,6 +879,10 @@ func (rs *RaftState) sendSnapshotToPeer(
 	if next := rs.leader.MatchIndex[peerID] + 1; next > rs.leader.NextIndex[peerID] {
 		rs.leader.NextIndex[peerID] = next
 	}
+	// The other place a follower's progress moves, so the other place a learner
+	// can turn out to have caught up (KNOWN_ISSUES.md R20). A snapshot that
+	// happens to end at the leader's last log index is enough on its own.
+	rs.promoteCaughtUpLearnerLocked()
 }
 
 // streamSnapshotToPeer sends one snapshot envelope to peerID as a sequence of

@@ -128,3 +128,70 @@ func TestValidateJoinFlag(t *testing.T) {
 		t.Error("expected an error for a non-empty -join")
 	}
 }
+
+// TestClusterAddReportsTheServerAsALearner is the HTTP half of the R20 fix: an
+// add is answered with a configuration in which the new server is a learner, not
+// a voter and not a joint configuration, and GET /cluster/config reports the same
+// thing to whoever polls for the change to finish. The added server does not
+// exist here, so it never catches up and the learner stays observable.
+func TestClusterAddReportsTheServerAsALearner(t *testing.T) {
+	hs := newTestHTTPServer(t)
+
+	// A freshly elected leader refuses membership changes with 409 until its own
+	// election no-op has committed (§5.4.2), which is a matter of one tick.
+	var rec *httptest.ResponseRecorder
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rec = httptest.NewRecorder()
+		hs.handleClusterAdd(rec, httptest.NewRequest(http.MethodPost, clusterAddPath,
+			strings.NewReader(`{"node_id":"node2","addr":"localhost:9081"}`)))
+		if rec.Code != http.StatusConflict {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertLearnerConfigBody(t, rec.Body.Bytes())
+
+	// The same view through the read endpoint any node answers.
+	rec = httptest.NewRecorder()
+	hs.handleClusterConfig(rec, httptest.NewRequest(http.MethodGet, clusterConfigPath, http.NoBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /cluster/config: expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertLearnerConfigBody(t, rec.Body.Bytes())
+}
+
+func assertLearnerConfigBody(t *testing.T, body []byte) {
+	t.Helper()
+
+	var reply struct {
+		Success bool `json:"success"`
+		Config  struct {
+			Joint    bool              `json:"joint"`
+			Voters   map[string]string `json:"voters"`
+			Learners map[string]string `json:"learners"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatalf("failed to decode %q: %v", body, err)
+	}
+	if !reply.Success {
+		t.Fatalf("expected success:true, got %q", body)
+	}
+	if reply.Config.Joint {
+		t.Errorf("adding a server must not produce a joint configuration: %q", body)
+	}
+	if reply.Config.Learners["node2"] != "localhost:9081" {
+		t.Errorf("expected node2 among the learners with its address, got %q", body)
+	}
+	if _, ok := reply.Config.Voters["node2"]; ok {
+		t.Errorf("the added server was made a voter straight away: %q", body)
+	}
+	if _, ok := reply.Config.Voters["node1"]; !ok {
+		t.Errorf("the existing voter set changed: %q", body)
+	}
+}

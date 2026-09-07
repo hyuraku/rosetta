@@ -361,9 +361,11 @@ func withoutID(ids []string, drop string) []string {
 }
 
 // TestSecondConfigChangeRejected covers §6's "one at a time" rule. The single
-// voter here can commit on its own, but the joint configuration it proposes
-// needs the newcomer too, so the change stays in flight and the second proposal
-// has to be refused.
+// voter here commits on its own, so the configuration admitting n2 as a learner
+// is committed almost at once — but n2 does not exist and never catches up, so
+// the *addition* is still in flight and any further change has to be refused.
+// Removing that learner is the deliberate exception and has its own test
+// (TestSecondChangeDuringCatchUpRejected).
 func TestSecondConfigChangeRejected(t *testing.T) {
 	cluster := newTestCluster(t)
 	defer cluster.stopAll()
@@ -376,8 +378,8 @@ func TestSecondConfigChangeRejected(t *testing.T) {
 	if _, err := node.ProposeConfigChange(true, "n3", "addr-n3"); !errors.Is(err, ErrConfigChangeInProgress) {
 		t.Fatalf("second change: got %v, want ErrConfigChangeInProgress", err)
 	}
-	if _, err := node.ProposeConfigChange(false, "n2", ""); !errors.Is(err, ErrConfigChangeInProgress) {
-		t.Fatalf("second change (removal): got %v, want ErrConfigChangeInProgress", err)
+	if _, err := node.ProposeConfigChange(false, "n1", ""); !errors.Is(err, ErrConfigChangeInProgress) {
+		t.Fatalf("voter removal during catch-up: got %v, want ErrConfigChangeInProgress", err)
 	}
 }
 

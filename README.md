@@ -121,12 +121,15 @@ Implemented in [`raft/state.go`](raft/state.go). Randomized election timeouts pr
 - **network/**: Network communication layer
   - HTTP-based RPC transport
   - Membership changes go through Raft: `POST /cluster/add` / `POST /cluster/remove`
-    on the leader append a configuration entry and the cluster moves through the
-    joint configuration C_old,new to C_new (paper §6, R14, fixed). `GET /cluster/config`
-    reports what a node is currently using. The transport's peer address book
-    follows the configuration, so an added server is reachable without editing
-    anyone's flags. There is no learner / catch-up phase yet, so a newly added
-    server counts towards the quorum immediately (R20, open)
+    on the leader append a configuration entry, and a change that moves the voter
+    set goes through the joint configuration C_old,new to C_new (paper §6, R14,
+    fixed). `GET /cluster/config` reports what a node is currently using. The
+    transport's peer address book follows the configuration, so an added server is
+    reachable without editing anyone's flags
+  - An added server joins as a **learner**: it is replicated to but counted by no
+    quorum, and the leader promotes it to a voter on its own once it has caught up
+    (paper §6 "new servers join as non-voting members", R20, fixed). Learners are
+    a transient catch-up state only — permanent read replicas are out of scope
   - `ClusterManager`'s `/cluster/join`, `/cluster/leave` and `/cluster/nodes`
     are HTTP-level bookkeeping only and are *not* part of that path — they are
     never reflected in the Raft quorum, are not served on a normal startup, and
@@ -224,7 +227,9 @@ curl -X POST http://localhost:9080/cluster/add \
   -H 'Content-Type: application/json' \
   -d '{"node_id":"node4","addr":"localhost:8083"}'
 
-# Poll until the change completes ("joint": false).
+# The response lists node4 under "learners": it is being caught up and counts
+# towards no quorum yet. Poll until it appears under "voters" with no "learners"
+# left and "joint": false -- the leader promotes it by itself.
 curl http://localhost:9080/cluster/config
 
 # Removing works the same way; the removed node can be shut down once it is gone
@@ -234,10 +239,12 @@ curl -X POST http://localhost:9080/cluster/remove \
 ```
 
 A node started with the existing cluster's peer list is not a voter in it, so it
-does not campaign; it becomes one when the configuration entry admitting it
-reaches its log. Only one change at a time is accepted. Removing the leader is
-allowed: it steps down once C_new commits. Full details and error codes are in
-[docs/api.md](docs/api.md).
+does not campaign; it is admitted as a non-voting learner, and becomes a voter
+when the leader sees it has caught up and appends the configuration promoting it.
+Only one change at a time is accepted, and a learner still catching up *is* a
+change in flight — the one thing allowed alongside it is removing that learner,
+which abandons the addition. Removing the leader is allowed: it steps down once
+C_new commits. Full details and error codes are in [docs/api.md](docs/api.md).
 
 Cluster sizing: Raft needs a majority to commit, so run an odd number of nodes —
 3 nodes tolerate 1 failure, 5 tolerate 2. Adding nodes does not make writes faster.

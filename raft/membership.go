@@ -44,6 +44,30 @@ var (
 // agreement requires separate majorities of the old and the new set. A
 // configuration with OldVoters == nil is an ordinary C_old or C_new.
 //
+// Learners holds the *non-voting* members (Ongaro's dissertation §4.2.1,
+// "Catching up new servers"; the paper's §6 mentions the same phase). A learner
+// is replicated to exactly like a voter — it is in Members, so it gets
+// AppendEntries, heartbeats and InstallSnapshot — but no quorum arithmetic ever
+// looks at it: QuorumReached counts Voters and OldVoters only, and IsVoter is
+// false for a learner, so it neither campaigns nor grants votes. That is the
+// whole of the safety argument for learners, and it is why this field can be
+// added without touching QuorumReached at all.
+//
+// In this implementation a learner is strictly a *transient* catch-up state: a
+// server added through ProposeConfigChange starts here and the leader promotes
+// it into Voters as soon as it has caught up. Permanent learners / read replicas
+// are out of scope.
+//
+// Invariant: **no server is ever in both Voters and Learners.** Every producer
+// of a configuration upholds it — configForChange puts a server in exactly one
+// group, and promoteCaughtUpLearnerLocked moves it from Learners to Voters in a
+// single entry. Breaking it would make the two questions this type answers
+// disagree about the same server: QuorumReached would count it while IsVoter
+// (and therefore the campaign gate and RequestVote) treated it as non-voting, so
+// a server that the cluster depends on for a majority would refuse to vote.
+// Nothing in a joint configuration relaxes this: OldVoters may overlap Voters,
+// but neither may overlap Learners.
+//
 // The address is carried here, not merely in the process's -peers flag, because
 // a node that joins a running cluster learns of its peers only through the
 // configuration entry that admits it. The address is advisory to consensus —
@@ -55,6 +79,7 @@ var (
 type ClusterConfig struct {
 	Voters    map[string]string `json:"voters"`
 	OldVoters map[string]string `json:"old_voters,omitempty"`
+	Learners  map[string]string `json:"learners,omitempty"`
 }
 
 // NewClusterConfig builds a single (non-joint) configuration from node IDs, with
@@ -77,6 +102,7 @@ func (c *ClusterConfig) Clone() *ClusterConfig {
 	return &ClusterConfig{
 		Voters:    cloneAddrs(c.Voters),
 		OldVoters: cloneAddrs(c.OldVoters),
+		Learners:  cloneAddrs(c.Learners),
 	}
 }
 
@@ -98,17 +124,27 @@ func (c *ClusterConfig) IsJoint() bool {
 }
 
 // Members returns every server that takes part in this configuration: the union
-// of the new and (while joint) the old voter sets, with the new set's address
-// winning when both name the same server. The union is what has to be
-// *contacted* — vote requests and replication go to all of them — whereas
-// agreement is evaluated per group.
+// of the new and (while joint) the old voter sets *and the learners*, with the
+// new voter set's address winning when several groups name the same server. The
+// union is what has to be *contacted* — vote requests and replication go to all
+// of them — whereas agreement is evaluated per group.
+//
+// Learners belong here precisely because catching one up is replication: it has
+// to receive AppendEntries and InstallSnapshot, and the leader has to keep a
+// NextIndex/MatchIndex pair for it (syncLeaderPeersLocked). Being contacted is
+// not being counted; QuorumReached never consults this set.
 func (c *ClusterConfig) Members() map[string]string {
 	if c == nil {
 		return map[string]string{}
 	}
-	out := make(map[string]string, len(c.Voters)+len(c.OldVoters))
+	out := make(map[string]string, len(c.Voters)+len(c.OldVoters)+len(c.Learners))
 	for id, addr := range c.OldVoters {
 		out[id] = addr
+	}
+	for id, addr := range c.Learners {
+		if addr != "" || out[id] == "" {
+			out[id] = addr
+		}
 	}
 	for id, addr := range c.Voters {
 		if addr != "" || out[id] == "" {
@@ -130,7 +166,9 @@ func (c *ClusterConfig) MemberIDs() []string {
 }
 
 // Contains reports whether nodeID takes part in this configuration at all
-// (either group).
+// (either voter group, or as a learner). It answers "is this server one of ours"
+// — which a learner being caught up is — not "does this server count", which is
+// IsVoter's question.
 func (c *ClusterConfig) Contains(nodeID string) bool {
 	if c == nil {
 		return false
@@ -138,19 +176,52 @@ func (c *ClusterConfig) Contains(nodeID string) bool {
 	if _, ok := c.Voters[nodeID]; ok {
 		return true
 	}
-	_, ok := c.OldVoters[nodeID]
+	if _, ok := c.OldVoters[nodeID]; ok {
+		return true
+	}
+	_, ok := c.Learners[nodeID]
 	return ok
 }
 
 // IsVoter reports whether nodeID votes in the *new* configuration. It is what
 // decides whether a server may campaign, and whether a leader must step down
 // once C_new commits (§6).
+//
+// It is deliberately false for a learner: the existing campaign gate
+// (raft/node.go's handleElectionTimeout) then keeps a non-voting member from
+// ever standing for election, with no separate check.
 func (c *ClusterConfig) IsVoter(nodeID string) bool {
 	if c == nil {
 		return false
 	}
 	_, ok := c.Voters[nodeID]
 	return ok
+}
+
+// IsLearner reports whether nodeID is a non-voting member of this configuration.
+// A server is never both a learner and a voter: promotion appends a
+// configuration that moves it from one group to the other in a single entry.
+func (c *ClusterConfig) IsLearner(nodeID string) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := c.Learners[nodeID]
+	return ok
+}
+
+// LearnerIDs returns the learners' IDs in a stable order, so that a leader
+// deciding which learner to promote makes the same choice on every reply rather
+// than one that depends on map iteration order.
+func (c *ClusterConfig) LearnerIDs() []string {
+	if c == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(c.Learners))
+	for id := range c.Learners {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // QuorumReached reports whether the set of servers in agree constitutes
@@ -164,7 +235,10 @@ func (c *ClusterConfig) IsVoter(nodeID string) bool {
 //
 // Servers named in agree that are not in a group simply do not count towards
 // that group — which is how a leader that has been voted out of C_new keeps
-// replicating (it still has to get C_new committed) without counting itself.
+// replicating (it still has to get C_new committed) without counting itself,
+// and equally how a learner in agree changes nothing: Learners is not a group
+// here and never will be. Adding a learner therefore cannot move a commit or an
+// election either way, which is the entire point of the catch-up phase.
 func (c *ClusterConfig) QuorumReached(agree map[string]bool) bool {
 	if c == nil {
 		return false
@@ -389,7 +463,7 @@ func (rs *RaftState) fillAddrsLocked(cfg *ClusterConfig, addrs map[string]string
 		return false
 	}
 	changed := false
-	for _, group := range []map[string]string{cfg.Voters, cfg.OldVoters} {
+	for _, group := range []map[string]string{cfg.Voters, cfg.OldVoters, cfg.Learners} {
 		for id, addr := range addrs {
 			if addr == "" || id == rs.nodeID {
 				continue
@@ -433,19 +507,31 @@ func (rs *RaftState) appendConfigEntryLocked(cfg *ClusterConfig) (int, error) {
 	return index, nil
 }
 
-// ProposeConfigChange starts a cluster configuration change on the leader: it
-// appends the joint configuration C_old,new, which takes effect immediately. The
-// rest of the transition is driven by commit progress (see
-// advanceConfigChangeLocked).
+// ProposeConfigChange starts a cluster configuration change on the leader. What
+// it appends depends on whether the change moves the voter set:
+//
+//   - adding a server appends a *single* (non-joint) configuration that leaves
+//     Voters untouched and puts the server in Learners. Joint consensus is not
+//     needed because the voter set does not change, so no two majorities can
+//     disagree (dissertation §4.2.1). Replication to the newcomer starts at once
+//     (syncLeaderPeersLocked), and the leader promotes it to a voter — that
+//     promotion being the C_old,new append — once it has caught up
+//     (promoteCaughtUpLearnerLocked). This is the KNOWN_ISSUES.md R20 fix: an
+//     added server never raises the bar a commit has to clear while it is behind;
+//   - removing a learner likewise appends a single configuration without it,
+//     which is how a catch-up that is never going to finish is abandoned;
+//   - removing a voter changes the voter set, so it goes through the joint
+//     configuration C_old,new as before. The rest of that transition is driven by
+//     commit progress (see advanceConfigChangeLocked).
+//
+// Only one change may be in flight (§6). A learner counts as one: while any
+// learner exists the cluster is mid-way through an addition, so a further change
+// is refused with ErrConfigChangeInProgress — except removing that learner,
+// which is the way out.
 //
 // Removing this node itself is allowed. Per §6 the leader keeps serving until
 // C_new commits and only then steps down, which is what advanceConfigChangeLocked
 // does; refusing self-removal would make a cluster unable to retire its leader.
-//
-// A learner / non-voting catch-up phase is deliberately not implemented
-// (KNOWN_ISSUES.md R20): a server added here counts towards the quorum from the
-// moment C_old,new reaches a log, so adding a server whose log is far behind
-// makes the cluster slower to commit until it catches up.
 func (rs *RaftState) ProposeConfigChange(add bool, nodeID, addr string) (*ClusterConfig, error) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -468,14 +554,82 @@ func (rs *RaftState) ProposeConfigChange(add bool, nodeID, addr string) (*Cluste
 	if current.IsJoint() || at > rs.volatile.CommitIndex {
 		return nil, ErrConfigChangeInProgress
 	}
+	// A learner is an addition that has not finished. Dropping that learner is
+	// allowed (it cancels the addition); anything else has to wait.
+	cancellingCatchUp := !add && current.IsLearner(nodeID)
+	if len(current.Learners) > 0 && !cancellingCatchUp {
+		return nil, ErrConfigChangeInProgress
+	}
 
-	newVoters := cloneAddrs(current.Voters)
-	if add {
-		if existing, ok := newVoters[nodeID]; ok && existing == addr {
+	next, err := configForChange(current, add, nodeID, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	index, err := rs.appendConfigEntryLocked(next)
+	if err != nil {
+		return nil, err
+	}
+	rs.syncLeaderPeersLocked()
+	if next.IsJoint() {
+		rs.logger.Printf("Configuration change started at index %d: joint configuration old=%v new=%v",
+			index, next.OldVoters, next.Voters)
+	} else {
+		rs.logger.Printf("Configuration change started at index %d: voters=%v learners=%v",
+			index, next.Voters, next.Learners)
+	}
+	return next.Clone(), nil
+}
+
+// configForChange builds the configuration ProposeConfigChange should append for
+// one membership change against current, or reports why the change makes no
+// sense. It is a pure function of the current configuration — it touches no Raft
+// state — which is what keeps "which configuration does this change produce"
+// separate from "may a change be started at all".
+//
+// The changes that move the voter set (removing a voter, and re-addressing one)
+// produce a joint configuration; the two learner cases leave Voters alone and so
+// need no joint step. Every branch preserves the invariant that no server is in
+// both Voters and Learners — see the ClusterConfig doc comment for why that
+// matters.
+func configForChange(current *ClusterConfig, add bool, nodeID, addr string) (*ClusterConfig, error) {
+	switch {
+	case add && current.IsVoter(nodeID):
+		// Adding a server that is already a voter is how its address is changed.
+		// It must stay a voter throughout — demoting a counted server to a
+		// non-voting learner would take it out of every quorum while it is up and
+		// healthy, and would make it refuse votes (RequestVote) although
+		// QuorumReached still counts it. So this goes through joint consensus and
+		// never touches Learners.
+		if current.Voters[nodeID] == addr {
 			return nil, ErrNodeAlreadyVoter
 		}
+		newVoters := cloneAddrs(current.Voters)
 		newVoters[nodeID] = addr
-	} else {
+		return &ClusterConfig{
+			Voters:    newVoters,
+			OldVoters: cloneAddrs(current.Voters),
+			Learners:  cloneAddrs(current.Learners),
+		}, nil
+
+	case add:
+		learners := cloneAddrs(current.Learners)
+		if learners == nil {
+			learners = make(map[string]string, 1)
+		}
+		learners[nodeID] = addr
+		return &ClusterConfig{Voters: cloneAddrs(current.Voters), Learners: learners}, nil
+
+	case current.IsLearner(nodeID):
+		learners := cloneAddrs(current.Learners)
+		delete(learners, nodeID)
+		if len(learners) == 0 {
+			learners = nil
+		}
+		return &ClusterConfig{Voters: cloneAddrs(current.Voters), Learners: learners}, nil
+
+	default:
+		newVoters := cloneAddrs(current.Voters)
 		if _, ok := newVoters[nodeID]; !ok {
 			return nil, ErrNodeNotVoter
 		}
@@ -483,17 +637,12 @@ func (rs *RaftState) ProposeConfigChange(add bool, nodeID, addr string) (*Cluste
 			return nil, ErrLastVoter
 		}
 		delete(newVoters, nodeID)
+		return &ClusterConfig{
+			Voters:    newVoters,
+			OldVoters: cloneAddrs(current.Voters),
+			Learners:  cloneAddrs(current.Learners),
+		}, nil
 	}
-
-	joint := &ClusterConfig{Voters: newVoters, OldVoters: cloneAddrs(current.Voters)}
-	index, err := rs.appendConfigEntryLocked(joint)
-	if err != nil {
-		return nil, err
-	}
-	rs.syncLeaderPeersLocked()
-	rs.logger.Printf("Configuration change started at index %d: joint configuration old=%v new=%v",
-		index, joint.OldVoters, joint.Voters)
-	return joint.Clone(), nil
 }
 
 // advanceConfigChangeLocked drives the two-phase transition of §6 from commit
@@ -521,7 +670,12 @@ func (rs *RaftState) advanceConfigChangeLocked() {
 	}
 
 	if current.IsJoint() {
-		final := &ClusterConfig{Voters: cloneAddrs(current.Voters)}
+		// Learners ride along unchanged: they are not part of the voter-set
+		// transition, and dropping them here would silently cancel a catch-up.
+		final := &ClusterConfig{
+			Voters:   cloneAddrs(current.Voters),
+			Learners: cloneAddrs(current.Learners),
+		}
 		index, err := rs.appendConfigEntryLocked(final)
 		if err != nil {
 			// The joint configuration stays in effect and the next commit
@@ -543,6 +697,87 @@ func (rs *RaftState) advanceConfigChangeLocked() {
 		if err := rs.becomeFollowerLocked(rs.persistent.CurrentTerm, ""); err != nil {
 			rs.logger.Printf("advanceConfigChange: step down persist failed: %v", err)
 		}
+	}
+}
+
+// promoteCaughtUpLearnerLocked turns a learner that has caught up into a voter,
+// by appending the joint configuration C_old,new that moves it from Learners into
+// Voters. From there the ordinary transition takes over: advanceConfigChangeLocked
+// appends C_new once the joint configuration commits. Callers must hold rs.mu and
+// must have just advanced that learner's MatchIndex — the two callers are the
+// AppendEntries reply and the InstallSnapshot acknowledgement, both of which run
+// this inside the same critical section that moved MatchIndex, so the decision is
+// made against the log and commit index the reply was judged against.
+//
+// "Caught up" is one observation of MatchIndex[learner] >= lastAbsLogIndex(): the
+// learner stores everything the leader has. That is a deliberate simplification
+// of the dissertation's §4.2.1 criterion (several rounds of replication, the last
+// of which finishes within an election timeout), which measures whether the
+// learner can *keep* up rather than whether it is level right now.
+//
+// The simplification is safe but costs liveness under load, and the cost is not
+// only theoretical. lastAbsLogIndex() is read when the reply is handled, not when
+// the request was sent, so a client write that lands during the round trip moves
+// the tail out from under a learner that had in fact caught up with everything
+// the leader had when it was asked. On a cluster under sustained writes a
+// perfectly healthy learner can therefore trail the tail by one round trip
+// indefinitely and never be promoted until the write load pauses — at the first
+// lull the very next reply promotes it. So: an addition completes promptly on a
+// quiet cluster, and may wait for a lull on a busy one. It never promotes a
+// learner too early, which is the direction that would matter for safety.
+//
+// The append is refused unless the configuration that introduced the learner is
+// itself committed and non-joint, so §6's "one change at a time" still holds:
+// promotion is the second half of the addition, never a change overlapping it.
+// A persist failure rolls the append back (appendConfigEntryLocked) and is only
+// logged — the learner stays a learner and the next reply retries, exactly as
+// advanceConfigChangeLocked does for C_new.
+//
+// Nothing here touches applyCh; the only append path is appendEntryLocked (B3).
+func (rs *RaftState) promoteCaughtUpLearnerLocked() {
+	if rs.state != Leader || rs.leader == nil {
+		return
+	}
+
+	current, at := rs.currentConfigLocked()
+	if current == nil || len(current.Learners) == 0 {
+		return
+	}
+	if current.IsJoint() || at > rs.volatile.CommitIndex {
+		return
+	}
+
+	lastIndex := rs.lastAbsLogIndex()
+	for _, learnerID := range current.LearnerIDs() {
+		if rs.leader.MatchIndex[learnerID] < lastIndex {
+			continue
+		}
+
+		newVoters := cloneAddrs(current.Voters)
+		newVoters[learnerID] = current.Learners[learnerID]
+		remaining := cloneAddrs(current.Learners)
+		delete(remaining, learnerID)
+		if len(remaining) == 0 {
+			remaining = nil
+		}
+
+		joint := &ClusterConfig{
+			Voters:    newVoters,
+			OldVoters: cloneAddrs(current.Voters),
+			Learners:  remaining,
+		}
+		index, err := rs.appendConfigEntryLocked(joint)
+		if err != nil {
+			rs.logger.Printf("promoteCaughtUpLearner: could not append the joint configuration "+
+				"promoting %s, leaving it a learner and retrying: %v", learnerID, err)
+			return
+		}
+		rs.syncLeaderPeersLocked()
+		rs.logger.Printf("Learner %s caught up at index %d; appended joint configuration "+
+			"old=%v new=%v at index %d", learnerID, lastIndex, joint.OldVoters, joint.Voters, index)
+		// One change at a time: whatever other learners exist wait for this
+		// promotion to finish.
+		return
 	}
 }
 
